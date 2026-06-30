@@ -557,6 +557,43 @@ function FormModal({
     ...p,
     [k]: x
   }));
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const submit = async () => {
+    if (busy) return; // double-submit guard
+    const miss = [],
+      bad = [];
+    fields.forEach(f => {
+      const val = v[f.k];
+      const empty = val === "" || val === undefined || val === null;
+      if (f.req && empty) {
+        miss.push(f.label);
+        return;
+      }
+      if (f.type === "number" && !empty) {
+        const n = Number(val);
+        const mn = f.min != null ? f.min : 0;
+        if (!isFinite(n) || n < mn || f.int && !Number.isInteger(n) || f.req && n <= 0) bad.push(f.label);
+      }
+    });
+    if (miss.length) {
+      setErr("Ye zaroori hai: " + miss.join(", "));
+      return;
+    }
+    if (bad.length) {
+      setErr("Sahi value daalein: " + bad.join(", "));
+      return;
+    }
+    setErr("");
+    setBusy(true);
+    try {
+      await onSave(v);
+      onClose();
+    } catch (e) {
+      setErr(e && e.message ? e.message : String(e));
+      setBusy(false);
+    }
+  };
   return /*#__PURE__*/React.createElement("div", {
     className: "ovl",
     onClick: onClose
@@ -636,9 +673,18 @@ function FormModal({
   }, v[f.k] ? "✓ Yes" : "✗ No") : /*#__PURE__*/React.createElement("input", {
     className: "inp",
     type: f.type === "number" ? "number" : f.type === "date" ? "date" : "text",
+    min: f.type === "number" ? f.min != null ? f.min : 0 : undefined,
+    step: f.type === "number" && f.int ? 1 : undefined,
     value: v[f.k] ?? "",
     onChange: e => set(f.k, f.type === "number" ? e.target.value === "" ? "" : Number(e.target.value) : e.target.value)
-  })))), /*#__PURE__*/React.createElement("div", {
+  })))), err ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: "0 20px",
+      fontSize: 12.5,
+      color: col('red'),
+      fontWeight: 700
+    }
+  }, err) : null, /*#__PURE__*/React.createElement("div", {
     style: {
       padding: "14px 20px",
       borderTop: "1px solid " + col('line'),
@@ -658,15 +704,13 @@ function FormModal({
     }
   }, "Cancel"), /*#__PURE__*/React.createElement("button", {
     className: "pbtn",
+    disabled: busy,
     style: {
       flex: 2,
       justifyContent: "center"
     },
-    onClick: () => {
-      onSave(v);
-      onClose();
-    }
-  }, "Save"))));
+    onClick: submit
+  }, busy ? "Saving…" : "Save"))));
 }
 
 /* ---------- contact (call / whatsapp) ---------- */
@@ -1492,7 +1536,10 @@ function App() {
     }, {
       k: "total_beds",
       label: "Total Beds",
-      type: "number"
+      type: "number",
+      req: true,
+      int: true,
+      min: 1
     }, {
       k: "monthly_fee_per_bed",
       label: "Fee/Bed",
@@ -1509,7 +1556,8 @@ function App() {
     students: [{
       k: "full_name",
       label: "Full Name",
-      full: true
+      full: true,
+      req: true
     }, {
       k: "father_name",
       label: "Father Name"
@@ -1547,7 +1595,8 @@ function App() {
     }, {
       k: "monthly_fee",
       label: "Monthly Fee",
-      type: "number"
+      type: "number",
+      req: true
     }, {
       k: "security_deposit",
       label: "Security Deposit",
@@ -1555,7 +1604,8 @@ function App() {
     }, {
       k: "joining_date",
       label: "Joining Date",
-      type: "date"
+      type: "date",
+      req: true
     }, {
       k: "id_proof_type",
       label: "ID Proof Type"
@@ -1919,7 +1969,7 @@ function App() {
             const rq = await SB.from("rooms").select("id").eq("hostel_id", hid).eq("room_number", v.room_number).order("created_at", { ascending: false }).limit(1).maybeSingle();
             roomId = rq.data && rq.data.id;
           }
-          const nbeds = Number(v.total_beds) || 1;
+          const nbeds = Math.max(1, Math.floor(Number(v.total_beds) || 1));
           const beds = [];
           for (let i = 1; i <= nbeds; i++) beds.push({
             hostel_id: hid,
@@ -1936,30 +1986,46 @@ function App() {
         }
       };
       const setBed = async (b, st) => {
-        await SB.from("beds").update({
+        const { error: e1 } = await SB.from("beds").update({
           bed_status: st,
           student_id: st === "occupied" ? b.student_id : null
         }).eq("id", b.id);
-        if (st !== "occupied" && b.student_id) await SB.from("students").update({
-          current_bed_id: null
-        }).eq("id", b.student_id);
+        if (e1) { flash("⚠ " + e1.message); return; }
+        if (st !== "occupied" && b.student_id) {
+          const { error: e2 } = await SB.from("students").update({
+            current_bed_id: null
+          }).eq("id", b.student_id);
+          if (e2) { flash("⚠ " + e2.message); return; }
+        }
         refresh();
       };
       const doAlloc = async (b, sid) => {
+        // Target bed already taken by someone else? Never put two students on one bed.
+        if (b.student_id && b.student_id !== sid) {
+          flash("Ye bed pehle se occupied hai — pehle isay khaali karein, phir allocate karein.");
+          setAlloc(null);
+          return;
+        }
         const st = data.students.find(s => s.id === sid);
-        if (st.current_bed_id) await SB.from("beds").update({
-          student_id: null,
-          bed_status: "vacant"
-        }).eq("id", st.current_bed_id);
-        await SB.from("beds").update({
+        // If this student is being moved from another bed, free that previous bed first.
+        if (st && st.current_bed_id && st.current_bed_id !== b.id) {
+          const { error: e0 } = await SB.from("beds").update({
+            student_id: null,
+            bed_status: "vacant"
+          }).eq("id", st.current_bed_id);
+          if (e0) { flash("⚠ Purana bed free nahi hua: " + e0.message); return; }
+        }
+        const { error: e1 } = await SB.from("beds").update({
           student_id: sid,
           bed_status: "occupied",
           joining_date: today()
         }).eq("id", b.id);
-        await SB.from("students").update({
+        if (e1) { flash("⚠ Bed allocate nahi hua: " + e1.message); return; }
+        const { error: e2 } = await SB.from("students").update({
           current_bed_id: b.id,
           hostel_id: b.hostel_id
         }).eq("id", sid);
+        if (e2) { flash("⚠ Student update nahi hua: " + e2.message); return; }
         flash("Allocated");
         setAlloc(null);
         refresh();
@@ -2003,7 +2069,10 @@ function App() {
           }, {
             k: "total_beds",
             label: "Total Beds",
-            type: "number"
+            type: "number",
+            req: true,
+            int: true,
+            min: 1
           }, {
             k: "monthly_fee_per_bed",
             label: "Fee/Bed",
@@ -2420,16 +2489,13 @@ function App() {
     }
   };
   const receive = async (due, amt, mode, pFrom, pTo) => {
-    const np = num(due.paid_amount) + Math.min(amt, num(due.pending));
-    await SB.from("monthly_dues").update({
-      paid_amount: np,
-      status: np >= num(due.payable) ? "paid" : "partial"
-    }).eq("id", due.id);
-    await SB.from("fee_payments").insert({
+    const pay = num(amt);
+    // Insert the payment FIRST. If it fails, do NOT touch the due — keep modal open so the user can retry.
+    const ins = await SB.from("fee_payments").insert({
       due_id: due.id,
       student_id: due.student_id,
       hostel_id: due.hostel_id,
-      amount: Math.min(amt, num(due.pending)),
+      amount: pay,
       mode,
       payment_date: today(),
       period_from: pFrom || null,
@@ -2438,7 +2504,15 @@ function App() {
       collected_by: session.user.id,
       created_by: session.user.id
     });
-    flash("Payment received");
+    if (ins.error) { flash("⚠ Payment save nahi hua: " + ins.error.message); return; }
+    // Payment recorded — now update the due. If this errors, surface it (payment still stands).
+    const np = num(due.paid_amount) + pay;
+    const upd = await SB.from("monthly_dues").update({
+      paid_amount: np,
+      status: np >= num(due.payable) ? "paid" : "partial"
+    }).eq("id", due.id);
+    if (upd.error) flash("⚠ Payment record hua par due update nahi hua: " + upd.error.message);
+    else flash("Payment received");
     setPay(null);
     refresh();
   };
@@ -3591,6 +3665,24 @@ function PayModal({
   const [mode, setMode] = useState("upi");
   const [pFrom, setPFrom] = useState(bounds[0]);
   const [pTo, setPTo] = useState(bounds[1]);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const confirm = async () => {
+    if (busy) return; // double-submit guard
+    const n = Number(amt);
+    if (!isFinite(n) || n <= 0 || n > max) {
+      setErr("Amount 0 se zyada aur pending (" + inr(max) + ") se kam ya barabar honi chahiye.");
+      return;
+    }
+    setErr("");
+    setBusy(true);
+    try {
+      await onSave(due, n, mode, pFrom, pTo);
+    } catch (e) {
+      setErr(e && e.message ? e.message : String(e));
+    }
+    setBusy(false);
+  };
   const lbl = {
     fontSize: 11.5,
     color: col('mut'),
@@ -3677,7 +3769,14 @@ function PayModal({
     }
   }, PAY_MODES.map(m => /*#__PURE__*/React.createElement("option", {
     key: m
-  }, m)))), /*#__PURE__*/React.createElement("div", {
+  }, m)))), err ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12.5,
+      color: col('red'),
+      fontWeight: 700,
+      marginBottom: 10
+    }
+  }, err) : null, /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       gap: 10
@@ -3695,13 +3794,14 @@ function PayModal({
     }
   }, "Cancel"), /*#__PURE__*/React.createElement("button", {
     className: "mini",
+    disabled: busy,
     style: {
       flex: 2,
       background: col('green'),
       padding: 11
     },
-    onClick: () => onSave(due, amt, mode, pFrom, pTo)
-  }, "Confirm"))));
+    onClick: confirm
+  }, busy ? "…" : "Confirm"))));
 }
 ReactDOM.createRoot(document.getElementById("root")).render(/*#__PURE__*/React.createElement(App, null));
 </script>
