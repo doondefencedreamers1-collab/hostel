@@ -388,6 +388,10 @@ const ten = m => String(m || "").replace(/\D/g, "").slice(-10);
 const tel = m => "tel:+91" + ten(m);
 const wa = m => "https://wa.me/91" + ten(m);
 const today = () => new Date().toISOString().slice(0, 10);
+// LOCAL calendar date (not UTC) as YYYY-MM-DD — avoids late-evening IST recording the wrong day.
+const localToday = () => { const d = new Date(); const p = n => String(n).padStart(2, "0"); return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()); };
+// format a YYYY-MM-DD (or ISO) string as DD-MM-YYYY for display
+const dmy = s => { const str = String(s || "").slice(0, 10); const p = str.split("-"); return p.length === 3 ? p[2] + "-" + p[1] + "-" + p[0] : (s || "-"); };
 const monthStart = () => today().slice(0, 8) + "01";
 const clean = o => { const r = {}; for (const k in o) { const val = o[k]; if (val !== "" && val !== undefined) r[k] = val; } return r; };
 const COURSES = ["NDA", "NDA Foundation", "SSB", "CDS", "AFCAT", "Other"];
@@ -1165,6 +1169,10 @@ function App() {
   const [contact, setContact] = useState(null);
   const [toast, setToast] = useState("");
   const [billingMode, setBillingMode] = useState("calendar");
+  // Fees module filters live on the stable App instance so they survive the page
+  // remount that happens on every refresh() (Pages is recreated each render).
+  const [hf, setHf] = useState("");
+  const [mf, setMf] = useState("");
   useEffect(() => {
     SB.auth.getSession().then(({
       data
@@ -2448,8 +2456,7 @@ function App() {
     },
     fees: () => {
   const [pay, setPay] = useState(null);
-  const [hf, setHf] = useState("");
-  const [mf, setMf] = useState("");
+  // hf (hostel) and mf (month) filters are lifted to App so refresh() can't reset them.
   const num = v => Number(v || 0);
   const fdate = s => {
     if (!s) return "-";
@@ -2488,7 +2495,7 @@ function App() {
       refresh();
     }
   };
-  const receive = async (due, amt, mode, pFrom, pTo) => {
+  const receive = async (due, amt, mode, pFrom, pTo, pDate) => {
     const pay = num(amt);
     // Insert the payment FIRST. If it fails, do NOT touch the due — keep modal open so the user can retry.
     const ins = await SB.from("fee_payments").insert({
@@ -2497,7 +2504,7 @@ function App() {
       hostel_id: due.hostel_id,
       amount: pay,
       mode,
-      payment_date: today(),
+      payment_date: pDate || localToday(),
       period_from: pFrom || null,
       period_to: pTo || null,
       receipt_number: "R-" + Math.floor(Math.random() * 9000 + 1000),
@@ -2537,7 +2544,7 @@ function App() {
       return;
     }
     const R = (l, v) => "<div class='r'><span>" + l + "</span><b>" + v + "</b></div>";
-    w.document.write("<html><head><title>Receipt</title><style>body{font-family:Georgia,serif;padding:24px;color:#1f2630}h2{margin:0}hr{border:none;border-top:1px dashed #999;margin:14px 0}.r{display:flex;justify-content:space-between;margin:6px 0;font-size:14px}.big{font-size:18px;font-weight:bold}</style></head><body>" + "<h2>DDD Hostel</h2><div style='color:#777;font-size:12px'>Fee Receipt</div><hr>" + R("Receipt No.", fp ? fp.receipt_number : "-") + R("Date", fp ? fp.payment_date : today()) + R("Student", s ? s.full_name : "-") + R("Hostel", hName(d.hostel_id) || "-") + R("Month", String(d.month).slice(0, 7)) + R("Fee Period", period) + "<hr>" + R("Payable", "\u20B9" + num(d.payable).toLocaleString("en-IN")) + R("Paid", "\u20B9" + num(d.paid_amount).toLocaleString("en-IN")) + R("Pending", "\u20B9" + num(d.pending).toLocaleString("en-IN")) + "<hr><div class='r big'><span>Status</span><span>" + (num(d.pending) <= 0 ? "PAID" : "PARTIAL") + "</span></div><hr>" + "<div style='font-size:11px;color:#888;text-align:center'>Computer generated \u00B7 " + new Date().toLocaleString() + "</div></body></html>");
+    w.document.write("<html><head><title>Receipt</title><style>body{font-family:Georgia,serif;padding:24px;color:#1f2630}h2{margin:0}hr{border:none;border-top:1px dashed #999;margin:14px 0}.r{display:flex;justify-content:space-between;margin:6px 0;font-size:14px}.big{font-size:18px;font-weight:bold}</style></head><body>" + "<h2>DDD Hostel</h2><div style='color:#777;font-size:12px'>Fee Receipt</div><hr>" + R("Receipt No.", fp ? fp.receipt_number : "-") + R("Payment Date", fp && fp.payment_date ? dmy(fp.payment_date) : "-") + R("Student", s ? s.full_name : "-") + R("Hostel", hName(d.hostel_id) || "-") + R("Month", String(d.month).slice(0, 7)) + R("Fee Period", period) + "<hr>" + R("Payable", "\u20B9" + num(d.payable).toLocaleString("en-IN")) + R("Paid", "\u20B9" + num(d.paid_amount).toLocaleString("en-IN")) + R("Pending", "\u20B9" + num(d.pending).toLocaleString("en-IN")) + "<hr><div class='r big'><span>Status</span><span>" + (num(d.pending) <= 0 ? "PAID" : "PARTIAL") + "</span></div><hr>" + "<div style='font-size:11px;color:#888;text-align:center'>Computer generated \u00B7 " + new Date().toLocaleString() + "</div></body></html>");
     w.document.close();
     w.focus();
     setTimeout(() => w.print(), 300);
@@ -3665,6 +3672,7 @@ function PayModal({
   const [mode, setMode] = useState("upi");
   const [pFrom, setPFrom] = useState(bounds[0]);
   const [pTo, setPTo] = useState(bounds[1]);
+  const [pDate, setPDate] = useState(localToday());
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const confirm = async () => {
@@ -3674,10 +3682,18 @@ function PayModal({
       setErr("Amount 0 se zyada aur pending (" + inr(max) + ") se kam ya barabar honi chahiye.");
       return;
     }
+    if (!pDate || isNaN(new Date(pDate + "T00:00:00"))) {
+      setErr("Payment date sahi nahi hai.");
+      return;
+    }
+    if (pDate > localToday()) {
+      setErr("Payment date future me nahi ho sakti.");
+      return;
+    }
     setErr("");
     setBusy(true);
     try {
-      await onSave(due, n, mode, pFrom, pTo);
+      await onSave(due, n, mode, pFrom, pTo, pDate);
     } catch (e) {
       setErr(e && e.message ? e.message : String(e));
     }
@@ -3754,6 +3770,22 @@ function PayModal({
       marginTop: 5
     }
   }))), /*#__PURE__*/React.createElement("label", {
+    style: {
+      display: "block",
+      marginBottom: 14
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: lbl
+  }, "Payment kis date ko aaya"), /*#__PURE__*/React.createElement("input", {
+    className: "inp",
+    type: "date",
+    value: pDate,
+    max: localToday(),
+    onChange: e => setPDate(e.target.value),
+    style: {
+      marginTop: 5
+    }
+  })), /*#__PURE__*/React.createElement("label", {
     style: {
       display: "block",
       marginBottom: 16
