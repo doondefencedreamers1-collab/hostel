@@ -422,7 +422,7 @@ const BED = {
   }
 };
 const NAV = {
-  director: ["dashboard", "hostels", "rooms", "students", "roster", "fees", "expenses", "staff", "complaints", "inventory", "reports", "insights", "audit", "approvals"],
+  director: ["dashboard", "hostels", "rooms", "students", "roster", "fees", "expenses", "staff", "salary", "complaints", "inventory", "reports", "insights", "audit", "approvals"],
   manager: ["dashboard", "rooms", "students", "roster", "fees", "expenses", "staff", "complaints", "inventory", "reports"],
   accountant: ["dashboard", "fees", "expenses", "reports", "staff"],
   staff: ["dashboard"]
@@ -436,6 +436,7 @@ const NAV_LABEL = {
   fees: "Fees",
   expenses: "Expenses",
   staff: "Staff",
+  salary: "Salary",
   complaints: "Complaints",
   inventory: "Inventory",
   audit: "Audit Log",
@@ -3503,14 +3504,18 @@ function StudentProfile({
 const fetchAll = async table => {
   const out = [];
   let from = 0;
+  const orderCol = table === "staff_salary_profile" ? "employee_id" : "id";
   for (let guard = 0; guard < 500; guard++) {
     const {
       data,
       error
-    } = await SB.from(table).select("*").order("id", {
+    } = await SB.from(table).select("*").order(orderCol, {
       ascending: true
     }).range(from, from + 999);
-    if (error) return {
+    if (error) return typeof SAL_OPTIONAL !== "undefined" && SAL_OPTIONAL.includes(table) ? {
+      data: [],
+      error: null
+    } : {
       data: null,
       error
     };
@@ -3528,7 +3533,8 @@ const fetchAll = async table => {
 /* Bell: every alert = { label, icon, count, page, filter } -> click opens page with filter */
 function BellAlerts({
   data,
-  go
+  go,
+  role
 }) {
   const [open, setOpen] = useState(false);
   const today = istToday();
@@ -3537,7 +3543,6 @@ function BellAlerts({
   const missing = (data.students || []).filter(s => s.status !== "left" && !isBillable(s)).length;
   const vacant = (data.beds || []).filter(b => b.bed_status === "vacant").length;
   const openC = (data.complaints || []).filter(c => c.status !== "resolved").length;
-  const salary = (data.employees || []).reduce((a, e) => a + num0(e.monthly_salary), 0);
   const alerts = [{
     icon: "💰",
     count: n("overdue"),
@@ -3579,14 +3584,6 @@ function BellAlerts({
       comp: "open"
     }
   }, {
-    icon: "👷",
-    count: salary > 0 ? 1 : 0,
-    label: "Salary payable: " + inr(salary),
-    page: "staff",
-    filter: {
-      staff: "salary"
-    }
-  }, {
     icon: "⚠️",
     count: missing,
     label: missing + " students: joining date/fee missing",
@@ -3595,6 +3592,7 @@ function BellAlerts({
       st: "missing"
     }
   }];
+  if (role === "director") salaryAlerts(data, today).forEach(a => alerts.push(a));
   (data.hostels || []).forEach(h => {
     if (h.agreement_end) {
       const dd = dayDiff(today, String(h.agreement_end).slice(0, 10));
@@ -3662,7 +3660,7 @@ function BellAlerts({
     key: i,
     className: "ddd-alert",
     onClick: () => click(a),
-    "data-alert": a.page + ":" + (a.filter ? Object.values(a.filter)[0] : ""),
+    "data-alert": a.key ? "salary:" + a.key : a.page + ":" + (a.filter ? Object.values(a.filter)[0] : ""),
     style: {
       display: "flex",
       width: "100%",
@@ -3679,7 +3677,9 @@ function BellAlerts({
     }
   }, /*#__PURE__*/React.createElement("span", null, a.icon), /*#__PURE__*/React.createElement("span", {
     style: {
-      flex: 1
+      flex: 1,
+      color: a.red ? col('red') : undefined,
+      fontWeight: a.red ? 700 : undefined
     }
   }, a.label), /*#__PURE__*/React.createElement("b", {
     style: {
@@ -3692,6 +3692,1558 @@ function BellAlerts({
       color: "#777"
     }
   }, "Sab theek hai ✓")) : null);
+}
+
+/* =====================================================================
+   018 — STAFF SALARY (Director only). Data comes from Director-only
+   tables; for everyone else RLS returns nothing.
+   Salary for month X is due on the 10th of month X+1.
+   ===================================================================== */
+const SAL_OPTIONAL = ["staff_attendance", "staff_salary_profile", "salary_advances", "salary_runs", "salary_edits"];
+const salaryDue = month => ymd(...(() => {
+  const n = addMonthsYmd(monthStartOf(month), 1);
+  const [y, m] = ymdParts(n);
+  return [y, m, 10];
+})());
+const salaryRowState = (r, today) => {
+  if (r.status === "paid") return {
+    kind: "paid",
+    label: "PAID",
+    c: col('green'),
+    bg: "#e6f4ec"
+  };
+  if ((today || istToday()) > salaryDue(r.month)) return {
+    kind: "overdue",
+    label: "OVERDUE",
+    c: col('red'),
+    bg: "#fbe9e7"
+  };
+  return {
+    kind: "pending",
+    label: "PENDING",
+    c: col('amber'),
+    bg: "#fdf4e0"
+  };
+};
+const monthName = s => {
+  const [y, m] = ymdParts(s);
+  return ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"][m - 1] + " " + y;
+};
+const advanceOutstanding = (data, empId) => (data.salary_advances || []).filter(a => a.employee_id === empId).reduce((s, a) => s + num0(a.amount), 0) - (data.salary_runs || []).filter(r => r.employee_id === empId && r.status === "paid").reduce((s, r) => s + num0(r.advance_deduction), 0);
+
+/* salary cycle for "today": month due this cycle = previous month (paid on the 10th) */
+const salaryCycle = (data, today) => {
+  today = today || istToday();
+  const [y, m, d] = ymdParts(today);
+  const month = addMonthsYmd(monthStartOf(today), -1);
+  const runs = data.salary_runs || [];
+  const cur = runs.filter(r => monthStartOf(r.month) === month);
+  const pending = cur.filter(r => r.status === "pending");
+  const pendingNet = pending.reduce((s, r) => s + num0(r.net), 0);
+  const overdue = runs.filter(r => r.status === "pending" && today > salaryDue(r.month));
+  const salaried = (data.staff_salary_profile || []).filter(p => num0(p.monthly_salary) > 0).length;
+  return {
+    month,
+    due: ymd(y, m, 10),
+    day: d,
+    generated: cur.length > 0,
+    pending,
+    pendingNet,
+    overdue,
+    salaried,
+    sub: !salaried ? "" : !cur.length ? monLabel(month) + " salary generate nahi hui" : pending.length ? monLabel(month) + " · " + pending.length + " staff pending" : monLabel(month) + " · sab paid"
+  };
+};
+/* Director salary alerts (Bell) — { icon, count, label, page, filter, red } */
+const salaryAlerts = (data, today) => {
+  const c = salaryCycle(data, today);
+  const out = [];
+  if (c.salaried && !c.generated) out.push({
+    icon: "🧾",
+    count: 1,
+    label: monthName(c.month).split(" ")[0] + " salary generate nahi hui",
+    page: "salary",
+    filter: {
+      gen: true,
+      month: c.month
+    },
+    key: "gen"
+  });
+  if (c.overdue.length) out.push({
+    icon: "🔴",
+    count: c.overdue.length,
+    label: c.overdue.length + " staff salary overdue (" + inr(c.overdue.reduce((s, r) => s + num0(r.net), 0)) + ")",
+    page: "salary",
+    filter: {
+      sf: "overdue"
+    },
+    key: "overdue",
+    red: true
+  });else if (c.pending.length && c.day >= 8) out.push({
+    icon: "👷",
+    count: c.pending.length,
+    label: "Salary 10 tarikh ko due — " + c.pending.length + " staff pending " + inr(c.pendingNet),
+    page: "salary",
+    filter: {
+      sf: "pending",
+      month: c.month
+    },
+    key: "due"
+  });else if (c.pending.length) out.push({
+    icon: "👷",
+    count: c.pending.length,
+    label: "Salary payable: " + inr(c.pendingNet) + " (" + monLabel(c.month) + ")",
+    page: "salary",
+    filter: {
+      sf: "pending",
+      month: c.month
+    },
+    key: "payable"
+  });
+  return out;
+};
+
+/* amount in words (Indian system) */
+const amountInWords = n => {
+  n = Math.round(num0(n));
+  if (n === 0) return "Zero Rupees Only";
+  const a = ["", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten", "Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen", "Seventeen", "Eighteen", "Nineteen"];
+  const b = ["", "", "Twenty", "Thirty", "Forty", "Fifty", "Sixty", "Seventy", "Eighty", "Ninety"];
+  const two = x => x < 20 ? a[x] : b[Math.floor(x / 10)] + (x % 10 ? " " + a[x % 10] : "");
+  const three = x => (x >= 100 ? a[Math.floor(x / 100)] + " Hundred" + (x % 100 ? " " : "") : "") + (x % 100 ? two(x % 100) : "");
+  const parts = [];
+  const cr = Math.floor(n / 10000000);
+  n %= 10000000;
+  const lk = Math.floor(n / 100000);
+  n %= 100000;
+  const th = Math.floor(n / 1000);
+  n %= 1000;
+  if (cr) parts.push(three(cr) + " Crore");
+  if (lk) parts.push(two(lk) + " Lakh");
+  if (th) parts.push(two(th) + " Thousand");
+  if (n) parts.push(three(n));
+  return parts.join(" ") + " Rupees Only";
+};
+
+/* A4 salary slip (print -> Save as PDF; WhatsApp share) */
+const printSalarySlip = (r, emp, hostelName, prof) => {
+  const w = window.open("", "_blank", "width=820,height=1000");
+  if (!w) {
+    alert("Popup block hua — browser mein popups allow karein");
+    return;
+  }
+  const money = v => "₹" + num0(v).toLocaleString("en-IN");
+  const row = (l, v) => "<tr><td>" + esc(l) + "</td><td class='n'>" + esc(v) + "</td></tr>";
+  const phone = String(emp && emp.mobile || "").replace(/\D/g, "").slice(-10);
+  const msg = "Salary slip " + (r.slip_no || "") + " — " + (emp && emp.full_name || "") + ", " + monthName(r.month) + ": Net paid " + money(r.net) + " on " + dmy(r.paid_date) + " (" + String(r.mode || "").toUpperCase() + "). - DDD Hostel";
+  const wa = "https://wa.me/" + (phone ? "91" + phone : "") + "?text=" + encodeURIComponent(msg);
+  w.document.write("<html><head><title>Salary Slip " + esc(r.slip_no || "") + "</title><style>" + "@page{size:A4;margin:14mm}body{font-family:Georgia,serif;color:#1f2630;max-width:760px;margin:0 auto;padding:18px}" + ".hd{display:flex;align-items:center;gap:14px;border-bottom:2px solid #1f2630;padding-bottom:10px}.logo{width:56px;height:56px;border-radius:12px;background:#2c3e57;color:#fff;display:grid;place-items:center;font-weight:800;font-size:18px}" + "h1{margin:0;font-size:22px}.sub{color:#666;font-size:12px}.meta{display:grid;grid-template-columns:1fr 1fr;gap:4px 24px;margin:14px 0;font-size:13.5px}.meta b{display:inline-block;min-width:120px;color:#555;font-weight:600}" + "table{width:100%;border-collapse:collapse;margin-top:8px;font-size:14px}td,th{border:1px solid #ccc;padding:7px 10px;text-align:left}th{background:#f3f1ec}.n{text-align:right}" + ".net{font-size:18px;font-weight:800;margin-top:12px;display:flex;justify-content:space-between;border:2px solid #1f2630;padding:10px 12px}.words{font-size:13px;margin-top:6px;color:#333}" + ".note{font-size:12px;color:#666;margin-top:10px}.sign{display:flex;justify-content:space-between;margin-top:60px;font-size:13px}.sign div{border-top:1px solid #333;padding-top:6px;width:40%;text-align:center}" + ".btns{margin:18px 0;display:flex;gap:10px}.btns a,.btns button{padding:10px 16px;border-radius:8px;border:none;font-weight:700;cursor:pointer;text-decoration:none;font-size:14px}" + "@media print{.btns{display:none}}</style></head><body>" + "<div class='btns'><button onclick='window.print()' style='background:#2c3e57;color:#fff'>Download PDF</button><a href='" + esc(wa) + "' target='_blank' style='background:#25D366;color:#fff'>Share on WhatsApp</a></div>" + "<div class='hd'><div class='logo'>DDD</div><div><h1>DDD Hostel</h1><div class='sub'>Salary Slip · " + esc(monthName(r.month)) + "</div></div><div style='margin-left:auto;text-align:right;font-size:13px'><b>Slip No.</b><br>" + esc(r.slip_no || "-") + "</div></div>" + "<div class='meta'><div><b>Staff</b>" + esc(emp && emp.full_name || "-") + "</div><div><b>Role</b>" + esc(emp && emp.role || "-") + "</div>" + "<div><b>Hostel</b>" + esc(hostelName || "-") + "</div><div><b>Month</b>" + esc(monthName(r.month)) + "</div>" + "<div><b>Period</b>" + esc(dmy(r.period_from) + " to " + dmy(r.period_to)) + "</div><div><b>Attendance days</b>" + esc(String(r.attendance_days || 0)) + "</div>" + "<div><b>UAN</b>" + esc(prof && prof.uan || "-") + "</div><div><b>PF No.</b>" + esc(prof && prof.pf_number || "-") + "</div></div>" + "<table><tr><th>Earnings</th><th class='n'>Amount</th></tr>" + row("Gross salary", money(r.gross)) + (num0(r.bonus) > 0 ? row("Bonus", money(r.bonus)) : "") + "</table>" + "<table><tr><th>Deductions</th><th class='n'>Amount</th></tr>" + row("Employee PF", money(r.employee_pf)) + row("Advance recovery", money(r.advance_deduction)) + row("Other deduction", money(r.other_deduction)) + "</table>" + "<div class='net'><span>Net Paid</span><span>" + money(r.net) + "</span></div><div class='words'>" + esc(amountInWords(r.net)) + "</div>" + "<div class='note'>Employer PF contribution: " + money(r.employer_pf) + " (paid by employer — not deducted from salary)</div>" + "<div class='meta' style='margin-top:14px'><div><b>Paid date</b>" + esc(dmy(r.paid_date)) + "</div><div><b>Mode</b>" + esc(String(r.mode || "-").toUpperCase() + (r.txn_ref ? " · " + r.txn_ref : "")) + "</div></div>" + (r.remarks ? "<div class='note'>Remarks: " + esc(r.remarks) + "</div>" : "") + "<div class='sign'><div>Employee signature</div><div>For DDD Hostel (Director)</div></div>" + "</body></html>");
+  w.document.close();
+  w.focus();
+};
+
+/* ---- staff form: salary + PF fields (Director only) ---- */
+function SalaryProfileFields({
+  v,
+  set,
+  profiles
+}) {
+  useEffect(() => {
+    if (v._sal !== undefined) return;
+    const p = (profiles || []).find(x => x.employee_id === v.id) || {};
+    set("_sal", {
+      monthly_salary: p.monthly_salary ?? "",
+      pf_applicable: !!p.pf_applicable,
+      uan: p.uan || "",
+      pf_number: p.pf_number || "",
+      pf_wage: p.pf_wage ?? "",
+      bank_account: p.bank_account || "",
+      ifsc: p.ifsc || "",
+      upi_id: p.upi_id || ""
+    });
+  }, []);
+  const s = v._sal || {};
+  const up = (k, val) => set("_sal", {
+    ...s,
+    [k]: val
+  });
+  const box = {
+    display: "flex",
+    flexDirection: "column",
+    gap: 5
+  };
+  const inp = (k, label, type) => /*#__PURE__*/React.createElement("label", {
+    style: box,
+    key: k
+  }, /*#__PURE__*/React.createElement("span", {
+    style: lblStyle()
+  }, label), /*#__PURE__*/React.createElement("input", {
+    className: "inp",
+    type: type || "text",
+    min: type === "number" ? 0 : undefined,
+    value: s[k] ?? "",
+    "data-sal": k,
+    onChange: e => up(k, type === "number" ? e.target.value === "" ? "" : Number(e.target.value) : e.target.value)
+  }));
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      gridColumn: "1/-1",
+      display: "grid",
+      gap: 12,
+      gridTemplateColumns: "1fr 1fr",
+      padding: 12,
+      border: "1px dashed " + col('line'),
+      borderRadius: 10
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      gridColumn: "1/-1",
+      fontSize: 12,
+      fontWeight: 800,
+      color: col('slate')
+    }
+  }, "🔒 Salary (sirf Director ko dikhta hai)"), inp("monthly_salary", "Monthly Salary (₹)", "number"), /*#__PURE__*/React.createElement("label", {
+    style: box
+  }, /*#__PURE__*/React.createElement("span", {
+    style: lblStyle()
+  }, "PF applicable"), /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    className: "inp",
+    "data-sal": "pf_applicable",
+    style: {
+      textAlign: "left",
+      cursor: "pointer",
+      fontWeight: 700,
+      color: s.pf_applicable ? col('green') : col('mut')
+    },
+    onClick: () => up("pf_applicable", !s.pf_applicable)
+  }, s.pf_applicable ? "✓ Yes" : "✗ No")), s.pf_applicable ? inp("uan", "UAN") : null, s.pf_applicable ? inp("pf_number", "PF Number") : null, s.pf_applicable ? inp("pf_wage", "PF Wage (khaali = monthly salary)", "number") : null, inp("bank_account", "Bank A/c (optional)"), inp("ifsc", "IFSC (optional)"), inp("upi_id", "UPI ID (optional)"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      gridColumn: "1/-1",
+      fontSize: 11.5,
+      color: col('mut')
+    }
+  }, "Salary badalne par agle generate hone wale mahine se lagegi; purane mahine nahi badlenge."));
+}
+VALIDATE.employees = v => {
+  if (v.exit_date && v.joining_date && String(v.exit_date) < String(v.joining_date)) return "Exit date joining date se pehle nahi ho sakti.";
+  if (v.status === "left" && !v.exit_date) return "Left staff ke liye Exit Date daalein.";
+  const s = v._sal;
+  if (s && (num0(s.monthly_salary) < 0 || s.pf_wage !== "" && s.pf_wage != null && num0(s.pf_wage) < 0)) return "Salary / PF wage negative nahi ho sakta.";
+  return "";
+};
+const normSalProfile = s => ({
+  monthly_salary: num0(s.monthly_salary),
+  pf_applicable: !!s.pf_applicable,
+  uan: (s.uan || "").trim() || null,
+  pf_number: (s.pf_number || "").trim() || null,
+  pf_wage: s.pf_wage === "" || s.pf_wage == null ? null : num0(s.pf_wage),
+  bank_account: (s.bank_account || "").trim() || null,
+  ifsc: (s.ifsc || "").trim() || null,
+  upi_id: (s.upi_id || "").trim() || null
+});
+
+/* ---- Staff page (salary columns + buttons only for Director; Mark Present fixed) ---- */
+function StaffPage({
+  ctx
+}) {
+  const {
+    data,
+    role,
+    hName,
+    NameBtn,
+    Header,
+    EditDel,
+    flash,
+    refresh,
+    session,
+    openSal
+  } = ctx;
+  const isDir = role === "director";
+  const [hsel, setHsel] = useState([]);
+  const [rolesel, setRolesel] = useState("");
+  const [busy, setBusy] = useState("");
+  const today = istToday();
+  const chip = on => ({
+    padding: "5px 12px",
+    borderRadius: 8,
+    border: "1px solid " + col('line'),
+    cursor: "pointer",
+    fontSize: 12.5,
+    fontWeight: 700,
+    background: on ? col('slate') : "#fff",
+    color: on ? "#fff" : col('slate')
+  });
+  const rolesPresent = [...new Set(data.employees.map(e => e.role).filter(Boolean))];
+  const list = data.employees.filter(e => (!hsel.length || hsel.includes(e.hostel_id)) && (!rolesel || e.role === rolesel));
+  const att = {};
+  (data.staff_attendance || []).forEach(a => {
+    if (String(a.date).slice(0, 10) === today) att[a.employee_id] = a;
+  });
+  const prof = {};
+  (data.staff_salary_profile || []).forEach(p => {
+    prof[p.employee_id] = p;
+  });
+  const toggle = async e => {
+    if (busy) return;
+    const cur = att[e.id] && att[e.id].present;
+    setBusy(e.id);
+    const {
+      error
+    } = await SB.from("staff_attendance").upsert({
+      employee_id: e.id,
+      hostel_id: e.hostel_id,
+      date: today,
+      present: !cur,
+      created_by: session.user.id
+    }, {
+      onConflict: "employee_id,date"
+    });
+    setBusy("");
+    if (error) {
+      flash("⚠ " + error.message);
+      return;
+    }
+    flash(cur ? "Absent mark hua" : "Present mark hua");
+    refresh();
+  };
+  const heads = ["Name", "Role", "Hostel"].concat(isDir ? ["Salary", "Advance"] : []).concat(["Today", ""]);
+  return /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(Header, {
+    entity: "employees"
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      flexWrap: "wrap",
+      gap: 8,
+      alignItems: "center",
+      marginBottom: 14
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 12,
+      fontWeight: 700,
+      color: col('mut')
+    }
+  }, "Hostel:"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => setHsel([]),
+    style: chip(hsel.length === 0)
+  }, "All"), data.hostels.map(h => /*#__PURE__*/React.createElement("button", {
+    key: h.id,
+    onClick: () => setHsel(p => p.includes(h.id) ? p.filter(x => x !== h.id) : [...p, h.id]),
+    style: chip(hsel.includes(h.id))
+  }, h.code)), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 12,
+      fontWeight: 700,
+      color: col('mut'),
+      marginLeft: 8
+    }
+  }, "Role:"), /*#__PURE__*/React.createElement("select", {
+    className: "inp",
+    style: {
+      width: "auto"
+    },
+    value: rolesel,
+    onChange: e => setRolesel(e.target.value)
+  }, /*#__PURE__*/React.createElement("option", {
+    value: ""
+  }, "All roles"), rolesPresent.map(r => /*#__PURE__*/React.createElement("option", {
+    key: r,
+    value: r
+  }, r))), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 12,
+      color: col('mut'),
+      marginLeft: "auto"
+    }
+  }, list.length, " staff")), /*#__PURE__*/React.createElement("div", {
+    className: "card",
+    style: {
+      overflowX: "auto"
+    }
+  }, /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, heads.map(c => /*#__PURE__*/React.createElement("th", {
+    key: c
+  }, c)))), /*#__PURE__*/React.createElement("tbody", null, list.map(e => {
+    const present = att[e.id] && att[e.id].present;
+    const out = isDir ? advanceOutstanding(data, e.id) : 0;
+    return /*#__PURE__*/React.createElement("tr", {
+      key: e.id,
+      "data-staff": e.id
+    }, /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement(NameBtn, {
+      name: e.full_name,
+      mobile: e.mobile,
+      sub: e.role
+    }), e.status === "left" ? /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 10.5,
+        color: col('red')
+      }
+    }, "Left ", e.exit_date ? dmy(e.exit_date) : "") : null), /*#__PURE__*/React.createElement("td", null, e.role), /*#__PURE__*/React.createElement("td", null, hName(e.hostel_id)), isDir ? /*#__PURE__*/React.createElement("td", {
+      "data-staff-salary": e.id
+    }, inr(prof[e.id] ? prof[e.id].monthly_salary : 0), prof[e.id] && prof[e.id].pf_applicable ? /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 10.5,
+        color: col('mut')
+      }
+    }, "PF") : null) : null, isDir ? /*#__PURE__*/React.createElement("td", {
+      "data-staff-advance": e.id,
+      style: {
+        color: out > 0 ? col('amber') : undefined,
+        fontWeight: out > 0 ? 700 : 400
+      }
+    }, inr(out)) : null, /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("button", {
+      className: "mini",
+      disabled: busy === e.id,
+      onClick: () => toggle(e),
+      "data-present": e.id,
+      style: {
+        background: present ? col('green') : col('slate')
+      }
+    }, present ? "✓ Present" : "Mark Present")), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("span", {
+      style: {
+        display: "inline-flex",
+        gap: 6,
+        alignItems: "center"
+      }
+    }, isDir ? /*#__PURE__*/React.createElement("button", {
+      className: "mini",
+      style: {
+        background: col('amber')
+      },
+      onClick: () => openSal({
+        type: "advance",
+        emp: e
+      }),
+      "data-give-advance": e.id
+    }, "₹ Advance") : null, isDir ? /*#__PURE__*/React.createElement("button", {
+      className: "mini",
+      style: {
+        background: col('steel')
+      },
+      onClick: () => openSal({
+        type: "profile",
+        emp: e
+      }),
+      "data-staff-sal": e.id
+    }, "Salary") : null, /*#__PURE__*/React.createElement(EditDel, {
+      entity: "employees",
+      item: e
+    }))));
+  }), !list.length ? /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
+    colSpan: heads.length
+  }, "No staff match.")) : null))));
+}
+
+/* ---- Give Advance (Director) ---- */
+function GiveAdvanceModal({
+  ctx,
+  emp,
+  onClose
+}) {
+  const today = istToday();
+  const [amt, setAmt] = useState("");
+  const [date, setDate] = useState(today);
+  const [mode, setMode] = useState("cash");
+  const [note, setNote] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const out = advanceOutstanding(ctx.data, emp.id);
+  const submit = async () => {
+    if (busy) return;
+    if (!(num0(amt) > 0)) {
+      setErr("Amount 0 se zyada daalein.");
+      return;
+    }
+    if (!date || date > today) {
+      setErr("Date aaj ya pehle ki honi chahiye.");
+      return;
+    }
+    setErr("");
+    setBusy(true);
+    const {
+      error
+    } = await SB.from("salary_advances").insert({
+      id: crypto.randomUUID(),
+      employee_id: emp.id,
+      amount: num0(amt),
+      given_on: date,
+      mode,
+      note: note.trim() || null,
+      kind: "advance",
+      created_by: ctx.session.user.id
+    });
+    setBusy(false);
+    if (error) {
+      setErr(error.message);
+      return;
+    }
+    ctx.flash("Advance saved");
+    ctx.refresh();
+    onClose();
+  };
+  const box = {
+    display: "flex",
+    flexDirection: "column",
+    gap: 5
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    className: "ovl",
+    onClick: onClose
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "card",
+    style: {
+      padding: 22,
+      maxWidth: 380,
+      width: "100%"
+    },
+    onClick: e => e.stopPropagation()
+  }, /*#__PURE__*/React.createElement("b", {
+    className: "serif",
+    style: {
+      fontSize: 16
+    }
+  }, "Give Advance — ", emp.full_name), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: col('mut'),
+      marginTop: 4
+    }
+  }, "Abhi outstanding: ", inr(out)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "1fr 1fr",
+      gap: 10,
+      marginTop: 14
+    }
+  }, /*#__PURE__*/React.createElement("label", {
+    style: box
+  }, /*#__PURE__*/React.createElement("span", {
+    style: lblStyle()
+  }, "Amount (₹)"), /*#__PURE__*/React.createElement("input", {
+    className: "inp",
+    type: "number",
+    min: 1,
+    value: amt,
+    onChange: e => setAmt(e.target.value),
+    "data-adv-amount": "1"
+  })), /*#__PURE__*/React.createElement("label", {
+    style: box
+  }, /*#__PURE__*/React.createElement("span", {
+    style: lblStyle()
+  }, "Date"), /*#__PURE__*/React.createElement("input", {
+    className: "inp",
+    type: "date",
+    max: today,
+    value: date,
+    onChange: e => setDate(e.target.value)
+  })), /*#__PURE__*/React.createElement("label", {
+    style: box
+  }, /*#__PURE__*/React.createElement("span", {
+    style: lblStyle()
+  }, "Mode"), /*#__PURE__*/React.createElement("select", {
+    className: "inp",
+    value: mode,
+    onChange: e => setMode(e.target.value)
+  }, ["cash", "upi", "bank"].map(m => /*#__PURE__*/React.createElement("option", {
+    key: m,
+    value: m
+  }, m.toUpperCase())))), /*#__PURE__*/React.createElement("label", {
+    style: box
+  }, /*#__PURE__*/React.createElement("span", {
+    style: lblStyle()
+  }, "Note"), /*#__PURE__*/React.createElement("input", {
+    className: "inp",
+    value: note,
+    onChange: e => setNote(e.target.value)
+  }))), err ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 10,
+      fontSize: 12.5,
+      color: col('red'),
+      fontWeight: 700
+    }
+  }, err) : null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 10,
+      marginTop: 16
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: onClose,
+    style: {
+      flex: 1,
+      padding: 10,
+      background: col('paper'),
+      border: "1px solid " + col('line'),
+      borderRadius: 9,
+      fontWeight: 700,
+      cursor: "pointer"
+    }
+  }, "Cancel"), /*#__PURE__*/React.createElement("button", {
+    className: "pbtn",
+    disabled: busy,
+    style: {
+      flex: 2,
+      justifyContent: "center"
+    },
+    onClick: submit,
+    "data-adv-save": "1"
+  }, busy ? "Saving…" : "Save Advance"))));
+}
+
+/* ---- Staff salary profile: salary, PF, advance + recovery history, months ---- */
+function StaffSalaryModal({
+  ctx,
+  emp,
+  onClose
+}) {
+  const {
+    data,
+    hName
+  } = ctx;
+  const p = (data.staff_salary_profile || []).find(x => x.employee_id === emp.id) || {};
+  const advs = (data.salary_advances || []).filter(a => a.employee_id === emp.id).sort((a, b) => String(b.given_on).localeCompare(String(a.given_on)));
+  const runs = (data.salary_runs || []).filter(r => r.employee_id === emp.id).sort((a, b) => String(b.month).localeCompare(String(a.month)));
+  const recov = runs.filter(r => r.status === "paid" && num0(r.advance_deduction) > 0);
+  const out = advanceOutstanding(data, emp.id);
+  const I = (l, v) => /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10.5,
+      color: col('mut'),
+      fontWeight: 700,
+      textTransform: "uppercase"
+    }
+  }, l), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 700
+    }
+  }, v || "—"));
+  return /*#__PURE__*/React.createElement("div", {
+    className: "ovl",
+    onClick: onClose
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "card",
+    style: {
+      padding: 20,
+      maxWidth: 640,
+      width: "100%",
+      maxHeight: "90vh",
+      overflowY: "auto"
+    },
+    onClick: e => e.stopPropagation(),
+    "data-staff-sal-modal": emp.id
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between"
+    }
+  }, /*#__PURE__*/React.createElement("b", {
+    className: "serif",
+    style: {
+      fontSize: 16
+    }
+  }, "Salary — ", emp.full_name), /*#__PURE__*/React.createElement("button", {
+    onClick: onClose,
+    style: {
+      border: "none",
+      background: "none",
+      cursor: "pointer",
+      fontSize: 18,
+      color: col('mut')
+    }
+  }, "✕")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "repeat(auto-fill,minmax(140px,1fr))",
+      gap: 10,
+      margin: "12px 0"
+    }
+  }, I("Monthly salary", inr(p.monthly_salary)), I("PF", p.pf_applicable ? "Yes" : "No"), I("UAN", p.uan), I("PF wage", p.pf_applicable ? inr(p.pf_wage != null ? p.pf_wage : p.monthly_salary) : ""), I("Bank / UPI", [p.bank_account, p.ifsc, p.upi_id].filter(Boolean).join(" · ")), I("Advance outstanding", inr(out))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 8,
+      marginBottom: 12
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "mini",
+    style: {
+      background: col('amber')
+    },
+    onClick: () => {
+      onClose();
+      ctx.openSal({
+        type: "advance",
+        emp
+      });
+    }
+  }, "₹ Give Advance"), /*#__PURE__*/React.createElement("button", {
+    className: "mini",
+    style: {
+      background: col('slate')
+    },
+    onClick: () => {
+      onClose();
+      ctx.setModal({
+        entity: "employees",
+        item: emp
+      });
+    }
+  }, "✎ Edit salary / PF")), /*#__PURE__*/React.createElement("b", {
+    style: {
+      fontSize: 13
+    }
+  }, "Advances"), /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Date", "Amount", "Mode", "Note"].map(c => /*#__PURE__*/React.createElement("th", {
+    key: c
+  }, c)))), /*#__PURE__*/React.createElement("tbody", null, advs.map(a => /*#__PURE__*/React.createElement("tr", {
+    key: a.id
+  }, /*#__PURE__*/React.createElement("td", null, dmy(a.given_on)), /*#__PURE__*/React.createElement("td", null, inr(a.amount)), /*#__PURE__*/React.createElement("td", null, String(a.mode || "-").toUpperCase()), /*#__PURE__*/React.createElement("td", null, a.note || ""))), !advs.length ? /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
+    colSpan: "4"
+  }, "Koi advance nahi.")) : null)), /*#__PURE__*/React.createElement("b", {
+    style: {
+      fontSize: 13,
+      display: "block",
+      marginTop: 12
+    }
+  }, "Recovery (salary se kata)"), /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Month", "Recovered", "Paid on"].map(c => /*#__PURE__*/React.createElement("th", {
+    key: c
+  }, c)))), /*#__PURE__*/React.createElement("tbody", null, recov.map(r => /*#__PURE__*/React.createElement("tr", {
+    key: r.id
+  }, /*#__PURE__*/React.createElement("td", null, monLabel(r.month)), /*#__PURE__*/React.createElement("td", null, inr(r.advance_deduction)), /*#__PURE__*/React.createElement("td", null, dmy(r.paid_date)))), !recov.length ? /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
+    colSpan: "3"
+  }, "Abhi koi recovery nahi.")) : null)), /*#__PURE__*/React.createElement("b", {
+    style: {
+      fontSize: 13,
+      display: "block",
+      marginTop: 12
+    }
+  }, "Salary months"), /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Month", "Net", "Status", "Slip"].map(c => /*#__PURE__*/React.createElement("th", {
+    key: c
+  }, c)))), /*#__PURE__*/React.createElement("tbody", null, runs.map(r => {
+    const st = salaryRowState(r);
+    return /*#__PURE__*/React.createElement("tr", {
+      key: r.id
+    }, /*#__PURE__*/React.createElement("td", null, monLabel(r.month)), /*#__PURE__*/React.createElement("td", null, inr(r.net)), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement(Badge, {
+      c: st.c,
+      bg: st.bg
+    }, st.label)), /*#__PURE__*/React.createElement("td", null, r.status === "paid" ? /*#__PURE__*/React.createElement("button", {
+      className: "mini",
+      style: {
+        background: col('slate')
+      },
+      onClick: () => printSalarySlip(r, emp, hName(r.hostel_id || emp.hostel_id), p)
+    }, "🧾") : ""));
+  }), !runs.length ? /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
+    colSpan: "4"
+  }, "Abhi koi salary generate nahi hui.")) : null))));
+}
+
+/* ---- Director edit of a pending salary row ---- */
+function SalaryEditModal({
+  ctx,
+  run,
+  pfSet,
+  onClose
+}) {
+  const emp = ctx.data.employees.find(e => e.id === run.employee_id) || {};
+  const [g, setG] = useState(num0(run.gross));
+  const [a, setA] = useState(num0(run.advance_deduction));
+  const [o, setO] = useState(num0(run.other_deduction));
+  const [b, setB] = useState(num0(run.bonus));
+  const [pf, setPf] = useState(!!run.pf_on);
+  const [rm, setRm] = useState(run.remarks || "");
+  const [reason, setReason] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const avail = (ctx.data.salary_advances || []).filter(x => x.employee_id === run.employee_id).reduce((s, x) => s + num0(x.amount), 0) - (ctx.data.salary_runs || []).filter(x => x.employee_id === run.employee_id && x.id !== run.id && (x.status === "paid" || x.status === "pending")).reduce((s, x) => s + num0(x.advance_deduction), 0);
+  const base = pfSet.apply ? Math.min(num0(run.pf_wage), pfSet.ceiling) : num0(run.pf_wage);
+  const empPf = pf ? pf === !!run.pf_on ? num0(run.employee_pf) : Math.round(base * pfSet.emp / 100) : 0;
+  const net = Math.max(0, num0(g) - empPf - num0(a) - num0(o) + num0(b));
+  const hist = (ctx.data.salary_edits || []).filter(x => x.run_id === run.id).sort((x, y) => String(y.edited_at).localeCompare(String(x.edited_at)));
+  const submit = async () => {
+    if (busy) return;
+    if (reason.trim().length < 3) {
+      setErr("Edit ka reason likhein (jaise \"4 din chhutti\").");
+      return;
+    }
+    if ([g, a, o, b].some(x => num0(x) < 0)) {
+      setErr("Amount negative nahi ho sakta.");
+      return;
+    }
+    if (num0(a) > Math.max(avail, 0)) {
+      setErr("Advance cut outstanding (" + inr(Math.max(avail, 0)) + ") se zyada nahi ho sakta.");
+      return;
+    }
+    setErr("");
+    setBusy(true);
+    const {
+      error
+    } = await SB.rpc("salary_edit", {
+      p_run: run.id,
+      p_gross: num0(g),
+      p_advance: num0(a),
+      p_other: num0(o),
+      p_bonus: num0(b),
+      p_pf_on: pf,
+      p_remarks: rm,
+      p_reason: reason.trim()
+    });
+    setBusy(false);
+    if (error) {
+      setErr(error.message);
+      return;
+    }
+    ctx.flash("Salary updated");
+    ctx.refresh();
+    onClose();
+  };
+  const box = {
+    display: "flex",
+    flexDirection: "column",
+    gap: 5
+  };
+  const num = (label, val, setv, key) => /*#__PURE__*/React.createElement("label", {
+    style: box
+  }, /*#__PURE__*/React.createElement("span", {
+    style: lblStyle()
+  }, label), /*#__PURE__*/React.createElement("input", {
+    className: "inp",
+    type: "number",
+    min: 0,
+    value: val,
+    "data-edit": key,
+    onChange: e => setv(e.target.value === "" ? 0 : Number(e.target.value))
+  }));
+  return /*#__PURE__*/React.createElement("div", {
+    className: "ovl",
+    onClick: onClose
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "card",
+    style: {
+      padding: 22,
+      maxWidth: 460,
+      width: "100%",
+      maxHeight: "92vh",
+      overflowY: "auto"
+    },
+    onClick: e => e.stopPropagation()
+  }, /*#__PURE__*/React.createElement("b", {
+    className: "serif",
+    style: {
+      fontSize: 16
+    }
+  }, "Edit Salary — ", emp.full_name, " · ", monLabel(run.month)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "1fr 1fr",
+      gap: 10,
+      marginTop: 14
+    }
+  }, num("Gross (₹)", g, setG, "gross"), num("Advance cut (₹)", a, setA, "advance"), num("Other deduction (₹)", o, setO, "other"), num("Bonus (₹)", b, setB, "bonus"), /*#__PURE__*/React.createElement("label", {
+    style: box
+  }, /*#__PURE__*/React.createElement("span", {
+    style: lblStyle()
+  }, "PF this month"), /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    className: "inp",
+    "data-edit": "pf",
+    style: {
+      textAlign: "left",
+      cursor: "pointer",
+      fontWeight: 700,
+      color: pf ? col('green') : col('mut')
+    },
+    onClick: () => setPf(x => !x)
+  }, pf ? "✓ On (" + inr(empPf) + ")" : "✗ Off")), /*#__PURE__*/React.createElement("label", {
+    style: box
+  }, /*#__PURE__*/React.createElement("span", {
+    style: lblStyle()
+  }, "Remarks"), /*#__PURE__*/React.createElement("input", {
+    className: "inp",
+    value: rm,
+    onChange: e => setRm(e.target.value)
+  })), /*#__PURE__*/React.createElement("label", {
+    style: {
+      ...box,
+      gridColumn: "1/-1"
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: lblStyle()
+  }, "Reason (zaroori)"), /*#__PURE__*/React.createElement("input", {
+    className: "inp",
+    value: reason,
+    placeholder: "jaise: 4 din chhutti",
+    onChange: e => setReason(e.target.value),
+    "data-edit": "reason"
+  }))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 10,
+      fontSize: 12,
+      color: col('mut')
+    }
+  }, "Advance outstanding (is row ke liye): ", inr(Math.max(avail, 0))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 10,
+      padding: 10,
+      background: col('paper'),
+      borderRadius: 9,
+      display: "flex",
+      justifyContent: "space-between",
+      fontWeight: 800
+    },
+    "data-edit-net": "1"
+  }, /*#__PURE__*/React.createElement("span", null, "NET"), /*#__PURE__*/React.createElement("span", null, inr(net))), hist.length ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 10,
+      fontSize: 11.5
+    }
+  }, /*#__PURE__*/React.createElement("b", null, "History"), hist.map(h => /*#__PURE__*/React.createElement("div", {
+    key: h.id,
+    style: {
+      color: col('mut')
+    }
+  }, dmy(String(h.edited_at).slice(0, 10)), ": ", h.field, " ", h.old_value ?? "—", " → ", h.new_value ?? "—", " · ", h.reason))) : null, err ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 10,
+      fontSize: 12.5,
+      color: col('red'),
+      fontWeight: 700
+    }
+  }, err) : null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 10,
+      marginTop: 16
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: onClose,
+    style: {
+      flex: 1,
+      padding: 10,
+      background: col('paper'),
+      border: "1px solid " + col('line'),
+      borderRadius: 9,
+      fontWeight: 700,
+      cursor: "pointer"
+    }
+  }, "Cancel"), /*#__PURE__*/React.createElement("button", {
+    className: "pbtn",
+    disabled: busy,
+    style: {
+      flex: 2,
+      justifyContent: "center"
+    },
+    onClick: submit,
+    "data-edit-save": "1"
+  }, busy ? "Saving…" : "Save"))));
+}
+
+/* ---- Payment Done (single row, or all pending) ---- */
+function SalaryPayModal({
+  ctx,
+  run,
+  all,
+  onClose
+}) {
+  const today = istToday();
+  const [date, setDate] = useState(today);
+  const [mode, setMode] = useState("bank");
+  const [txn, setTxn] = useState("");
+  const [rm, setRm] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const emp = run ? ctx.data.employees.find(e => e.id === run.employee_id) || {} : null;
+  const submit = async () => {
+    if (busy) return;
+    if (!date || date > today) {
+      setErr("Paid date aaj ya pehle ki honi chahiye.");
+      return;
+    }
+    if (all && !confirm("Is mahine ki " + all.count + " pending salary (" + inr(all.total) + ") ek saath Paid mark hongi. Pakka?")) return;
+    setErr("");
+    setBusy(true);
+    const res = all ? await SB.rpc("salary_pay_all", {
+      p_month: all.month,
+      p_date: date,
+      p_mode: mode,
+      p_hostel: all.hostel || null
+    }) : await SB.rpc("salary_pay", {
+      p_run: run.id,
+      p_date: date,
+      p_mode: mode,
+      p_txn: txn.trim() || null,
+      p_remarks: rm.trim() || null
+    });
+    setBusy(false);
+    if (res.error) {
+      setErr(res.error.message);
+      return;
+    }
+    ctx.flash(all ? res.data + " salary paid" : "Payment done · Slip " + (res.data && res.data.slip_no));
+    ctx.refresh();
+    onClose();
+  };
+  const box = {
+    display: "flex",
+    flexDirection: "column",
+    gap: 5
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    className: "ovl",
+    onClick: onClose
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "card",
+    style: {
+      padding: 22,
+      maxWidth: 380,
+      width: "100%"
+    },
+    onClick: e => e.stopPropagation()
+  }, /*#__PURE__*/React.createElement("b", {
+    className: "serif",
+    style: {
+      fontSize: 16
+    }
+  }, all ? "Pay All Pending — " + monLabel(all.month) : "Payment Done — " + emp.full_name), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 13,
+      marginTop: 6,
+      fontWeight: 800
+    }
+  }, all ? all.count + " staff · " + inr(all.total) : "NET " + inr(run.net)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "1fr 1fr",
+      gap: 10,
+      marginTop: 14
+    }
+  }, /*#__PURE__*/React.createElement("label", {
+    style: box
+  }, /*#__PURE__*/React.createElement("span", {
+    style: lblStyle()
+  }, "Paid date (IST)"), /*#__PURE__*/React.createElement("input", {
+    className: "inp",
+    type: "date",
+    max: today,
+    value: date,
+    onChange: e => setDate(e.target.value),
+    "data-pay-date": "1"
+  })), /*#__PURE__*/React.createElement("label", {
+    style: box
+  }, /*#__PURE__*/React.createElement("span", {
+    style: lblStyle()
+  }, "Mode"), /*#__PURE__*/React.createElement("select", {
+    className: "inp",
+    value: mode,
+    onChange: e => setMode(e.target.value),
+    "data-pay-mode": "1"
+  }, ["cash", "upi", "bank"].map(m => /*#__PURE__*/React.createElement("option", {
+    key: m,
+    value: m
+  }, m.toUpperCase())))), !all ? /*#__PURE__*/React.createElement("label", {
+    style: box
+  }, /*#__PURE__*/React.createElement("span", {
+    style: lblStyle()
+  }, "Txn ref"), /*#__PURE__*/React.createElement("input", {
+    className: "inp",
+    value: txn,
+    onChange: e => setTxn(e.target.value)
+  })) : null, !all ? /*#__PURE__*/React.createElement("label", {
+    style: box
+  }, /*#__PURE__*/React.createElement("span", {
+    style: lblStyle()
+  }, "Remarks"), /*#__PURE__*/React.createElement("input", {
+    className: "inp",
+    value: rm,
+    onChange: e => setRm(e.target.value)
+  })) : null), err ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 10,
+      fontSize: 12.5,
+      color: col('red'),
+      fontWeight: 700
+    }
+  }, err) : null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 10,
+      marginTop: 16
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: onClose,
+    style: {
+      flex: 1,
+      padding: 10,
+      background: col('paper'),
+      border: "1px solid " + col('line'),
+      borderRadius: 9,
+      fontWeight: 700,
+      cursor: "pointer"
+    }
+  }, "Cancel"), /*#__PURE__*/React.createElement("button", {
+    className: "pbtn",
+    disabled: busy,
+    style: {
+      flex: 2,
+      justifyContent: "center",
+      background: col('green')
+    },
+    onClick: submit,
+    "data-pay-confirm": "1"
+  }, busy ? "Saving…" : "Payment Done"))));
+}
+
+/* ---- Salary page (Director) ---- */
+function SalaryPage({
+  ctx
+}) {
+  const {
+    data,
+    hName,
+    flash,
+    refresh,
+    salMonth,
+    setSalMonth,
+    salH,
+    setSalH,
+    salSf,
+    setSalSf
+  } = ctx;
+  const today = istToday();
+  const cyc = salaryCycle(data, today);
+  const month = salMonth || cyc.month;
+  const [tab, setTab] = useState("runs");
+  const [edit, setEdit] = useState(null);
+  const [pay, setPay] = useState(null);
+  const [payAll, setPayAll] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [pfSet, setPfSet] = useState({
+    emp: 12,
+    empr: 12,
+    ceiling: 15000,
+    apply: true
+  });
+  useEffect(() => {
+    (async () => {
+      const {
+        data: rows
+      } = await SB.from("app_settings").select("*");
+      const m = {};
+      (rows || []).forEach(r => {
+        m[r.key] = r.value;
+      });
+      setPfSet({
+        emp: num0(m.pf_employee_rate || 12),
+        empr: num0(m.pf_employer_rate || 12),
+        ceiling: num0(m.pf_wage_ceiling || 15000),
+        apply: !["false", "no", "0"].includes(String(m.pf_apply_ceiling || "true"))
+      });
+    })();
+  }, []);
+  const months = [];
+  for (let i = 0; i < 12; i++) months.push(addMonthsYmd(monthStartOf(today), -i));
+  (data.salary_runs || []).forEach(r => {
+    const m = monthStartOf(r.month);
+    if (!months.includes(m)) months.push(m);
+  });
+  months.sort().reverse();
+  const empOf = id => data.employees.find(e => e.id === id) || {};
+  const profOf = id => (data.staff_salary_profile || []).find(p => p.employee_id === id) || {};
+  const all = (data.salary_runs || []).filter(r => monthStartOf(r.month) === month && (!salH || r.hostel_id === salH));
+  const rows = all.filter(r => {
+    const k = salaryRowState(r, today).kind;
+    return salSf === "all" || !salSf ? true : salSf === "pending" ? r.status === "pending" : k === salSf;
+  }).sort((a, b) => String(empOf(a.employee_id).full_name).localeCompare(String(empOf(b.employee_id).full_name)));
+  const pend = all.filter(r => r.status === "pending");
+  const tot = k => rows.reduce((s, r) => s + num0(r[k]), 0);
+  const generate = async () => {
+    if (busy) return;
+    setBusy(true);
+    const {
+      data: n,
+      error
+    } = await SB.rpc("generate_salary", {
+      p_month: month
+    });
+    setBusy(false);
+    if (error) {
+      flash("⚠ " + error.message);
+      return;
+    }
+    flash(n ? n + " staff ki " + monLabel(month) + " salary bani" : "Koi nayi row nahi bani (pehle se generated / salary 0)");
+    refresh();
+  };
+  const undo = async r => {
+    const reason = prompt("Undo payment ka reason likhein:");
+    if (!reason || reason.trim().length < 3) return;
+    const {
+      error
+    } = await SB.rpc("salary_undo_payment", {
+      p_run: r.id,
+      p_reason: reason.trim()
+    });
+    if (error) {
+      flash("⚠ " + error.message);
+      return;
+    }
+    flash("Payment undo hua — row fir se editable");
+    refresh();
+  };
+  const pfRows = all.filter(r => r.pf_on && num0(r.employee_pf) > 0);
+  const pfBase = r => pfSet.apply ? Math.min(num0(r.pf_wage), pfSet.ceiling) : num0(r.pf_wage); // EPF wage (after ceiling)
+  const exportPF = () => {
+    const head = ["Staff", "UAN", "PF Number", "PF Wage", "Employee PF", "Employer PF"];
+    const lines = [head.join(",")].concat(pfRows.map(r => {
+      const e = empOf(r.employee_id),
+        p = profOf(r.employee_id);
+      return ['"' + String(e.full_name || "").replace(/"/g, '""') + '"', p.uan || "", p.pf_number || "", pfBase(r), r.employee_pf, r.employer_pf].join(",");
+    })).concat(["TOTAL,,," + pfRows.reduce((s, r) => s + pfBase(r), 0) + "," + pfRows.reduce((s, r) => s + num0(r.employee_pf), 0) + "," + pfRows.reduce((s, r) => s + num0(r.employer_pf), 0)]);
+    const csv = lines.join("\n");
+    try {
+      const url = URL.createObjectURL(new Blob([csv], {
+        type: "text/csv"
+      }));
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "PF_" + month.slice(0, 7) + ".csv";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } catch (e) {
+      window.__lastCsv = csv;
+    }
+    window.__lastCsv = csv;
+  };
+  const savePf = async () => {
+    const rows2 = [["pf_employee_rate", pfSet.emp], ["pf_employer_rate", pfSet.empr], ["pf_wage_ceiling", pfSet.ceiling], ["pf_apply_ceiling", pfSet.apply ? "true" : "false"]].map(([key, value]) => ({
+      key,
+      value: String(value)
+    }));
+    const {
+      error
+    } = await SB.from("app_settings").upsert(rows2, {
+      onConflict: "key"
+    });
+    flash(error ? "⚠ " + error.message : "PF settings saved (naye generate hone wale mahino par lagegi)");
+  };
+  const chip = (k, l) => /*#__PURE__*/React.createElement("button", {
+    key: k,
+    onClick: () => setSalSf(k),
+    "data-sal-filter": k,
+    style: {
+      padding: "5px 11px",
+      borderRadius: 8,
+      border: "1px solid " + col('line'),
+      cursor: "pointer",
+      fontSize: 12.5,
+      fontWeight: 700,
+      background: (salSf || "all") === k ? col('slate') : "#fff",
+      color: (salSf || "all") === k ? "#fff" : col('slate')
+    }
+  }, l);
+  const tabBtn = (k, l) => /*#__PURE__*/React.createElement("button", {
+    onClick: () => setTab(k),
+    "data-sal-tab": k,
+    style: {
+      padding: "7px 14px",
+      borderRadius: 9,
+      border: "1px solid " + col('line'),
+      cursor: "pointer",
+      fontWeight: 800,
+      fontSize: 13,
+      background: tab === k ? col('slate') : "#fff",
+      color: tab === k ? "#fff" : col('slate')
+    }
+  }, l);
+  const future = month > monthStartOf(today);
+  return /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      flexWrap: "wrap",
+      gap: 8,
+      alignItems: "center",
+      marginBottom: 12
+    }
+  }, tabBtn("runs", "Salary"), tabBtn("pf", "PF report"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 12,
+      fontWeight: 700,
+      color: col('mut'),
+      marginLeft: 6
+    }
+  }, "Month:"), /*#__PURE__*/React.createElement("select", {
+    className: "inp",
+    style: {
+      width: "auto"
+    },
+    value: month,
+    onChange: e => setSalMonth(e.target.value),
+    "data-sal-month": "1"
+  }, months.map(m => /*#__PURE__*/React.createElement("option", {
+    key: m,
+    value: m
+  }, monthName(m)))), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 12,
+      fontWeight: 700,
+      color: col('mut'),
+      marginLeft: 6
+    }
+  }, "Hostel:"), /*#__PURE__*/React.createElement("select", {
+    className: "inp",
+    style: {
+      width: "auto"
+    },
+    value: salH,
+    onChange: e => setSalH(e.target.value),
+    "data-sal-hostel": "1"
+  }, /*#__PURE__*/React.createElement("option", {
+    value: ""
+  }, "All Hostels"), data.hostels.map(h => /*#__PURE__*/React.createElement("option", {
+    key: h.id,
+    value: h.id
+  }, h.name))), /*#__PURE__*/React.createElement("button", {
+    className: "pbtn",
+    style: {
+      marginLeft: "auto",
+      background: col('steel')
+    },
+    disabled: busy || future,
+    onClick: generate,
+    "data-sal-generate": "1"
+  }, "⟳ Generate Salary — ", monthName(month))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gap: 12,
+      gridTemplateColumns: "repeat(auto-fill,minmax(160px,1fr))",
+      marginBottom: 14
+    }
+  }, /*#__PURE__*/React.createElement(Kpi, {
+    label: "Pending NET · " + monLabel(month),
+    value: inr(pend.reduce((s, r) => s + num0(r.net), 0)),
+    sub: pend.length + " staff · due " + dmy(salaryDue(month)),
+    tone: col('red')
+  }), /*#__PURE__*/React.createElement(Kpi, {
+    label: "Paid",
+    value: inr(all.filter(r => r.status === "paid").reduce((s, r) => s + num0(r.net), 0)),
+    sub: all.filter(r => r.status === "paid").length + " staff",
+    tone: col('green')
+  }), /*#__PURE__*/React.createElement(Kpi, {
+    label: "Employer PF (cost)",
+    value: inr(all.reduce((s, r) => s + num0(r.employer_pf), 0)),
+    tone: col('steel')
+  })), tab === "runs" ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      flexWrap: "wrap",
+      gap: 8,
+      alignItems: "center",
+      marginBottom: 12
+    }
+  }, chip("all", "All"), chip("pending", "Pending"), chip("paid", "Paid"), chip("overdue", "Overdue"), pend.length ? /*#__PURE__*/React.createElement("button", {
+    className: "mini",
+    style: {
+      marginLeft: "auto",
+      background: col('green')
+    },
+    onClick: () => setPayAll({
+      month,
+      hostel: salH,
+      count: pend.length,
+      total: pend.reduce((s, r) => s + num0(r.net), 0)
+    }),
+    "data-sal-payall": "1"
+  }, "Pay All Pending (", pend.length, ")") : null), !all.length ? /*#__PURE__*/React.createElement("div", {
+    className: "card",
+    style: {
+      padding: 16,
+      marginBottom: 12,
+      color: col('mut')
+    },
+    "data-sal-empty": "1"
+  }, monthName(month), " ki salary abhi generate nahi hui — upar \"Generate Salary\" dabayein.") : null, /*#__PURE__*/React.createElement("div", {
+    className: "card",
+    style: {
+      overflowX: "auto"
+    }
+  }, /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Staff", "Hostel", "Days", "Gross", "Emp PF", "Adv cut", "Other cut", "Bonus", "NET", "Status", ""].map(c => /*#__PURE__*/React.createElement("th", {
+    key: c
+  }, c)))), /*#__PURE__*/React.createElement("tbody", null, rows.map(r => {
+    const e = empOf(r.employee_id),
+      st = salaryRowState(r, today);
+    const edits = (data.salary_edits || []).filter(x => x.run_id === r.id && x.field !== "status");
+    const pr = r.period_from && (String(r.period_from).slice(0, 10) !== monthStartOf(r.month) || String(r.period_to).slice(0, 10) !== monthEndOf(r.month));
+    return /*#__PURE__*/React.createElement("tr", {
+      key: r.id,
+      "data-sal-row": r.id
+    }, /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("b", null, e.full_name), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 10.5,
+        color: col('mut')
+      }
+    }, e.role)), /*#__PURE__*/React.createElement("td", null, hName(r.hostel_id)), /*#__PURE__*/React.createElement("td", null, r.attendance_days, pr ? /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 10.5,
+        color: col('mut')
+      }
+    }, dmy(r.period_from), "–", dmy(r.period_to)) : null), /*#__PURE__*/React.createElement("td", null, inr(r.gross)), /*#__PURE__*/React.createElement("td", null, inr(r.employee_pf)), /*#__PURE__*/React.createElement("td", null, inr(r.advance_deduction)), /*#__PURE__*/React.createElement("td", null, inr(r.other_deduction)), /*#__PURE__*/React.createElement("td", null, inr(r.bonus)), /*#__PURE__*/React.createElement("td", {
+      "data-sal-net": r.id
+    }, /*#__PURE__*/React.createElement("b", null, inr(r.net)), edits.length ? /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 10.5,
+        color: col('mut')
+      },
+      title: edits.map(x => x.field + ": " + x.reason).join("\n")
+    }, "✎ ", edits[edits.length - 1] && edits.sort((x, y) => String(x.edited_at).localeCompare(String(y.edited_at)))[edits.length - 1].reason) : null), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement(Badge, {
+      c: st.c,
+      bg: st.bg
+    }, st.label), r.status === "paid" ? /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 10.5,
+        color: col('mut')
+      }
+    }, dmy(r.paid_date), " · ", String(r.mode || "").toUpperCase()) : null), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("span", {
+      style: {
+        display: "inline-flex",
+        gap: 6,
+        flexWrap: "wrap"
+      }
+    }, r.status === "pending" ? /*#__PURE__*/React.createElement("button", {
+      className: "mini",
+      style: {
+        background: col('slate')
+      },
+      onClick: () => setEdit(r),
+      "data-sal-edit": r.id
+    }, "Edit") : null, r.status === "pending" ? /*#__PURE__*/React.createElement("button", {
+      className: "mini",
+      style: {
+        background: col('green')
+      },
+      onClick: () => setPay(r),
+      "data-sal-pay": r.id
+    }, "Payment Done") : null, r.status === "paid" ? /*#__PURE__*/React.createElement("button", {
+      className: "mini",
+      style: {
+        background: col('steel')
+      },
+      onClick: () => printSalarySlip(r, e, hName(r.hostel_id || e.hostel_id), profOf(r.employee_id)),
+      "data-sal-slip": r.id
+    }, "🧾 Salary Slip") : null, r.status === "paid" ? /*#__PURE__*/React.createElement("button", {
+      className: "mini",
+      style: {
+        background: col('red')
+      },
+      onClick: () => undo(r),
+      "data-sal-undo": r.id
+    }, "Undo") : null)));
+  }), rows.length ? /*#__PURE__*/React.createElement("tr", {
+    style: {
+      fontWeight: 800
+    }
+  }, /*#__PURE__*/React.createElement("td", {
+    colSpan: "3"
+  }, "Total (", rows.length, ")"), /*#__PURE__*/React.createElement("td", null, inr(tot("gross"))), /*#__PURE__*/React.createElement("td", null, inr(tot("employee_pf"))), /*#__PURE__*/React.createElement("td", null, inr(tot("advance_deduction"))), /*#__PURE__*/React.createElement("td", null, inr(tot("other_deduction"))), /*#__PURE__*/React.createElement("td", null, inr(tot("bonus"))), /*#__PURE__*/React.createElement("td", null, inr(tot("net"))), /*#__PURE__*/React.createElement("td", {
+    colSpan: "2"
+  })) : null)))) : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    className: "card",
+    style: {
+      padding: 14,
+      marginBottom: 12,
+      display: "flex",
+      flexWrap: "wrap",
+      gap: 10,
+      alignItems: "flex-end"
+    }
+  }, [["emp", "Employee rate %"], ["empr", "Employer rate %"], ["ceiling", "Wage ceiling ₹"]].map(([k, l]) => /*#__PURE__*/React.createElement("label", {
+    key: k,
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      gap: 4
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: lblStyle()
+  }, l), /*#__PURE__*/React.createElement("input", {
+    className: "inp",
+    type: "number",
+    min: 0,
+    style: {
+      width: 120
+    },
+    value: pfSet[k],
+    onChange: e => setPfSet(p => ({
+      ...p,
+      [k]: Number(e.target.value)
+    })),
+    "data-pf-set": k
+  }))), /*#__PURE__*/React.createElement("label", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      gap: 4
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: lblStyle()
+  }, "Apply ceiling"), /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    className: "inp",
+    style: {
+      cursor: "pointer",
+      fontWeight: 700
+    },
+    onClick: () => setPfSet(p => ({
+      ...p,
+      apply: !p.apply
+    }))
+  }, pfSet.apply ? "✓ Yes" : "✗ No")), /*#__PURE__*/React.createElement("button", {
+    className: "mini",
+    style: {
+      background: col('slate'),
+      padding: "9px 14px"
+    },
+    onClick: savePf,
+    "data-pf-save": "1"
+  }, "Save PF settings"), /*#__PURE__*/React.createElement("button", {
+    className: "mini",
+    style: {
+      background: col('green'),
+      padding: "9px 14px",
+      marginLeft: "auto"
+    },
+    onClick: exportPF,
+    "data-pf-csv": "1"
+  }, "⬇ Export CSV")), /*#__PURE__*/React.createElement("div", {
+    className: "card",
+    style: {
+      overflowX: "auto"
+    }
+  }, /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Staff", "UAN", "PF Wage (EPF)", "Employee PF", "Employer PF"].map(c => /*#__PURE__*/React.createElement("th", {
+    key: c
+  }, c)))), /*#__PURE__*/React.createElement("tbody", null, pfRows.map(r => /*#__PURE__*/React.createElement("tr", {
+    key: r.id,
+    "data-pf-row": r.id
+  }, /*#__PURE__*/React.createElement("td", null, empOf(r.employee_id).full_name), /*#__PURE__*/React.createElement("td", null, profOf(r.employee_id).uan || "—"), /*#__PURE__*/React.createElement("td", null, inr(pfBase(r))), /*#__PURE__*/React.createElement("td", null, inr(r.employee_pf)), /*#__PURE__*/React.createElement("td", null, inr(r.employer_pf)))), pfRows.length ? /*#__PURE__*/React.createElement("tr", {
+    style: {
+      fontWeight: 800
+    }
+  }, /*#__PURE__*/React.createElement("td", {
+    colSpan: "2"
+  }, "Total"), /*#__PURE__*/React.createElement("td", null, inr(pfRows.reduce((s, r) => s + pfBase(r), 0))), /*#__PURE__*/React.createElement("td", null, inr(pfRows.reduce((s, r) => s + num0(r.employee_pf), 0))), /*#__PURE__*/React.createElement("td", null, inr(pfRows.reduce((s, r) => s + num0(r.employer_pf), 0)))) : /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
+    colSpan: "5"
+  }, "Is mahine koi PF row nahi.")))))), edit ? /*#__PURE__*/React.createElement(SalaryEditModal, {
+    ctx: ctx,
+    run: edit,
+    pfSet: pfSet,
+    onClose: () => setEdit(null)
+  }) : null, pay ? /*#__PURE__*/React.createElement(SalaryPayModal, {
+    ctx: ctx,
+    run: pay,
+    onClose: () => setPay(null)
+  }) : null, payAll ? /*#__PURE__*/React.createElement(SalaryPayModal, {
+    ctx: ctx,
+    all: payAll,
+    onClose: () => setPayAll(null)
+  }) : null);
 }
 
 function App() {
@@ -3720,6 +5272,10 @@ function App() {
   const [staffF, setStaffF] = useState("");
   const [roomsVac, setRoomsVac] = useState(false);
   const [feeGrace, setFeeGrace] = useState(0);
+  const [salMonth, setSalMonth] = useState("");
+  const [salH, setSalH] = useState("");
+  const [salSf, setSalSf] = useState("all");
+  const [salModal, setSalModal] = useState(null);
   FEE_GRACE = feeGrace;
   // open a page with a filter (Bell alerts + Dashboard cards)
   const go = (pg, f) => {
@@ -3729,9 +5285,29 @@ function App() {
     if (pg === "rooms") setRoomsVac(!!f.vacant);
     if (pg === "complaints") setCompF(f.comp || "");
     if (pg === "staff") setStaffF(f.staff || "");
+    if (pg === "salary") { setSalSf(f.sf || "all"); if (f.month) setSalMonth(f.month); }
     setPage(pg);
     setOpen(false);
     try { window.scrollTo(0, 0); } catch (e) {}
+  };
+  // staff save: employee row + Director-only salary profile
+  const saveStaff = async v => {
+    const sal = v._sal ? normSalProfile(v._sal) : null;
+    const row = clean(v);
+    delete row.id;
+    let id = v.id, error;
+    if (id) ({ error } = await SB.from("employees").update(row).eq("id", id));
+    else {
+      id = crypto.randomUUID();
+      ({ error } = await SB.from("employees").insert({ ...row, id, created_by: session.user.id }));
+    }
+    if (error) throw new Error("Save nahi hua: " + error.message);
+    if (sal) {
+      const { error: pe } = await SB.from("staff_salary_profile").upsert({ employee_id: id, ...sal, updated_by: session.user.id, updated_at: new Date().toISOString() }, { onConflict: "employee_id" });
+      if (pe) throw new Error("Staff save hua, salary save nahi hui: " + pe.message);
+    }
+    flash("Saved");
+    refresh();
   };
   const saveFeeGrace = async n => {
     setFeeGrace(n);
@@ -3777,7 +5353,7 @@ function App() {
   }, [session]);
   const role = profile?.roles?.name || "manager";
   const refresh = useCallback(async () => {
-    const t = ["hostels", "rooms", "beds", "students", "monthly_dues", "fee_payments", "expenses", "employees", "complaints", "inventory", "audit_logs", "users"];
+    const t = ["hostels", "rooms", "beds", "students", "monthly_dues", "fee_payments", "expenses", "employees", "complaints", "inventory", "audit_logs", "users", "staff_attendance", "staff_salary_profile", "salary_advances", "salary_runs", "salary_edits"];
     const out = {};
     try {
       for (const x of t) {
@@ -3868,7 +5444,9 @@ function App() {
     const dueSoon = _fs.filter(x => x.kind === "soon").length;
     const dueCount = _fs.filter(x => x.kind === "due").length;
     const missing = data.students.filter(s => s.status !== "left" && !isBillable(s)).length;
-    const salaryPay = data.employees.reduce((a, e) => a + Number(e.monthly_salary || 0), 0);
+    const _sc = salaryCycle(data, _t);
+    const salaryPay = _sc.pendingNet;
+    const salarySub = _sc.sub;
     const perHostel = data.hostels.map(h => {
       const inc = data.fee_payments.filter(f => f.hostel_id === h.id).reduce((a, f) => a + Number(f.amount || 0), 0);
       const exp = data.expenses.filter(e => e.hostel_id === h.id && e.status === "approved").reduce((a, e) => a + Number(e.amount || 0), 0);
@@ -3878,7 +5456,7 @@ function App() {
     const catMap = {};
     data.expenses.filter(e => e.status === "approved").forEach(e => { catMap[e.category] = (catMap[e.category] || 0) + Number(e.amount || 0); });
     return {
-      overdue, dueSoon, dueCount, missing, occupied, beds: data.beds.length, income, expense, pending, salaryPay, perHostel,
+      overdue, dueSoon, dueCount, missing, occupied, beds: data.beds.length, income, expense, pending, salaryPay, salarySub, perHostel,
       catData: Object.entries(catMap).map(([k, v]) => ({ k, v, label: inr(v) })),
       students: data.students.length, hostels: data.hostels.length,
       complaintsOpen: data.complaints.filter(c => c.status !== "resolved").length
@@ -4278,13 +5856,20 @@ function App() {
       label: "Joining",
       type: "date"
     }, {
-      k: "monthly_salary",
-      label: "Monthly Salary",
-      type: "number"
+      k: "exit_date",
+      label: "Exit Date",
+      type: "date"
     }, {
-      k: "advance",
-      label: "Advance",
-      type: "number"
+      k: "status",
+      label: "Status",
+      type: "select",
+      opts: [{ value: "active", label: "Active" }, { value: "left", label: "Left" }]
+    }, {
+      k: "_sal",
+      label: "Salary",
+      type: "custom",
+      hide: () => role !== "director",
+      render: (v, set) => /*#__PURE__*/React.createElement(SalaryProfileFields, { v: v, set: set, profiles: data.staff_salary_profile || [] })
     }, {
       k: "duty_timing",
       label: "Duty Timing"
@@ -4394,7 +5979,7 @@ function App() {
   }, "\uD83D\uDDD1"));
   const Pages = {
     dashboard: () => {
-      const k = [["Total Hostels", D.hostels, null, 'slate', "hostels"], ["Students", D.students, D.missing ? D.missing + " joining date/fee missing" : null, 'steel', "students"], ["Occupied Beds", D.occupied + "/" + D.beds, (D.beds ? Math.round(D.occupied / D.beds * 100) : 0) + "% full", 'green', "rooms"], ["Vacant Beds", D.beds - D.occupied, null, 'amber', "rooms", { vacant: true }], ["Income (paid)", inr(D.income), null, 'green', "fees"], ["Expense (approved)", inr(D.expense), null, 'red', "expenses"], ["Net Profit", inr(D.income - D.expense), null, 'gold'], ["Pending Fees", inr(D.pending), D.overdue + " overdue \xB7 " + D.dueCount + " due \xB7 " + D.dueSoon + " due in 7 days", 'red', "fees", { sf: "overdue" }], ["Salary Payable", inr(D.salaryPay), null, 'steel', "staff", { staff: "salary" }], ["Open Complaints", D.complaintsOpen, null, 'amber', "complaints", { comp: "open" }]];
+      const k = [["Total Hostels", D.hostels, null, 'slate', "hostels"], ["Students", D.students, D.missing ? D.missing + " joining date/fee missing" : null, 'steel', "students"], ["Occupied Beds", D.occupied + "/" + D.beds, (D.beds ? Math.round(D.occupied / D.beds * 100) : 0) + "% full", 'green', "rooms"], ["Vacant Beds", D.beds - D.occupied, null, 'amber', "rooms", { vacant: true }], ["Income (paid)", inr(D.income), null, 'green', "fees"], ["Expense (approved)", inr(D.expense), null, 'red', "expenses"], ["Net Profit", inr(D.income - D.expense), null, 'gold'], ["Pending Fees", inr(D.pending), D.overdue + " overdue \xB7 " + D.dueCount + " due \xB7 " + D.dueSoon + " due in 7 days", 'red', "fees", { sf: "overdue" }], ...(role === "director" ? [["Salary Payable", inr(D.salaryPay), D.salarySub, 'steel', "salary", { sf: "pending" }]] : []), ["Open Complaints", D.complaintsOpen, null, 'amber', "complaints", { comp: "open" }]];
       return /*#__PURE__*/React.createElement("div", {
         style: {
           display: "flex",
@@ -4974,117 +6559,7 @@ function App() {
     }))))), !data.expenses.length && /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
       colSpan: "7"
     }, "No expenses yet.")))))),
-    staff: () => {
-  const [hsel, setHsel] = useState([]);
-  const [rolesel, setRolesel] = useState("");
-  const chip = on => ({
-    padding: "5px 12px",
-    borderRadius: 8,
-    border: "1px solid " + col('line'),
-    cursor: "pointer",
-    fontSize: 12.5,
-    fontWeight: 700,
-    background: on ? col('slate') : "#fff",
-    color: on ? "#fff" : col('slate')
-  });
-  const toggleH = id => setHsel(p => p.includes(id) ? p.filter(x => x !== id) : [...p, id]);
-  const rolesPresent = [...new Set(data.employees.map(e => e.role).filter(Boolean))];
-  const list = data.employees.filter(e => {
-    if (hsel.length && !hsel.includes(e.hostel_id)) return false;
-    if (rolesel && e.role !== rolesel) return false;
-    if (staffF === "salary" && !(Number(e.monthly_salary || 0) > 0)) return false;
-    return true;
-  });
-  const toggle = async e => {
-    await SB.from("staff_attendance").upsert({
-      employee_id: e.id,
-      hostel_id: e.hostel_id,
-      date: today(),
-      present: !e._present
-    }, {
-      onConflict: "employee_id,date"
-    });
-    refresh();
-    flash("Attendance updated");
-  };
-  return /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(Header, {
-    entity: "employees"
-  }), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      flexWrap: "wrap",
-      gap: 8,
-      alignItems: "center",
-      marginBottom: 14
-    }
-  }, /*#__PURE__*/React.createElement("span", {
-    style: {
-      fontSize: 12,
-      fontWeight: 700,
-      color: col('mut')
-    }
-  }, "Hostel:"), /*#__PURE__*/React.createElement("button", {
-    onClick: () => setHsel([]),
-    style: chip(hsel.length === 0)
-  }, "All"), data.hostels.map(h => /*#__PURE__*/React.createElement("button", {
-    key: h.id,
-    onClick: () => toggleH(h.id),
-    style: chip(hsel.includes(h.id))
-  }, h.code)), /*#__PURE__*/React.createElement("span", {
-    style: {
-      fontSize: 12,
-      fontWeight: 700,
-      color: col('mut'),
-      marginLeft: 8
-    }
-  }, "Role:"), /*#__PURE__*/React.createElement("select", {
-    className: "inp",
-    style: {
-      width: "auto"
-    },
-    value: rolesel,
-    onChange: e => setRolesel(e.target.value)
-  }, /*#__PURE__*/React.createElement("option", {
-    value: ""
-  }, "All roles"), rolesPresent.map(r => /*#__PURE__*/React.createElement("option", {
-    key: r,
-    value: r
-  }, r))), /*#__PURE__*/React.createElement("button", {
-    "data-staff-filter": "salary",
-    onClick: () => setStaffF(staffF === "salary" ? "" : "salary"),
-    style: chip(staffF === "salary")
-  }, "Salary payable (" + inr(list.filter(e => Number(e.monthly_salary || 0) > 0).reduce((a, e) => a + Number(e.monthly_salary || 0), 0)) + ")"), /*#__PURE__*/React.createElement("span", {
-    style: {
-      fontSize: 12,
-      color: col('mut'),
-      marginLeft: "auto"
-    }
-  }, list.length, " staff")), /*#__PURE__*/React.createElement("div", {
-    className: "card",
-    style: {
-      overflowX: "auto"
-    }
-  }, /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Name", "Role", "Hostel", "Salary", "Advance", "Today", ""].map(c => /*#__PURE__*/React.createElement("th", {
-    key: c
-  }, c)))), /*#__PURE__*/React.createElement("tbody", null, list.map(e => /*#__PURE__*/React.createElement("tr", {
-    key: e.id
-  }, /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement(NameBtn, {
-    name: e.full_name,
-    mobile: e.mobile,
-    sub: e.role
-  })), /*#__PURE__*/React.createElement("td", null, e.role), /*#__PURE__*/React.createElement("td", null, hName(e.hostel_id)), /*#__PURE__*/React.createElement("td", null, inr(e.monthly_salary)), /*#__PURE__*/React.createElement("td", null, inr(e.advance)), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("button", {
-    className: "mini",
-    style: {
-      background: col('green')
-    },
-    onClick: () => toggle(e)
-  }, "Mark Present")), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement(EditDel, {
-    entity: "employees",
-    item: e
-  })))), !list.length && /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
-    colSpan: "7"
-  }, "No staff match."))))));
-},
+    staff: () => null,
     complaints: () => /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(Header, {
       entity: "complaints",
       extra: /*#__PURE__*/React.createElement("span", { style: { display: "inline-flex", gap: 6 } }, [["", "All"], ["open", "Open"], ["resolved", "Resolved"]].map(([k2, l2]) => /*#__PURE__*/React.createElement("button", { key: k2, "data-comp-filter": k2 || "all", onClick: () => setCompF(k2), style: { padding: "5px 12px", borderRadius: 8, border: "1px solid " + col('line'), cursor: "pointer", fontSize: 12.5, fontWeight: 700, background: compF === k2 ? col('slate') : "#fff", color: compF === k2 ? "#fff" : col('slate') } }, l2)))
@@ -5168,7 +6643,7 @@ function App() {
     const income = data.fee_payments.filter(f => f.hostel_id === h.id).reduce((a, f) => a + num(f.amount), 0);
     const expense = data.expenses.filter(e => e.hostel_id === h.id && e.status === "approved").reduce((a, e) => a + num(e.amount), 0);
     const pending = billablePending({ students: data.students, monthly_dues: data.monthly_dues.filter(d => d.hostel_id === h.id) }).reduce((a, d) => a + num(d.pending), 0);
-    const staffCost = data.employees.filter(e => e.hostel_id === h.id).reduce((a, e) => a + num(e.monthly_salary), 0);
+    const staffCost = role === "director" ? (data.staff_salary_profile || []).filter(p => data.employees.some(e => e.id === p.employee_id && e.hostel_id === h.id && e.status !== "left")).reduce((a, p) => a + num(p.monthly_salary), 0) : 0;
     return {
       name: h.name,
       code: h.code,
@@ -5201,7 +6676,7 @@ function App() {
   });
   const exportCSV = () => {
     const head = ["Hostel", "Code", "Beds", "Occupied", "Vacant", "Occupancy%", "Income", "Expense", "ProfitLoss", "PendingFees", "StaffCost"];
-    const lines = [head.join(",")].concat(rows.map(r => [r.name, r.code, r.beds, r.occ, r.vacant, r.occPct, r.income, r.expense, r.profit, r.pending, r.staffCost].join(",")));
+    const lines = [head.join(",")].concat(rows.map(r => [r.name, r.code, r.beds, r.occ, r.vacant, r.occPct, r.income, r.expense, r.profit, r.pending, role === "director" ? r.staffCost : ""].join(",")));
     const blob = new Blob([lines.join("\n")], {
       type: "text/csv"
     });
@@ -5259,7 +6734,7 @@ function App() {
     style: {
       overflowX: "auto"
     }
-  }, /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Hostel", "Beds", "Occ", "Vacant", "Occ%", "Income", "Expense", "Profit/Loss", "Pending", "Staff Cost"].map(c => /*#__PURE__*/React.createElement("th", {
+  }, /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Hostel", "Beds", "Occ", "Vacant", "Occ%", "Income", "Expense", "Profit/Loss", "Pending"].concat(role === "director" ? ["Staff Cost"] : []).map(c => /*#__PURE__*/React.createElement("th", {
     key: c
   }, c)))), /*#__PURE__*/React.createElement("tbody", null, rows.map((r, i) => /*#__PURE__*/React.createElement("tr", {
     key: i
@@ -5285,7 +6760,7 @@ function App() {
     style: {
       color: r.pending > 0 ? col('red') : col('green')
     }
-  }, r.pending > 0 ? inr(r.pending) : "—"), /*#__PURE__*/React.createElement("td", null, inr(r.staffCost)))), /*#__PURE__*/React.createElement("tr", {
+  }, r.pending > 0 ? inr(r.pending) : "—"), role === "director" ? /*#__PURE__*/React.createElement("td", null, inr(r.staffCost)) : null)), /*#__PURE__*/React.createElement("tr", {
     style: {
       fontWeight: 800,
       borderTop: "2px solid " + col('line')
@@ -5619,7 +7094,7 @@ function App() {
   }
   };
   const Current = Pages[cur] || Pages.dashboard;
-  const pageCtx = { data, role, session, hName, sName, uName, NameBtn, Header, EditDel, setModal, setContact, del, flash, refresh, hf, setHf, mf, setMf, billingMode, saveBillingMode, stuF, setStuF, openProfile: setProfId, feeSf, setFeeSf, go, feeGrace, saveFeeGrace };
+  const pageCtx = { data, role, session, hName, sName, uName, NameBtn, Header, EditDel, setModal, setContact, del, flash, refresh, hf, setHf, mf, setMf, billingMode, saveBillingMode, stuF, setStuF, openProfile: setProfId, feeSf, setFeeSf, go, feeGrace, saveFeeGrace, salMonth, setSalMonth, salH, setSalH, salSf, setSalSf, openSal: setSalModal };
   return /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
@@ -5752,7 +7227,7 @@ function App() {
     style: {
       flex: 1
     }
-  }), /*#__PURE__*/React.createElement(BellAlerts, { data: data, go: go }), /*#__PURE__*/React.createElement("span", {
+  }), /*#__PURE__*/React.createElement(BellAlerts, { data: data, go: go, role: role }), /*#__PURE__*/React.createElement("span", {
     style: {
       fontSize: 12,
       color: col('mut')
@@ -5773,9 +7248,17 @@ function App() {
     ctx: pageCtx
   }), /*#__PURE__*/React.createElement(Current, null)) : cur === "students" ? /*#__PURE__*/React.createElement(StudentsPage, {
     ctx: pageCtx
+  }) : cur === "salary" && role === "director" ? /*#__PURE__*/React.createElement(SalaryPage, {
+    ctx: pageCtx
+  }) : cur === "staff" ? /*#__PURE__*/React.createElement(StaffPage, {
+    ctx: pageCtx
   }) : cur === "fees" ? /*#__PURE__*/React.createElement(FeesPage, {
     ctx: pageCtx
-  }) : /*#__PURE__*/React.createElement(Current, null))), profId && /*#__PURE__*/React.createElement(StudentProfile, {
+  }) : /*#__PURE__*/React.createElement(Current, null))), salModal && role === "director" && /*#__PURE__*/React.createElement(salModal.type === "advance" ? GiveAdvanceModal : StaffSalaryModal, {
+    ctx: pageCtx,
+    emp: salModal.emp,
+    onClose: () => setSalModal(null)
+  }), profId && /*#__PURE__*/React.createElement(StudentProfile, {
     ctx: pageCtx,
     id: profId,
     onClose: () => setProfId(null)
@@ -5785,7 +7268,7 @@ function App() {
     validate: modal.validate || VALIDATE[modal.entity],
     initial: modal.item,
     onClose: () => setModal(null),
-    onSave: v => modal.onSave ? modal.onSave(v) : save(modal.entity, v)
+    onSave: v => modal.onSave ? modal.onSave(v) : modal.entity === "employees" && role === "director" ? saveStaff(v) : save(modal.entity, v)
   }), contact && /*#__PURE__*/React.createElement(Contact, {
     c: contact,
     onClose: () => setContact(null)
