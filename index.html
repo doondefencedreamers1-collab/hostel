@@ -393,7 +393,7 @@ const localToday = () => { const d = new Date(); const p = n => String(n).padSta
 // format a YYYY-MM-DD (or ISO) string as DD-MM-YYYY for display
 const dmy = s => { const str = String(s || "").slice(0, 10); const p = str.split("-"); return p.length === 3 ? p[2] + "-" + p[1] + "-" + p[0] : (s || "-"); };
 const monthStart = () => today().slice(0, 8) + "01";
-const clean = o => { const r = {}; for (const k in o) { const val = o[k]; if (val !== "" && val !== undefined) r[k] = val; } return r; };
+const clean = o => { const r = {}; for (const k in o) { if (k.charAt(0) === "_") continue; const val = o[k]; if (val !== "" && val !== undefined) r[k] = val; } return r; };
 const COURSES = ["NDA", "NDA Foundation", "SSB", "CDS", "AFCAT", "Other"];
 const ROOM_TYPES = ["1 seater", "2 seater", "3 seater", "4 seater", "dormitory"];
 const EXP_CATS = ["Food/Grocery", "Milk", "Vegetables", "Gas Cylinder", "Electricity", "Water", "Internet", "Cleaning", "Repair & Maintenance", "Salary", "Rent", "Security", "Transport", "Medical", "Misc"];
@@ -546,7 +546,8 @@ function FormModal({
   fields,
   initial,
   onClose,
-  onSave
+  onSave,
+  validate
 }) {
   const [v, setV] = useState(() => {
     const o = {
@@ -587,6 +588,13 @@ function FormModal({
     if (bad.length) {
       setErr("Sahi value daalein: " + bad.join(", "));
       return;
+    }
+    if (validate) {
+      const ve = validate(v);
+      if (ve) {
+        setErr(ve);
+        return;
+      }
     }
     setErr("");
     setBusy(true);
@@ -640,7 +648,9 @@ function FormModal({
       gap: 12,
       gridTemplateColumns: "1fr 1fr"
     }
-  }, fields.map(f => /*#__PURE__*/React.createElement("label", {
+  }, fields.filter(f => !(f.hide && f.hide(v))).map(f => f.type === "custom" ? /*#__PURE__*/React.createElement(React.Fragment, {
+    key: f.k
+  }, f.render(v, set)) : /*#__PURE__*/React.createElement("label", {
     key: f.k,
     style: {
       display: "flex",
@@ -1157,6 +1167,2244 @@ function Pending({
 /* =====================================================================
    MAIN APP
    ===================================================================== */
+/* =====================================================================
+   FEE PLANS + ADVANCE PAYMENTS + "PAID TILL"  (needs DB migration 014)
+   Rule: a student is DUE only when today (IST) > paid_till.
+         Next due date = paid_till + 1 day.
+   ===================================================================== */
+const PLAN_OPTS = [{
+  value: "monthly",
+  label: "Monthly",
+  m: 1
+}, {
+  value: "quarterly",
+  label: "3 Months",
+  m: 3
+}, {
+  value: "half_yearly",
+  label: "6 Months",
+  m: 6
+}, {
+  value: "yearly",
+  label: "1 Year",
+  m: 12
+}, {
+  value: "two_year",
+  label: "2 Years",
+  m: 24
+}, {
+  value: "custom",
+  label: "Custom",
+  m: null
+}];
+const planOpt = p => PLAN_OPTS.find(o => o.value === p) || PLAN_OPTS[0];
+const planMonthsOf = (plan, months) => {
+  const o = planOpt(plan);
+  return o.m != null ? o.m : Math.max(1, Math.min(36, parseInt(months, 10) || 1));
+};
+const planName = s => {
+  const o = planOpt(s && s.fee_plan);
+  return o.value === "custom" ? (s.plan_months || 1) + " Months (custom)" : o.label;
+};
+const num0 = v => Number(v || 0);
+const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g, ch => ({
+  "&": "&amp;",
+  "<": "&lt;",
+  ">": "&gt;",
+  '"': "&quot;",
+  "'": "&#39;"
+})[ch]);
+
+/* ---- IST date helpers (all dates are "YYYY-MM-DD" strings) ---- */
+const istToday = () => {
+  try {
+    return new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Kolkata",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit"
+    }).format(new Date());
+  } catch (e) {
+    return localToday();
+  }
+};
+const ymdParts = s => String(s || "").slice(0, 10).split("-").map(Number);
+const ymd = (y, m, d) => y + "-" + String(m).padStart(2, "0") + "-" + String(d).padStart(2, "0");
+const daysInMonth = (y, m) => new Date(Date.UTC(y, m, 0)).getUTCDate();
+const monthStartOf = s => {
+  const [y, m] = ymdParts(s);
+  return ymd(y, m, 1);
+};
+const monthEndOf = s => {
+  const [y, m] = ymdParts(s);
+  return ymd(y, m, daysInMonth(y, m));
+};
+const addMonthsYmd = (s, n) => {
+  const [y, m] = ymdParts(s);
+  const t = y * 12 + (m - 1) + n;
+  return ymd(Math.floor(t / 12), t % 12 + 1, 1);
+};
+const toUtc = s => {
+  const [y, m, d] = ymdParts(s);
+  return Date.UTC(y, m - 1, d);
+};
+const addDaysYmd = (s, n) => new Date(toUtc(s) + n * 86400000).toISOString().slice(0, 10);
+const dayDiff = (a, b) => Math.round((toUtc(b) - toUtc(a)) / 86400000); // b - a
+const monLabel = s => {
+  const [y, m] = ymdParts(s);
+  return ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][m - 1] + " " + String(y).slice(2);
+};
+const dueStart = d => String(d.period_from || d.month || "").slice(0, 10);
+
+/* "₹9,000/mo" · "₹54,000/6 mo" · "₹1,08,000/yr" · "₹2,16,000/2 yr" */
+const planLabel = s => {
+  const m = num0(s.plan_months) || 1;
+  const amt = s.plan_amount != null && s.plan_amount !== "" ? num0(s.plan_amount) : num0(s.monthly_fee) * m;
+  if (m === 1) return inr(amt) + "/mo";
+  if (m === 12) return inr(amt) + "/yr";
+  if (m % 12 === 0) return inr(amt) + "/" + m / 12 + " yr";
+  return inr(amt) + "/" + m + " mo";
+};
+
+/* Fee status of one student from paid_till */
+const feeState = (s, today) => {
+  today = today || istToday();
+  if (!s || s.status === "left") return {
+    kind: "left",
+    label: "LEFT",
+    c: col('mut'),
+    bg: "#eceef1"
+  };
+  if (!s.paid_till) {
+    if (!s.joining_date || num0(s.monthly_fee) <= 0) return {
+      kind: "na",
+      label: "FEE NOT SET",
+      c: col('mut'),
+      bg: "#eceef1"
+    };
+    return {
+      kind: "na",
+      label: "NOT BILLED",
+      c: col('mut'),
+      bg: "#eceef1"
+    };
+  }
+  const pt = String(s.paid_till).slice(0, 10);
+  const over = dayDiff(pt, today); // today - paid_till
+  if (over > 0) return {
+    kind: "overdue",
+    days: over,
+    paidTill: pt,
+    label: "OVERDUE " + over + (over === 1 ? " DAY" : " DAYS"),
+    c: col('red'),
+    bg: "#fbe9e7"
+  };
+  const dueIn = -over + 1; // days until paid_till + 1
+  if (dueIn <= 7) return {
+    kind: "soon",
+    days: dueIn,
+    paidTill: pt,
+    label: "DUE IN " + dueIn + (dueIn === 1 ? " DAY" : " DAYS"),
+    c: col('amber'),
+    bg: "#fdf4e0"
+  };
+  return {
+    kind: "paid",
+    paidTill: pt,
+    label: "PAID TILL " + dmy(pt),
+    c: col('green'),
+    bg: "#e6f4ec"
+  };
+};
+
+/* Pending amount that is actually due (period already started) */
+const startedPending = (dues, today) => {
+  today = today || istToday();
+  return (dues || []).filter(d => num0(d.pending) > 0 && dueStart(d) && dueStart(d) <= today);
+};
+
+/* Left before paid_till: months already paid after leaving */
+const remainingAfterLeave = (s, data) => {
+  if (!s || s.status !== "left" || !s.paid_till) return null;
+  const from = String(s.exit_date || istToday()).slice(0, 10);
+  if (String(s.paid_till).slice(0, 10) <= from) return null;
+  const rows = (data.monthly_dues || []).filter(d => d.student_id === s.id && num0(d.pending) <= 0 && dueStart(d) > from);
+  if (!rows.length) return null;
+  return {
+    months: rows.length,
+    value: rows.reduce((a, d) => a + num0(d.paid_amount), 0)
+  };
+};
+
+/* Client mirror of record_fee_payment(): which months N months will cover */
+const payPreview = (s, dues, n, today) => {
+  today = today || istToday();
+  const mine = (dues || []).filter(d => d.student_id === s.id);
+  const byMonth = {};
+  mine.forEach(d => {
+    const k = monthStartOf(d.month);
+    if (!byMonth[k] || String(d.month) < String(byMonth[k].month)) byMonth[k] = d;
+  });
+  const unpaid = mine.filter(d => num0(d.pending) > 0).map(d => monthStartOf(d.month)).sort();
+  let start;
+  if (unpaid.length) start = unpaid[0];else if (mine.length) start = addMonthsYmd(mine.map(d => monthStartOf(d.month)).sort().slice(-1)[0], 1);else if (s.joining_date) start = monthStartOf(s.joining_date);else return null;
+  const out = [];
+  let m = start,
+    guard = 0;
+  while (out.length < n && guard++ < 240) {
+    const row = byMonth[m];
+    if (!row) out.push({
+      m,
+      owed: num0(s.monthly_fee),
+      isNew: true
+    });else if (num0(row.pending) > 0) out.push({
+      m,
+      owed: num0(row.pending),
+      isNew: false
+    });
+    m = addMonthsYmd(m, 1);
+  }
+  const gross = out.reduce((a, x) => a + x.owed, 0);
+  const pm = num0(s.plan_months) || 1;
+  const std = Math.round(num0(s.monthly_fee) * pm * 100) / 100;
+  const planDisc = n === pm && s.plan_amount != null && num0(s.plan_amount) < std ? std - num0(s.plan_amount) : 0;
+  const curMonth = monthStartOf(today);
+  const overdue = out.filter(x => x.m <= curMonth);
+  const covered = new Set(out.map(x => x.m));
+  const to = out.length ? monthEndOf(out[out.length - 1].m) : null;
+  // paid_till after this payment: day before first still-unpaid month, else end of covered
+  const leftUnpaid = unpaid.filter(x => !covered.has(x)).sort();
+  const newPaidTill = leftUnpaid.length ? addDaysYmd(leftUnpaid[0], -1) : to;
+  return {
+    months: out,
+    from: out.length ? out[0].m : null,
+    to,
+    gross,
+    planDisc: Math.min(planDisc, gross),
+    overdueCount: overdue.length,
+    overdueAmt: overdue.reduce((a, x) => a + x.owed, 0),
+    advanceCount: out.length - overdue.length,
+    newPaidTill
+  };
+};
+
+/* Client mirror of record_partial_payment(): amount applied oldest-first */
+const partialPreview = (s, dues, amount, today) => {
+  today = today || istToday();
+  const amt = Math.round(num0(amount) * 100) / 100;
+  if (!(amt > 0)) return null;
+  const mine = (dues || []).filter(d => d.student_id === s.id);
+  const byMonth = {};
+  mine.forEach(d => {
+    const k = monthStartOf(d.month);
+    if (!byMonth[k] || String(d.month) < String(byMonth[k].month)) byMonth[k] = d;
+  });
+  const unpaid = mine.filter(d => num0(d.pending) > 0).map(d => monthStartOf(d.month)).sort();
+  let start;
+  if (unpaid.length) start = unpaid[0];else if (mine.length) start = addMonthsYmd(mine.map(d => monthStartOf(d.month)).sort().slice(-1)[0], 1);else if (s.joining_date) start = monthStartOf(s.joining_date);else return null;
+  const out = [];
+  let m = start,
+    left = amt,
+    guard = 0;
+  while (left > 0.004 && guard++ < 240) {
+    const row = byMonth[m];
+    const owed = !row ? num0(s.monthly_fee) : num0(row.pending);
+    if (owed > 0) {
+      const a = Math.min(left, owed);
+      out.push({
+        m,
+        owed,
+        alloc: Math.round(a * 100) / 100
+      });
+      left = Math.round((left - a) * 100) / 100;
+    }
+    m = addMonthsYmd(m, 1);
+  }
+  if (!out.length) return null;
+  const last = out[out.length - 1];
+  const balance = Math.round((last.owed - last.alloc) * 100) / 100;
+  const full = new Set(out.filter(x => x.alloc >= x.owed).map(x => x.m));
+  const stillUnpaid = unpaid.filter(x => !full.has(x)).concat(balance > 0 ? [last.m] : []).sort();
+  const newPaidTill = stillUnpaid.length ? addDaysYmd(stillUnpaid[0], -1) : monthEndOf(last.m);
+  const curMonth = monthStartOf(today);
+  return {
+    rows: out,
+    from: out[0].m,
+    to: monthEndOf(last.m),
+    amount: amt,
+    balance,
+    balanceMonth: last.m,
+    overdueCount: out.filter(x => x.m <= curMonth).length,
+    newPaidTill,
+    tooMuch: amt > num0(s.monthly_fee) * 36
+  };
+};
+
+/* ---- Receipt (one receipt for a whole advance group) ---- */
+const printReceipt = r => {
+  const w = window.open("", "_blank", "width=440,height=700");
+  if (!w) {
+    alert("Popup block hua — browser mein popups allow karein");
+    return;
+  }
+  const R = (l, v) => "<div class='r'><span>" + esc(l) + "</span><b>" + esc(v) + "</b></div>";
+  const money = v => "₹" + num0(v).toLocaleString("en-IN");
+  w.document.write("<html><head><title>Receipt " + esc(r.receipt_number) + "</title><style>body{font-family:Georgia,serif;padding:24px;color:#1f2630}h2{margin:0}hr{border:none;border-top:1px dashed #999;margin:14px 0}.r{display:flex;justify-content:space-between;gap:12px;margin:6px 0;font-size:14px}.big{font-size:18px;font-weight:bold}.note{font-size:11px;color:#777;text-align:right;margin-top:-4px}</style></head><body>" + "<h2>DDD Hostel</h2><div style='color:#777;font-size:12px'>Fee Receipt</div><hr>" + R("Receipt No.", r.receipt_number || "-") + R("Payment Date", dmy(r.payment_date)) + R("Student", r.student_name || "-") + (r.admission_number ? R("Admission No.", r.admission_number) : "") + R("Hostel", r.hostel || "-") + R("Fee Plan", r.plan || "-") + R("Months Covered", String(r.months || 1)) + R("Period", dmy(r.period_from) + " to " + dmy(r.period_to)) + R("Mode", String(r.mode || "-").toUpperCase() + (r.transaction_id ? " · " + r.transaction_id : "")) + "<hr>" + R("Gross Amount", money(r.gross)) + (num0(r.discount) > 0 ? R("Discount", "− " + money(r.discount)) + "<div class='note'>Approved by Director</div>" : "") + "<hr><div class='r big'><span>Net Paid</span><span>" + money(r.net) + "</span></div>" + (r.partial ? R("Payment Type", "PARTIAL") + (num0(r.balance) > 0 ? R("Balance due (" + monLabel(r.balance_month) + ")", money(r.balance)) : "") : "") + "<div class='r big'><span>Paid Till</span><span>" + esc(dmy(r.paid_till)) + "</span></div><hr>" + "<div style='font-size:11px;color:#888;text-align:center'>Computer generated · " + esc(new Date().toLocaleString("en-IN", {
+    timeZone: "Asia/Kolkata"
+  })) + " IST</div></body></html>");
+  w.document.close();
+  w.focus();
+  setTimeout(() => {
+    try {
+      w.print();
+    } catch (e) {}
+  }, 300);
+};
+
+/* group a student's payments: one row per advance group (or single legacy payment) */
+const paymentGroups = (pays, sid) => {
+  const g = {};
+  (pays || []).filter(f => f.student_id === sid).forEach(f => {
+    const k = f.advance_group_id || f.id;
+    if (!g[k]) g[k] = {
+      key: k,
+      first_id: f.id,
+      isGroup: !!f.advance_group_id,
+      rows: []
+    };
+    g[k].rows.push(f);
+  });
+  return Object.values(g).map(x => {
+    const rows = x.rows.slice().sort((a, b) => String(a.period_from || "").localeCompare(String(b.period_from || "")));
+    const net = rows.reduce((a, f) => a + num0(f.amount), 0);
+    const disc = rows.reduce((a, f) => a + num0(f.discount_amount), 0);
+    return {
+      ...x,
+      rows,
+      net,
+      discount: disc,
+      gross: net + disc,
+      months: rows.length,
+      period_from: rows[0].period_from,
+      period_to: rows[rows.length - 1].period_to,
+      payment_date: rows[0].payment_date,
+      receipt_number: rows[0].receipt_number,
+      mode: rows[0].mode,
+      transaction_id: rows[0].transaction_id,
+      created_at: rows.map(f => f.created_at || "").sort().slice(-1)[0]
+    };
+  }).sort((a, b) => String(b.payment_date || "").localeCompare(String(a.payment_date || "")) || String(b.created_at).localeCompare(String(a.created_at)));
+};
+const receiptFromGroup = (g, s, hostelName, dues) => {
+  const lastRow = g.rows[g.rows.length - 1];
+  const due = (dues || []).find(d => d.id === lastRow.due_id);
+  const bal = due ? num0(due.pending) : 0;
+  const partial = bal > 0 || /partial/i.test(String(lastRow.remarks || ""));
+  return {
+    receipt_number: g.receipt_number,
+    payment_date: g.payment_date,
+    student_name: s ? s.full_name : "-",
+    admission_number: s ? s.admission_number : "",
+    hostel: hostelName,
+    plan: s ? planName(s) : "-",
+    months: g.months,
+    period_from: g.period_from,
+    period_to: g.period_to,
+    mode: g.mode,
+    transaction_id: g.transaction_id,
+    gross: g.gross,
+    discount: g.discount,
+    net: g.net,
+    paid_till: bal > 0 ? addDaysYmd(g.period_from && lastRow.period_from ? lastRow.period_from : g.period_to, -1) : g.period_to,
+    partial,
+    balance: bal,
+    balance_month: lastRow.period_from
+  };
+};
+const lblStyle = () => ({
+  fontSize: 11.5,
+  color: col('mut'),
+  fontWeight: 700
+});
+
+/* student search: name, admission no., mobile(s), father's name — case-insensitive, partial */
+const studentMatches = (s, q) => {
+  const t = String(q || "").trim().toLowerCase();
+  if (!t) return true;
+  const digits = t.replace(/\D/g, "");
+  const txt = [s.full_name, s.admission_number, s.father_name].map(x => String(x || "").toLowerCase());
+  if (txt.some(x => x.includes(t))) return true;
+  if (digits.length >= 2) {
+    return [s.mobile, s.parent_mobile, s.whatsapp].some(x => String(x || "").replace(/\D/g, "").includes(digits));
+  }
+  return false;
+};
+
+/* =====================================================================
+   PHASE 2 — Fee Plan block inside Student add/edit form
+   ===================================================================== */
+function PlanFields({
+  v,
+  set,
+  role,
+  hasPayments
+}) {
+  const isDir = role === "director";
+  const plan = v.fee_plan || "monthly";
+  const months = planMonthsOf(plan, v.plan_months);
+  const fee = num0(v.monthly_fee);
+  const auto = Math.round(fee * months * 100) / 100;
+  const init = useRef(null);
+  if (init.current === null) {
+    init.current = {
+      fee: v.monthly_fee,
+      plan: v.fee_plan,
+      months: v.plan_months,
+      amount: v.plan_amount
+    };
+  }
+  // keep plan/months consistent + recalc amount unless Director edited it by hand
+  useEffect(() => {
+    if (v.fee_plan == null || v.fee_plan === "") set("fee_plan", "monthly");
+    if (plan !== "custom" && num0(v.plan_months) !== months) set("plan_months", months);
+    const i = init.current;
+    const unchanged = String(i.fee ?? "") === String(v.monthly_fee ?? "") && (i.plan || "monthly") === plan && num0(i.months || 1) === months;
+    if (isDir) {
+      if (v._planManual === undefined) {
+        // editing a student whose saved amount differs from standard -> treat as manual
+        const manual = i.amount != null && i.amount !== "" && unchanged && num0(i.amount) !== auto;
+        set("_planManual", manual);
+        if (manual) return;
+      }
+      if (!v._planManual && num0(v.plan_amount) !== auto) set("plan_amount", auto);
+    } else {
+      // Manager/Accountant: saved price kept only while fee & plan unchanged, else standard
+      const want = unchanged && i.amount != null && i.amount !== "" ? num0(i.amount) : auto;
+      if (num0(v.plan_amount) !== want || v.plan_amount === "" || v.plan_amount == null) set("plan_amount", want);
+    }
+  }, [plan, months, v.monthly_fee, v._planManual]);
+  const amt = num0(v.plan_amount);
+  const disc = auto - amt;
+  const box = {
+    display: "flex",
+    flexDirection: "column",
+    gap: 5
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      gridColumn: "1/-1",
+      display: "grid",
+      gap: 12,
+      gridTemplateColumns: "1fr 1fr",
+      padding: 12,
+      border: "1px dashed " + col('line'),
+      borderRadius: 10
+    }
+  }, /*#__PURE__*/React.createElement("label", {
+    style: box
+  }, /*#__PURE__*/React.createElement("span", {
+    style: lblStyle()
+  }, "Fee Plan"), /*#__PURE__*/React.createElement("select", {
+    className: "inp",
+    value: plan,
+    onChange: e => {
+      const p = e.target.value;
+      set("fee_plan", p);
+      const o = planOpt(p);
+      if (o.m != null) set("plan_months", o.m);
+    }
+  }, PLAN_OPTS.map(o => /*#__PURE__*/React.createElement("option", {
+    key: o.value,
+    value: o.value
+  }, o.label)))), plan === "custom" ? /*#__PURE__*/React.createElement("label", {
+    style: box
+  }, /*#__PURE__*/React.createElement("span", {
+    style: lblStyle()
+  }, "Custom Months (1–36)"), /*#__PURE__*/React.createElement("input", {
+    className: "inp",
+    type: "number",
+    min: 1,
+    max: 36,
+    step: 1,
+    value: v.plan_months ?? "",
+    onChange: e => set("plan_months", e.target.value === "" ? "" : Number(e.target.value))
+  })) : /*#__PURE__*/React.createElement("div", null), /*#__PURE__*/React.createElement("label", {
+    style: {
+      ...box,
+      gridColumn: "1/-1"
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: lblStyle()
+  }, "Plan Amount ", isDir ? "(Director can edit)" : "(auto)"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 8,
+      alignItems: "center"
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    className: "inp",
+    type: "number",
+    min: 0,
+    value: v.plan_amount ?? "",
+    readOnly: !isDir,
+    style: !isDir ? {
+      background: "#f4f5f7",
+      color: col('mut')
+    } : undefined,
+    onChange: e => {
+      if (!isDir) return;
+      set("_planManual", true);
+      set("plan_amount", e.target.value === "" ? "" : Number(e.target.value));
+    }
+  }), isDir && v._planManual ? /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    className: "mini",
+    style: {
+      background: col('slate'),
+      whiteSpace: "nowrap"
+    },
+    onClick: () => {
+      set("_planManual", false);
+      set("plan_amount", auto);
+    }
+  }, "↺ Auto") : null), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11.5,
+      color: col('mut')
+    }
+  }, inr(fee), " × ", months, " = ", inr(auto), disc > 0 && amt > 0 ? /*#__PURE__*/React.createElement("b", {
+    style: {
+      color: col('green')
+    }
+  }, " · Discount ", inr(disc), " (Director)") : null)), v.id && v.paid_till && hasPayments ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      gridColumn: "1/-1",
+      fontSize: 12.5,
+      fontWeight: 700,
+      color: col('slate')
+    }
+  }, "Paid till: ", dmy(v.paid_till)) : null);
+}
+const validateStudent = v => {
+  const plan = v.fee_plan || "monthly";
+  const m = plan === "custom" ? Number(v.plan_months) : planMonthsOf(plan, v.plan_months);
+  if (!Number.isInteger(m) || m < 1 || m > 36) return "Plan months 1 se 36 ke beech hone chahiye.";
+  if (num0(v.monthly_fee) > 0 && !(num0(v.plan_amount) > 0)) return "Plan Amount 0 se zyada hona chahiye.";
+  if (v.exit_date && v.joining_date && String(v.exit_date) < String(v.joining_date)) return "Exit date joining date se pehle nahi ho sakti.";
+  return "";
+};
+const VALIDATE = {
+  students: validateStudent
+};
+
+/* =====================================================================
+   PHASE 3 — Receive / advance payment popup (calls record_fee_payment)
+   ===================================================================== */
+function FeePayModal({
+  student: s,
+  data,
+  role,
+  billingMode,
+  hostelName,
+  onClose,
+  onDone
+}) {
+  const isDir = role === "director";
+  const today = istToday();
+  const PRESETS = [1, 3, 6, 12, 24];
+  const defM = num0(s.plan_months) || 1;
+  const [sel, setSel] = useState(PRESETS.includes(defM) ? String(defM) : "custom");
+  const [custom, setCustom] = useState(PRESETS.includes(defM) ? 2 : defM);
+  const [disc, setDisc] = useState(0);
+  const [ptype, setPtype] = useState("full");
+  const [pamt, setPamt] = useState("");
+  const [mode, setMode] = useState("upi");
+  const [pDate, setPDate] = useState(today);
+  const [txn, setTxn] = useState("");
+  const [remarks, setRemarks] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const [done, setDone] = useState(null);
+  const groupId = useRef(typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : null);
+  const isPartial = ptype === "partial";
+  const pp = isPartial ? partialPreview(s, data.monthly_dues, pamt, today) : null;
+  const n = sel === "custom" ? parseInt(custom, 10) || 0 : Number(sel);
+  const pv = n >= 1 && n <= 36 ? payPreview(s, data.monthly_dues, n, today) : null;
+  const extra = isDir ? Math.max(0, num0(disc)) : 0;
+  const totalDisc = pv ? Math.min(pv.gross, pv.planDisc + extra) : 0;
+  const amount = pv ? Math.round((pv.gross - totalDisc) * 100) / 100 : 0;
+  const blocked = !s.joining_date ? "Is student ki Joining Date nahi hai — pehle Students mein set karein." : num0(s.monthly_fee) <= 0 ? "Is student ki Monthly Fee 0 hai — pehle set karein." : billingMode === "anniversary" ? "Multi-month payment sirf Calendar billing mode mein chalta hai (Fees → Billing cycle)." : "";
+  const submit = async () => {
+    if (busy) return; // double-submit guard
+    if (blocked) {
+      setErr(blocked);
+      return;
+    }
+    if (isPartial) {
+      if (!(num0(pamt) > 0)) {
+        setErr("Amount 0 se zyada daalein.");
+        return;
+      }
+      if (!pp) {
+        setErr("Amount allocate nahi ho paya.");
+        return;
+      }
+      if (pp.tooMuch) {
+        setErr("Amount bahut zyada hai (max 36 months ki fee).");
+        return;
+      }
+      if (!pDate || pDate > today) {
+        setErr("Payment date aaj ya pehle ki honi chahiye.");
+        return;
+      }
+      setErr("");
+      setBusy(true);
+      const {
+        data: res,
+        error
+      } = await SB.rpc("record_partial_payment", {
+        p_student_id: s.id,
+        p_amount: Math.round(num0(pamt) * 100) / 100,
+        p_mode: mode,
+        p_payment_date: pDate,
+        p_transaction_id: txn.trim() || null,
+        p_remarks: remarks.trim() || null,
+        p_group_id: groupId.current
+      });
+      setBusy(false);
+      if (error) {
+        setErr(error.message || String(error));
+        return;
+      }
+      setDone(res);
+      onDone && onDone(res);
+      return;
+    }
+    if (!(n >= 1 && n <= 36) || sel === "custom" && !Number.isInteger(Number(custom))) {
+      setErr("Months 1 se 36 ke beech (poora number) hone chahiye.");
+      return;
+    }
+    if (!pv) {
+      setErr("Period calculate nahi ho paya.");
+      return;
+    }
+    if (isDir && (num0(disc) < 0 || pv.planDisc + num0(disc) > pv.gross)) {
+      setErr("Discount gross amount se zyada nahi ho sakta.");
+      return;
+    }
+    if (!(amount >= 0)) {
+      setErr("Amount sahi nahi hai.");
+      return;
+    }
+    if (!pDate || pDate > today) {
+      setErr("Payment date aaj ya pehle ki honi chahiye.");
+      return;
+    }
+    setErr("");
+    setBusy(true);
+    const {
+      data: res,
+      error
+    } = await SB.rpc("record_fee_payment", {
+      p_student_id: s.id,
+      p_months: n,
+      p_amount: amount,
+      p_discount: extra,
+      p_mode: mode,
+      p_payment_date: pDate,
+      p_transaction_id: txn.trim() || null,
+      p_remarks: remarks.trim() || null,
+      p_group_id: groupId.current
+    });
+    setBusy(false);
+    if (error) {
+      setErr(error.message || String(error));
+      return;
+    }
+    setDone(res);
+    onDone && onDone(res);
+  };
+  const box = {
+    display: "flex",
+    flexDirection: "column",
+    gap: 5
+  };
+  const row = (l, v, strong) => /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      fontSize: 13,
+      margin: "3px 0"
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: col('mut')
+    }
+  }, l), strong ? /*#__PURE__*/React.createElement("b", null, v) : /*#__PURE__*/React.createElement("span", null, v));
+  if (done) {
+    const r = {
+      receipt_number: done.receipt_number,
+      payment_date: pDate,
+      student_name: s.full_name,
+      admission_number: s.admission_number,
+      hostel: hostelName,
+      plan: planName(s),
+      months: done.months,
+      period_from: done.period_from,
+      period_to: done.period_to,
+      mode,
+      transaction_id: txn.trim(),
+      gross: done.gross,
+      discount: done.discount,
+      net: done.net,
+      paid_till: done.paid_till,
+      partial: !!done.partial,
+      balance: done.balance,
+      balance_month: done.balance_month
+    };
+    return /*#__PURE__*/React.createElement("div", {
+      className: "ovl",
+      onClick: onClose
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "card",
+      style: {
+        padding: 22,
+        maxWidth: 400,
+        width: "100%"
+      },
+      onClick: e => e.stopPropagation()
+    }, /*#__PURE__*/React.createElement("b", {
+      className: "serif",
+      style: {
+        fontSize: 16,
+        color: col('green')
+      }
+    }, "✓ Payment saved"), /*#__PURE__*/React.createElement("div", {
+      style: {
+        margin: "12px 0"
+      }
+    }, row("Receipt", done.receipt_number, true), row("Covers", dmy(done.period_from) + " to " + dmy(done.period_to)), row("Net paid", inr(done.net), true), row("Paid till", dmy(done.paid_till), true), done.partial && num0(done.balance) > 0 ? row("Balance (" + monLabel(done.balance_month) + ")", inr(done.balance), true) : null), /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        gap: 10
+      }
+    }, /*#__PURE__*/React.createElement("button", {
+      className: "pbtn",
+      style: {
+        flex: 1,
+        justifyContent: "center",
+        background: col('slate')
+      },
+      onClick: () => printReceipt(r)
+    }, "🧾 Print Receipt"), /*#__PURE__*/React.createElement("button", {
+      className: "pbtn",
+      style: {
+        flex: 1,
+        justifyContent: "center"
+      },
+      onClick: onClose
+    }, "Done"))));
+  }
+  return /*#__PURE__*/React.createElement("div", {
+    className: "ovl",
+    onClick: onClose
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "card",
+    style: {
+      padding: 22,
+      maxWidth: 420,
+      width: "100%",
+      maxHeight: "92vh",
+      overflowY: "auto"
+    },
+    onClick: e => e.stopPropagation()
+  }, /*#__PURE__*/React.createElement("b", {
+    className: "serif",
+    style: {
+      fontSize: 16
+    }
+  }, "Receive Fee — ", s.full_name), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: col('mut'),
+      marginTop: 4
+    }
+  }, planName(s), " · ", planLabel(s), " · ", s.paid_till ? "Paid till " + dmy(s.paid_till) : "Abhi tak koi payment nahi"), blocked ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 12,
+      fontSize: 12.5,
+      color: col('red'),
+      fontWeight: 700
+    }
+  }, blocked) : null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 6,
+      marginTop: 14
+    }
+  }, [["full", "Poore mahine"], ["partial", "Partial amount"]].map(([k, l]) => /*#__PURE__*/React.createElement("button", {
+    key: k,
+    type: "button",
+    onClick: () => {
+      setPtype(k);
+      setErr("");
+    },
+    "data-ptype": k,
+    style: {
+      flex: 1,
+      padding: "7px 10px",
+      borderRadius: 8,
+      border: "1px solid " + col('line'),
+      cursor: "pointer",
+      fontWeight: 800,
+      fontSize: 12.5,
+      background: ptype === k ? col('steel') : "#fff",
+      color: ptype === k ? "#fff" : col('slate')
+    }
+  }, l))), isPartial ? /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+    style: {
+      ...box,
+      marginTop: 12
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: lblStyle()
+  }, "Amount received (₹)"), /*#__PURE__*/React.createElement("input", {
+    className: "inp",
+    type: "number",
+    min: 1,
+    value: pamt,
+    onChange: e => setPamt(e.target.value),
+    "data-partial-amount": "1",
+    placeholder: "e.g. 4500"
+  })), pp ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 12,
+      padding: 12,
+      background: col('paper'),
+      borderRadius: 10,
+      border: "1px solid " + col('line')
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 800,
+      fontSize: 13.5
+    },
+    "data-partial-covers": "1"
+  }, "Adjust: ", pp.rows.map(x => monLabel(x.m) + " " + inr(x.alloc) + (x.alloc < x.owed ? " (partial)" : "")).join(" · ")), pp.balance > 0 ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      marginTop: 6,
+      color: col('amber'),
+      fontWeight: 700
+    },
+    "data-partial-balance": "1"
+  }, "Balance ", monLabel(pp.balanceMonth), ": ", inr(pp.balance)) : null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 6
+    }
+  }, row("Paid till after this", dmy(pp.newPaidTill), true)), pp.tooMuch ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: col('red'),
+      fontWeight: 700
+    }
+  }, "Amount bahut zyada hai (max 36 months).") : null) : null) : null, !isPartial ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      margin: "14px 0 6px"
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: lblStyle()
+  }, "Pay for")) : null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: isPartial ? "none" : "flex",
+      gap: 6,
+      flexWrap: "wrap"
+    }
+  }, [["1", "1 Month"], ["3", "3"], ["6", "6"], ["12", "12"], ["24", "24"], ["custom", "Custom"]].map(([k, l]) => /*#__PURE__*/React.createElement("button", {
+    key: k,
+    type: "button",
+    onClick: () => setSel(k),
+    "data-pay": k,
+    style: {
+      padding: "6px 11px",
+      borderRadius: 8,
+      border: "1px solid " + col('line'),
+      cursor: "pointer",
+      fontWeight: 700,
+      fontSize: 12.5,
+      background: sel === k ? col('slate') : "#fff",
+      color: sel === k ? "#fff" : col('slate')
+    }
+  }, l, k !== "custom" && k !== "1" ? " Months" : ""))), !isPartial && sel === "custom" ? /*#__PURE__*/React.createElement("label", {
+    style: {
+      ...box,
+      marginTop: 10
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: lblStyle()
+  }, "Months (1–36)"), /*#__PURE__*/React.createElement("input", {
+    className: "inp",
+    type: "number",
+    min: 1,
+    max: 36,
+    step: 1,
+    value: custom,
+    onChange: e => setCustom(e.target.value)
+  })) : null, !isPartial && pv ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 12,
+      padding: 12,
+      background: col('paper'),
+      borderRadius: 10,
+      border: "1px solid " + col('line')
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 800,
+      fontSize: 13.5
+    },
+    "data-covers": "1"
+  }, "Covers: ", dmy(pv.from), " to ", dmy(pv.to)), pv.overdueCount > 0 ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      marginTop: 6,
+      color: col('red'),
+      fontWeight: 700
+    }
+  }, "Pehle overdue clear: ", pv.overdueCount, " month", pv.overdueCount > 1 ? "s" : "", " (", inr(pv.overdueAmt), ")", pv.advanceCount > 0 ? ", phir " + pv.advanceCount + " month advance" : "") : /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      marginTop: 6,
+      color: col('green'),
+      fontWeight: 700
+    }
+  }, pv.advanceCount, " month advance"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11.5,
+      color: col('mut'),
+      marginTop: 4
+    }
+  }, pv.months.map(x => monLabel(x.m)).join(" · ")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 8
+    }
+  }, row("Gross", inr(pv.gross)), pv.planDisc > 0 ? row("Plan discount (Director-approved)", "− " + inr(pv.planDisc)) : null, isDir && num0(disc) > 0 ? row("Director discount", "− " + inr(num0(disc))) : null, row("Amount to collect", inr(amount), true), row("Paid till after this", dmy(pv.newPaidTill), true))) : null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "1fr 1fr",
+      gap: 10,
+      marginTop: 12
+    }
+  }, !isPartial ? /*#__PURE__*/React.createElement("label", {
+    style: box
+  }, /*#__PURE__*/React.createElement("span", {
+    style: lblStyle()
+  }, "Amount ", isDir ? "" : "(locked)"), /*#__PURE__*/React.createElement("input", {
+    className: "inp",
+    type: "number",
+    value: amount,
+    readOnly: true,
+    style: {
+      background: "#f4f5f7",
+      fontWeight: 800
+    },
+    "data-amount": "1"
+  })) : null, isDir && !isPartial ? /*#__PURE__*/React.createElement("label", {
+    style: box
+  }, /*#__PURE__*/React.createElement("span", {
+    style: lblStyle()
+  }, "Discount (Director)"), /*#__PURE__*/React.createElement("input", {
+    className: "inp",
+    type: "number",
+    min: 0,
+    value: disc,
+    "data-discount": "1",
+    onChange: e => setDisc(e.target.value === "" ? 0 : Number(e.target.value))
+  })) : /*#__PURE__*/React.createElement("div", null), /*#__PURE__*/React.createElement("label", {
+    style: box
+  }, /*#__PURE__*/React.createElement("span", {
+    style: lblStyle()
+  }, "Mode"), /*#__PURE__*/React.createElement("select", {
+    className: "inp",
+    value: mode,
+    onChange: e => setMode(e.target.value)
+  }, PAY_MODES.map(m => /*#__PURE__*/React.createElement("option", {
+    key: m,
+    value: m
+  }, m.toUpperCase())))), /*#__PURE__*/React.createElement("label", {
+    style: box
+  }, /*#__PURE__*/React.createElement("span", {
+    style: lblStyle()
+  }, "Payment date (IST)"), /*#__PURE__*/React.createElement("input", {
+    className: "inp",
+    type: "date",
+    max: today,
+    value: pDate,
+    onChange: e => setPDate(e.target.value)
+  })), /*#__PURE__*/React.createElement("label", {
+    style: {
+      ...box,
+      gridColumn: "1/-1"
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: lblStyle()
+  }, "Transaction ID / Remarks (optional)"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 8
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    className: "inp",
+    placeholder: "Txn ID",
+    value: txn,
+    onChange: e => setTxn(e.target.value)
+  }), /*#__PURE__*/React.createElement("input", {
+    className: "inp",
+    placeholder: "Remarks",
+    value: remarks,
+    onChange: e => setRemarks(e.target.value)
+  })))), err ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 10,
+      fontSize: 12.5,
+      color: col('red'),
+      fontWeight: 700
+    }
+  }, err) : null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 10,
+      marginTop: 16
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: onClose,
+    style: {
+      flex: 1,
+      padding: 10,
+      background: col('paper'),
+      border: "1px solid " + col('line'),
+      borderRadius: 9,
+      fontWeight: 700,
+      cursor: "pointer"
+    }
+  }, "Cancel"), /*#__PURE__*/React.createElement("button", {
+    className: "pbtn",
+    disabled: busy || !!blocked || (isPartial ? !pp || pp.tooMuch : !pv),
+    style: {
+      flex: 2,
+      justifyContent: "center"
+    },
+    onClick: submit,
+    "data-confirm": "1"
+  }, busy ? "Saving…" : "Confirm " + (isPartial ? pp ? inr(pp.amount) : "" : pv ? inr(amount) : "")))));
+}
+
+/* =====================================================================
+   Student fee history (each payment with its covered period)
+   ===================================================================== */
+function FeeHistoryModal({
+  student: s,
+  data,
+  role,
+  hostelName,
+  onClose,
+  flash,
+  refresh
+}) {
+  const isDir = role === "director";
+  const [busy, setBusy] = useState(false);
+  const groups = paymentGroups(data.fee_payments, s.id);
+  const st = feeState(s);
+  const rem = remainingAfterLeave(s, data);
+  const delGroup = async g => {
+    if (busy) return;
+    const msg = g.isGroup ? "Ye advance payment (" + g.months + " months, " + inr(g.net) + ") poora delete hoga.\n\nJo months abhi shuru nahi hue wo hat jayenge, baaki months wapas PENDING ho jayenge.\n\nPakka delete karein?" : "Ye payment (" + inr(g.net) + ") delete hoga aur uska month wapas pending ho jayega.\n\nPakka delete karein?";
+    if (!confirm(msg)) return;
+    setBusy(true);
+    const {
+      data: res,
+      error
+    } = await SB.rpc("delete_fee_payment", {
+      p_payment_id: g.first_id
+    });
+    setBusy(false);
+    if (error) {
+      flash("⚠ " + error.message);
+      return;
+    }
+    flash("Payment deleted · Paid till " + (res && res.paid_till ? dmy(res.paid_till) : "—"));
+    refresh();
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    className: "ovl",
+    onClick: onClose
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "card",
+    style: {
+      padding: 20,
+      maxWidth: 560,
+      width: "100%",
+      maxHeight: "90vh",
+      overflowY: "auto"
+    },
+    onClick: e => e.stopPropagation()
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      gap: 10
+    }
+  }, /*#__PURE__*/React.createElement("b", {
+    className: "serif",
+    style: {
+      fontSize: 16
+    }
+  }, "Fee History — ", s.full_name), /*#__PURE__*/React.createElement("button", {
+    onClick: onClose,
+    style: {
+      border: "none",
+      background: "none",
+      cursor: "pointer",
+      fontSize: 18,
+      color: col('mut')
+    }
+  }, "✕")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12.5,
+      color: col('mut'),
+      margin: "6px 0 12px",
+      display: "flex",
+      gap: 8,
+      flexWrap: "wrap",
+      alignItems: "center"
+    }
+  }, /*#__PURE__*/React.createElement("span", null, planName(s), " · ", planLabel(s)), /*#__PURE__*/React.createElement(Badge, {
+    c: st.c,
+    bg: st.bg
+  }, st.label), rem ? /*#__PURE__*/React.createElement("b", {
+    style: {
+      color: col('amber')
+    }
+  }, rem.months, " months remaining (", inr(rem.value), ")") : null), /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Date", "Period", "Months", "Paid", ""].map(c => /*#__PURE__*/React.createElement("th", {
+    key: c
+  }, c)))), /*#__PURE__*/React.createElement("tbody", null, groups.map(g => /*#__PURE__*/React.createElement("tr", {
+    key: g.key
+  }, /*#__PURE__*/React.createElement("td", null, dmy(g.payment_date), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10.5,
+      color: col('mut')
+    }
+  }, g.receipt_number || "")), /*#__PURE__*/React.createElement("td", null, dmy(g.period_from), " → ", dmy(g.period_to)), /*#__PURE__*/React.createElement("td", null, g.months), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("b", null, inr(g.net)), g.discount > 0 ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10.5,
+      color: col('green')
+    }
+  }, "disc ", inr(g.discount)) : null), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("span", {
+    style: {
+      display: "inline-flex",
+      gap: 6
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "mini",
+    style: {
+      background: col('slate')
+    },
+    onClick: () => printReceipt(receiptFromGroup(g, s, hostelName, data.monthly_dues))
+  }, "🧾"), isDir ? /*#__PURE__*/React.createElement("button", {
+    className: "mini",
+    style: {
+      background: col('red')
+    },
+    disabled: busy,
+    onClick: () => delGroup(g),
+    "data-del": g.first_id
+  }, "Delete") : null)))), !groups.length ? /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
+    colSpan: "5"
+  }, "Koi payment nahi.")) : null))));
+}
+
+/* =====================================================================
+   PHASE 4 — Students page (plan-aware FEE column + paid-till badge)
+   ===================================================================== */
+function StudentsPage({
+  ctx
+}) {
+  const {
+    data,
+    role,
+    hName,
+    NameBtn,
+    EditDel,
+    setModal,
+    stuF,
+    setStuF
+  } = ctx;
+  const tone = {
+    active: ['green', "#e6f4ec"],
+    left: ['red', "#fbe9e7"],
+    temporary_leave: ['amber', "#fdf4e0"]
+  };
+  const [hist, setHist] = useState(null);
+  const today = istToday();
+  // filters live in App (stuF) so save/delete/refresh never resets them
+  const valid = new Set(data.hostels.map(h => h.id));
+  const hsel = (stuF.h || []).filter(id => valid.has(id));
+  const rsel = stuF.r || "";
+  const upd = patch => setStuF(p => ({
+    ...p,
+    ...patch
+  }));
+  const chip = on => ({
+    padding: "5px 12px",
+    borderRadius: 8,
+    border: "1px solid " + col('line'),
+    cursor: "pointer",
+    fontSize: 12.5,
+    fontWeight: 700,
+    background: on ? col('slate') : "#fff",
+    color: on ? "#fff" : col('slate')
+  });
+  const toggleH = id => upd({
+    r: "",
+    h: hsel.includes(id) ? hsel.filter(x => x !== id) : [...hsel, id]
+  });
+  const activeHostels = hsel.length ? hsel : data.hostels.map(h => h.id);
+  const roomOpts = data.rooms.filter(r => activeHostels.includes(r.hostel_id)).sort((a, b) => String(a.room_number).localeCompare(String(b.room_number), undefined, {
+    numeric: true
+  }));
+  const bedRoom = bedId => data.beds.find(b => b.id === bedId)?.room_id;
+  const list = data.students.filter(s => {
+    if (hsel.length && !hsel.includes(s.hostel_id)) return false;
+    if (rsel && bedRoom(s.current_bed_id) !== rsel) return false;
+    if (stuF.st && (s.status || "active") !== stuF.st) return false;
+    if (stuF.q && !studentMatches(s, stuF.q)) return false;
+    return true;
+  });
+  const addNew = () => setModal({
+    entity: "students",
+    item: hsel.length === 1 ? {
+      hostel_id: hsel[0]
+    } : {}
+  });
+  const histStudent = hist ? data.students.find(x => x.id === hist) : null;
+  return /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "flex-end",
+      marginBottom: 14
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "pbtn",
+    onClick: addNew,
+    "data-add-student": "1"
+  }, "+ Add")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      flexWrap: "wrap",
+      gap: 8,
+      alignItems: "center",
+      marginBottom: 14
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 12,
+      fontWeight: 700,
+      color: col('mut')
+    }
+  }, "Hostel:"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => upd({
+      h: [],
+      r: ""
+    }),
+    style: chip(hsel.length === 0),
+    "data-hchip": "all"
+  }, "All"), data.hostels.map(h => /*#__PURE__*/React.createElement("button", {
+    key: h.id,
+    onClick: () => toggleH(h.id),
+    style: chip(hsel.includes(h.id)),
+    "data-hchip": h.code
+  }, h.code)), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 12,
+      fontWeight: 700,
+      color: col('mut'),
+      marginLeft: 8
+    }
+  }, "Room:"), /*#__PURE__*/React.createElement("select", {
+    className: "inp",
+    style: {
+      width: "auto"
+    },
+    value: rsel,
+    onChange: e => upd({
+      r: e.target.value
+    }),
+    "data-room-filter": "1"
+  }, /*#__PURE__*/React.createElement("option", {
+    value: ""
+  }, "All rooms"), roomOpts.map(r => /*#__PURE__*/React.createElement("option", {
+    key: r.id,
+    value: r.id
+  }, hName(r.hostel_id), " · Room ", r.room_number))), /*#__PURE__*/React.createElement("select", {
+    className: "inp",
+    style: {
+      width: "auto"
+    },
+    value: stuF.st || "",
+    onChange: e => upd({
+      st: e.target.value
+    }),
+    "data-status-filter": "1"
+  }, /*#__PURE__*/React.createElement("option", {
+    value: ""
+  }, "All status"), /*#__PURE__*/React.createElement("option", {
+    value: "active"
+  }, "Active"), /*#__PURE__*/React.createElement("option", {
+    value: "temporary_leave"
+  }, "Temporary leave"), /*#__PURE__*/React.createElement("option", {
+    value: "left"
+  }, "Left")), /*#__PURE__*/React.createElement("input", {
+    className: "inp",
+    style: {
+      width: 190
+    },
+    placeholder: "Search name / adm / mobile",
+    value: stuF.q || "",
+    onChange: e => upd({
+      q: e.target.value
+    }),
+    "data-stu-search": "1"
+  }), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 12,
+      color: col('mut'),
+      marginLeft: "auto"
+    }
+  }, list.length, " students")), /*#__PURE__*/React.createElement("div", {
+    className: "card",
+    style: {
+      overflowX: "auto"
+    }
+  }, /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Student", "Father", "Mobile", "Course", "Hostel", "Room/Bed", "Fee", "Status", ""].map(c => /*#__PURE__*/React.createElement("th", {
+    key: c
+  }, c)))), /*#__PURE__*/React.createElement("tbody", null, list.map(s => {
+    const bed = data.beds.find(b => b.id === s.current_bed_id);
+    const room = bed ? data.rooms.find(r => r.id === bed.room_id) : null;
+    const st = feeState(s, today);
+    const rem = remainingAfterLeave(s, data);
+    const tn = tone[s.status] || tone.active;
+    return /*#__PURE__*/React.createElement("tr", {
+      key: s.id,
+      "data-student": s.id
+    }, /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement(NameBtn, {
+      name: s.full_name,
+      mobile: s.mobile,
+      sub: s.course,
+      sid: s.id
+    })), /*#__PURE__*/React.createElement("td", null, s.father_name), /*#__PURE__*/React.createElement("td", null, s.mobile), /*#__PURE__*/React.createElement("td", null, s.course), /*#__PURE__*/React.createElement("td", null, hName(s.hostel_id)), /*#__PURE__*/React.createElement("td", null, bed ? (room ? room.room_number : "?") + "/" + bed.bed_number : "—"), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontWeight: 700,
+        whiteSpace: "nowrap"
+      }
+    }, planLabel(s)), s.status !== "left" ? /*#__PURE__*/React.createElement("button", {
+      onClick: () => setHist(s.id),
+      title: "Fee history",
+      style: {
+        border: "none",
+        background: "none",
+        padding: 0,
+        cursor: "pointer"
+      },
+      "data-fee-badge": s.id
+    }, /*#__PURE__*/React.createElement(Badge, {
+      c: st.c,
+      bg: st.bg
+    }, st.label)) : rem ? /*#__PURE__*/React.createElement("button", {
+      onClick: () => setHist(s.id),
+      style: {
+        border: "none",
+        background: "none",
+        padding: 0,
+        cursor: "pointer",
+        fontSize: 11,
+        color: col('amber'),
+        fontWeight: 700
+      }
+    }, rem.months, " months remaining (", inr(rem.value), ")") : null), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement(Badge, {
+      c: col(tn[0]),
+      bg: tn[1]
+    }, (s.status || "").replace("_", " "))), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement(EditDel, {
+      entity: "students",
+      item: s
+    })));
+  }), !list.length ? /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", null, "No students match.")) : null))), histStudent ? /*#__PURE__*/React.createElement(FeeHistoryModal, {
+    student: histStudent,
+    data: data,
+    role: role,
+    hostelName: hName(histStudent.hostel_id),
+    onClose: () => setHist(null),
+    flash: ctx.flash,
+    refresh: ctx.refresh
+  }) : null);
+}
+
+/* =====================================================================
+   PHASE 3/4 — Fees page (student-wise paid-till view + monthly ledger)
+   ===================================================================== */
+function FeesPage({
+  ctx
+}) {
+  const {
+    data,
+    role,
+    hName,
+    sName,
+    Header,
+    flash,
+    refresh,
+    hf,
+    setHf,
+    mf,
+    setMf,
+    billingMode,
+    saveBillingMode
+  } = ctx;
+  const [tab, setTab] = useState("students");
+  const [sf, setSf] = useState("all");
+  const [q, setQ] = useState("");
+  const [pay, setPay] = useState(null);
+  const [hist, setHist] = useState(null);
+  const today = istToday();
+  const inHostel = x => !hf || x.hostel_id === hf;
+  const students = data.students.filter(s => s.status !== "left" && inHostel(s));
+  const withState = students.map(s => ({
+    s,
+    st: feeState(s, today)
+  }));
+  const dueAmt = {};
+  startedPending(data.monthly_dues, today).forEach(d => {
+    dueAmt[d.student_id] = (dueAmt[d.student_id] || 0) + num0(d.pending);
+  });
+  const cnt = k => withState.filter(x => x.st.kind === k).length;
+  const advance = x => x.st.kind === "paid" && x.st.paidTill >= monthEndOf(today);
+  const rows = withState.filter(x => {
+    if (sf === "advance" && !advance(x)) return false;
+    if (sf === "soon" && x.st.kind !== "soon") return false;
+    if (sf === "overdue" && x.st.kind !== "overdue") return false;
+    if (q && !String(x.s.full_name || "").toLowerCase().includes(q.toLowerCase()) && !String(x.s.admission_number || "").toLowerCase().includes(q.toLowerCase())) return false;
+    return true;
+  }).sort((a, b) => {
+    const rank = {
+      overdue: 0,
+      soon: 1,
+      na: 2,
+      paid: 3
+    };
+    return rank[a.st.kind] - rank[b.st.kind] || String(a.st.paidTill || "").localeCompare(String(b.st.paidTill || "")) || String(a.s.full_name).localeCompare(String(b.s.full_name));
+  });
+  const pays = data.fee_payments.filter(inHostel);
+  const collected = pays.reduce((a, f) => a + num0(f.amount), 0);
+  const monthCollected = pays.filter(f => String(f.payment_date || "").slice(0, 7) === today.slice(0, 7)).reduce((a, f) => a + num0(f.amount), 0);
+  const overdueAmt = students.reduce((a, s) => a + (dueAmt[s.id] || 0), 0);
+
+  // ledger (old month-wise view)
+  const months = [...new Set(data.monthly_dues.map(d => String(d.month).slice(0, 7)))].sort().reverse();
+  let dues = data.monthly_dues.filter(inHostel);
+  if (mf) dues = dues.filter(d => String(d.month).slice(0, 7) === mf);
+  dues = dues.slice().sort((a, b) => String(b.month).localeCompare(String(a.month)) || String(sName(a.student_id)).localeCompare(String(sName(b.student_id))));
+  const genDues = async () => {
+    const {
+      error
+    } = await SB.rpc("generate_monthly_dues", {
+      p_month: monthStartOf(today)
+    });
+    if (error) flash("⚠ " + error.message);else {
+      flash("Monthly dues generated");
+      refresh();
+    }
+  };
+  const remind = (s, amt) => {
+    const raw = s && (s.whatsapp || s.parent_mobile || s.mobile) || "";
+    const phone = String(raw).replace(/[^0-9]/g, "").replace(/^0+/, "").slice(-10);
+    if (!phone) {
+      flash("Is student ka number nahi hai");
+      return;
+    }
+    const st = feeState(s, today);
+    const msg = encodeURIComponent("Namaste " + s.full_name + " ji, aapki hostel fee " + (amt > 0 ? "₹" + amt.toLocaleString("en-IN") + " pending hai" : "") + (st.paidTill ? " (paid till " + dmy(st.paidTill) + ", next due " + dmy(addDaysYmd(st.paidTill, 1)) + ")" : "") + ". Kripya jald jama karein. - " + (hName(s.hostel_id) || "DDD Hostel"));
+    window.open("https://wa.me/91" + phone + "?text=" + msg, "_blank");
+  };
+  const tabBtn = (k, l) => /*#__PURE__*/React.createElement("button", {
+    onClick: () => setTab(k),
+    style: {
+      padding: "7px 14px",
+      borderRadius: 9,
+      border: "1px solid " + col('line'),
+      cursor: "pointer",
+      fontWeight: 800,
+      fontSize: 13,
+      background: tab === k ? col('slate') : "#fff",
+      color: tab === k ? "#fff" : col('slate')
+    }
+  }, l);
+  const chip = (k, l, n) => /*#__PURE__*/React.createElement("button", {
+    key: k,
+    onClick: () => setSf(k),
+    "data-filter": k,
+    style: {
+      padding: "5px 11px",
+      borderRadius: 8,
+      border: "1px solid " + col('line'),
+      cursor: "pointer",
+      fontSize: 12.5,
+      fontWeight: 700,
+      background: sf === k ? col('slate') : "#fff",
+      color: sf === k ? "#fff" : col('slate')
+    }
+  }, l, n != null ? " (" + n + ")" : "");
+  const payStudent = pay ? data.students.find(x => x.id === pay) : null;
+  const histStudent = hist ? data.students.find(x => x.id === hist) : null;
+  return /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(Header, {
+    entity: "_none",
+    extra: /*#__PURE__*/React.createElement("button", {
+      className: "pbtn",
+      style: {
+        background: col('steel')
+      },
+      onClick: genDues
+    }, "⟳ Generate This Month's Dues")
+  }), /*#__PURE__*/React.createElement("div", {
+    className: "noprint",
+    style: {
+      display: "flex",
+      flexWrap: "wrap",
+      gap: 8,
+      alignItems: "center",
+      marginBottom: 12
+    }
+  }, tabBtn("students", "Students · Paid till"), tabBtn("ledger", "Monthly ledger"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 12,
+      fontWeight: 700,
+      color: col('mut'),
+      marginLeft: 6
+    }
+  }, "Hostel:"), /*#__PURE__*/React.createElement("select", {
+    className: "inp",
+    style: {
+      width: "auto"
+    },
+    value: hf,
+    onChange: e => setHf(e.target.value)
+  }, /*#__PURE__*/React.createElement("option", {
+    value: ""
+  }, "All Hostels"), data.hostels.map(h => /*#__PURE__*/React.createElement("option", {
+    key: h.id,
+    value: h.id
+  }, h.name))), role === "director" ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 12,
+      fontWeight: 700,
+      color: col('mut'),
+      marginLeft: 6
+    }
+  }, "Billing cycle:"), /*#__PURE__*/React.createElement("select", {
+    className: "inp",
+    style: {
+      width: "auto"
+    },
+    value: billingMode,
+    onChange: e => saveBillingMode(e.target.value),
+    title: "Calendar = har mahine 1 tareekh; Joining-date = har student ki apni date"
+  }, /*#__PURE__*/React.createElement("option", {
+    value: "calendar"
+  }, "Calendar month (1 tareekh)"), /*#__PURE__*/React.createElement("option", {
+    value: "anniversary"
+  }, "Joining-date cycle"))) : null), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gap: 12,
+      gridTemplateColumns: "repeat(auto-fill,minmax(160px,1fr))",
+      marginBottom: 14
+    }
+  }, /*#__PURE__*/React.createElement(Kpi, {
+    label: "Collected (this month)",
+    value: inr(monthCollected),
+    sub: "Total " + inr(collected),
+    tone: col('green')
+  }), /*#__PURE__*/React.createElement(Kpi, {
+    label: "Overdue amount",
+    value: inr(overdueAmt),
+    sub: cnt("overdue") + " students overdue",
+    tone: col('red')
+  }), /*#__PURE__*/React.createElement(Kpi, {
+    label: "Due in 7 days",
+    value: cnt("soon"),
+    tone: col('amber')
+  }), /*#__PURE__*/React.createElement(Kpi, {
+    label: "Paid in advance",
+    value: withState.filter(advance).length,
+    sub: "beyond this month",
+    tone: col('green')
+  })), tab === "students" ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      flexWrap: "wrap",
+      gap: 8,
+      alignItems: "center",
+      marginBottom: 12
+    }
+  }, chip("all", "All", withState.length), chip("advance", "Paid in advance", withState.filter(advance).length), chip("soon", "Due soon", cnt("soon")), chip("overdue", "Overdue", cnt("overdue")), /*#__PURE__*/React.createElement("input", {
+    className: "inp",
+    style: {
+      width: 200,
+      marginLeft: "auto"
+    },
+    placeholder: "Search name / adm. no.",
+    value: q,
+    onChange: e => setQ(e.target.value)
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "card",
+    style: {
+      overflowX: "auto"
+    }
+  }, /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Student", "Hostel", "Plan", "Paid till", "Status", "Due now", "Action"].map(c => /*#__PURE__*/React.createElement("th", {
+    key: c
+  }, c)))), /*#__PURE__*/React.createElement("tbody", null, rows.map(({
+    s,
+    st
+  }) => /*#__PURE__*/React.createElement("tr", {
+    key: s.id,
+    "data-fee-row": s.id
+  }, /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement(ctx.NameBtn, {
+    name: s.full_name,
+    mobile: s.mobile,
+    sid: s.id
+  }), s.admission_number ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10.5,
+      color: col('mut')
+    }
+  }, s.admission_number) : null), /*#__PURE__*/React.createElement("td", null, hName(s.hostel_id)), /*#__PURE__*/React.createElement("td", {
+    style: {
+      whiteSpace: "nowrap"
+    }
+  }, planLabel(s)), /*#__PURE__*/React.createElement("td", {
+    "data-paid-till": s.id
+  }, s.paid_till ? dmy(s.paid_till) : "—"), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement(Badge, {
+    c: st.c,
+    bg: st.bg
+  }, st.label)), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: dueAmt[s.id] > 0 ? col('red') : col('green'),
+      fontWeight: 700
+    }
+  }, dueAmt[s.id] > 0 ? inr(dueAmt[s.id]) : "—")), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("span", {
+    style: {
+      display: "inline-flex",
+      gap: 6,
+      flexWrap: "wrap"
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "mini",
+    style: {
+      background: col('green')
+    },
+    onClick: () => setPay(s.id),
+    "data-receive": s.id
+  }, "Receive"), st.kind === "overdue" || st.kind === "soon" ? /*#__PURE__*/React.createElement("button", {
+    className: "mini",
+    style: {
+      background: "#25D366"
+    },
+    onClick: () => remind(s, dueAmt[s.id] || 0)
+  }, "WhatsApp") : null, /*#__PURE__*/React.createElement("button", {
+    className: "mini",
+    style: {
+      background: col('slate')
+    },
+    onClick: () => setHist(s.id),
+    "data-history": s.id
+  }, "History"))))), !rows.length ? /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
+    colSpan: "7"
+  }, "Is filter mein koi student nahi.")) : null)))) : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      flexWrap: "wrap",
+      gap: 8,
+      alignItems: "center",
+      marginBottom: 12
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 12,
+      fontWeight: 700,
+      color: col('mut')
+    }
+  }, "Month:"), /*#__PURE__*/React.createElement("select", {
+    className: "inp",
+    style: {
+      width: "auto"
+    },
+    value: mf,
+    onChange: e => setMf(e.target.value)
+  }, /*#__PURE__*/React.createElement("option", {
+    value: ""
+  }, "All Months"), months.map(m => /*#__PURE__*/React.createElement("option", {
+    key: m,
+    value: m
+  }, monLabel(m + "-01")))), hf || mf ? /*#__PURE__*/React.createElement("button", {
+    className: "mini",
+    style: {
+      background: col('slate')
+    },
+    onClick: () => {
+      setHf("");
+      setMf("");
+    }
+  }, "Clear") : null), /*#__PURE__*/React.createElement("div", {
+    className: "card",
+    style: {
+      overflowX: "auto"
+    }
+  }, /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Student", "Hostel", "Month", "Period", "Payable", "Paid", "Pending", "Action"].map(c => /*#__PURE__*/React.createElement("th", {
+    key: c
+  }, c)))), /*#__PURE__*/React.createElement("tbody", null, dues.map(d => /*#__PURE__*/React.createElement("tr", {
+    key: d.id
+  }, /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("b", null, sName(d.student_id))), /*#__PURE__*/React.createElement("td", null, hName(d.hostel_id)), /*#__PURE__*/React.createElement("td", null, String(d.month).slice(0, 7)), /*#__PURE__*/React.createElement("td", {
+    style: {
+      fontSize: 11.5
+    }
+  }, dmy(d.period_from || monthStartOf(d.month)), " → ", dmy(d.period_to || monthEndOf(d.month))), /*#__PURE__*/React.createElement("td", null, inr(d.payable), num0(d.discount) > 0 ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10.5,
+      color: col('green')
+    }
+  }, "disc ", inr(d.discount)) : null), /*#__PURE__*/React.createElement("td", null, inr(d.paid_amount)), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: num0(d.pending) > 0 ? col('red') : col('green'),
+      fontWeight: 700
+    }
+  }, num0(d.pending) > 0 ? inr(d.pending) : "Paid")), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("span", {
+    style: {
+      display: "inline-flex",
+      gap: 6
+    }
+  }, num0(d.pending) > 0 ? /*#__PURE__*/React.createElement("button", {
+    className: "mini",
+    style: {
+      background: col('green')
+    },
+    onClick: () => setPay(d.student_id)
+  }, "Receive") : null, /*#__PURE__*/React.createElement("button", {
+    className: "mini",
+    style: {
+      background: col('slate')
+    },
+    onClick: () => setHist(d.student_id)
+  }, "History"))))), !dues.length ? /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
+    colSpan: "8"
+  }, "Is filter mein koi due nahi.")) : null)))), payStudent ? /*#__PURE__*/React.createElement(FeePayModal, {
+    student: payStudent,
+    data: data,
+    role: role,
+    billingMode: billingMode,
+    hostelName: hName(payStudent.hostel_id),
+    onClose: () => setPay(null),
+    onDone: () => {
+      flash("Payment received");
+      refresh();
+    }
+  }) : null, histStudent ? /*#__PURE__*/React.createElement(FeeHistoryModal, {
+    student: histStudent,
+    data: data,
+    role: role,
+    hostelName: hName(histStudent.hostel_id),
+    onClose: () => setHist(null),
+    flash: flash,
+    refresh: refresh
+  }) : null);
+}
+
+/* =====================================================================
+   Dashboard student search (name, adm. no., mobile, father's name)
+   Uses data.students already loaded under RLS (Manager sees own hostels).
+   ===================================================================== */
+function StudentSearch({
+  ctx
+}) {
+  const {
+    data,
+    hName,
+    openProfile
+  } = ctx;
+  const [q, setQ] = useState("");
+  const [dq, setDq] = useState("");
+  const [open, setOpen] = useState(false);
+  const [idx, setIdx] = useState(0);
+  useEffect(() => {
+    const t = setTimeout(() => setDq(q), 300);
+    return () => clearTimeout(t);
+  }, [q]);
+  const results = dq.trim().length >= 2 ? data.students.filter(s => studentMatches(s, dq)).slice(0, 20) : [];
+  const roomBed = s => {
+    const bed = data.beds.find(b => b.id === s.current_bed_id);
+    const room = bed ? data.rooms.find(r => r.id === bed.room_id) : null;
+    return bed ? "Room " + (room ? room.room_number : "?") + "/" + bed.bed_number : "No bed";
+  };
+  const pick = s => {
+    if (!s) return;
+    setOpen(false);
+    setQ("");
+    setDq("");
+    openProfile(s.id);
+  };
+  const onKey = e => {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setOpen(true);
+      setIdx(i => Math.min(i + 1, Math.max(results.length - 1, 0)));
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setIdx(i => Math.max(i - 1, 0));
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      pick(results[idx]);
+    } else if (e.key === "Escape") {
+      setOpen(false);
+    }
+  };
+  const tone = {
+    active: 'green',
+    left: 'red',
+    temporary_leave: 'amber'
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: "relative",
+      marginBottom: 16
+    },
+    "data-dash-search": "1"
+  }, /*#__PURE__*/React.createElement("input", {
+    className: "inp",
+    style: {
+      width: "100%",
+      padding: "11px 14px",
+      fontSize: 14.5
+    },
+    placeholder: "🔍 Search student — name, admission no., mobile, father's name",
+    value: q,
+    onChange: e => {
+      setQ(e.target.value);
+      setOpen(true);
+      setIdx(0);
+    },
+    onFocus: () => setOpen(true),
+    onKeyDown: onKey,
+    onBlur: () => setTimeout(() => setOpen(false), 200)
+  }), open && q.trim().length >= 2 ? /*#__PURE__*/React.createElement("div", {
+    className: "card",
+    style: {
+      position: "absolute",
+      left: 0,
+      right: 0,
+      top: "100%",
+      marginTop: 4,
+      zIndex: 30,
+      maxHeight: 380,
+      overflowY: "auto",
+      padding: 4
+    }
+  }, q !== dq ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: 10,
+      fontSize: 12.5,
+      color: col('mut')
+    }
+  }, "Searching…") : !results.length ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: 10,
+      fontSize: 12.5,
+      color: col('mut')
+    }
+  }, "Koi student nahi mila.") : results.map((s, i) => /*#__PURE__*/React.createElement("div", {
+    key: s.id,
+    onMouseDown: e => {
+      e.preventDefault();
+      pick(s);
+    },
+    onMouseEnter: () => setIdx(i),
+    "data-search-result": s.id,
+    style: {
+      padding: "9px 10px",
+      borderRadius: 8,
+      cursor: "pointer",
+      background: i === idx ? col('paper') : "transparent",
+      display: "flex",
+      justifyContent: "space-between",
+      gap: 10,
+      alignItems: "center"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      minWidth: 0
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 800
+    }
+  }, s.full_name, s.admission_number ? /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontWeight: 600,
+      color: col('mut'),
+      fontSize: 11.5
+    }
+  }, " · ", s.admission_number) : null), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11.5,
+      color: col('mut')
+    }
+  }, s.father_name ? "S/o " + s.father_name + " · " : "", hName(s.hostel_id), " · ", roomBed(s))), /*#__PURE__*/React.createElement(Badge, {
+    c: col(tone[s.status] || 'green'),
+    bg: col(tone[s.status] || 'green') + "1c"
+  }, String(s.status || "active").replace("_", " "))))) : null);
+}
+
+/* =====================================================================
+   Student Profile (full-screen) — opens from search, Students, Fees, Roster
+   Loads THIS student's dues + payments only when opened.
+   ===================================================================== */
+function StudentProfile({
+  ctx,
+  id,
+  onClose
+}) {
+  const {
+    data,
+    role,
+    hName,
+    uName,
+    setModal,
+    del,
+    refresh,
+    flash
+  } = ctx;
+  const s = data.students.find(x => x.id === id);
+  const [dues, setDues] = useState(null);
+  const [pays, setPays] = useState(null);
+  const [err, setErr] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [payOpen, setPayOpen] = useState(false);
+  const isDir = role === "director";
+  useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    setErr("");
+    (async () => {
+      const [a, b] = await Promise.all([SB.from("monthly_dues").select("*").eq("student_id", id), SB.from("fee_payments").select("*").eq("student_id", id)]);
+      if (!alive) return;
+      if (a.error || b.error) setErr((a.error || b.error).message || "Load error");
+      setDues(a.data || []);
+      setPays(b.data || []);
+      setLoading(false);
+    })().catch(e => {
+      if (alive) {
+        setErr(e && e.message || String(e));
+        setLoading(false);
+      }
+    });
+    return () => {
+      alive = false;
+    };
+  }, [id, data]);
+  useEffect(() => {
+    if (!s) onClose();
+  }, [s]);
+  if (!s) return null;
+  const bed = data.beds.find(b => b.id === s.current_bed_id);
+  const room = bed ? data.rooms.find(r => r.id === bed.room_id) : null;
+  const has014 = Object.prototype.hasOwnProperty.call(s, "paid_till") || Object.prototype.hasOwnProperty.call(s, "fee_plan");
+  const st = has014 ? feeState(s) : null;
+  const totalPaid = (pays || []).reduce((a, f) => a + num0(f.amount), 0);
+  const totalPending = startedPending(dues || []).reduce((a, d) => a + num0(d.pending), 0);
+  const groups = pays ? paymentGroups(pays, s.id) : [];
+  const duesSorted = (dues || []).slice().sort((a, b) => String(b.month).localeCompare(String(a.month)));
+  const parent = s.parent_mobile || s.whatsapp || s.mobile;
+  const ten10 = x => String(x || "").replace(/\D/g, "").slice(-10);
+  const I = (l, v) => /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      gap: 2,
+      minWidth: 0
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 10.5,
+      color: col('mut'),
+      fontWeight: 700,
+      textTransform: "uppercase",
+      letterSpacing: .3
+    }
+  }, l), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 13.5,
+      fontWeight: 600,
+      wordBreak: "break-word"
+    }
+  }, v == null || v === "" ? "—" : v));
+  const sec = (title, children, extra) => /*#__PURE__*/React.createElement("div", {
+    className: "card",
+    style: {
+      padding: 16,
+      marginBottom: 12
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "center",
+      marginBottom: 10,
+      gap: 8
+    }
+  }, /*#__PURE__*/React.createElement("b", {
+    className: "serif",
+    style: {
+      fontSize: 15
+    }
+  }, title), extra || null), children);
+  const grid = {
+    display: "grid",
+    gap: 12,
+    gridTemplateColumns: "repeat(auto-fill,minmax(170px,1fr))"
+  };
+  const act = bg => ({
+    background: bg,
+    padding: "8px 12px",
+    fontSize: 12.5
+  });
+  return /*#__PURE__*/React.createElement("div", {
+    className: "ovl",
+    onClick: onClose,
+    style: {
+      alignItems: "stretch",
+      padding: 0
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    onClick: e => e.stopPropagation(),
+    "data-profile": s.id,
+    style: {
+      background: col('paper') || "#f7f5f0",
+      width: "100%",
+      maxWidth: 980,
+      margin: "0 auto",
+      height: "100%",
+      overflowY: "auto",
+      padding: "14px 14px 40px"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 12,
+      marginBottom: 12,
+      position: "sticky",
+      top: -14,
+      background: col('paper') || "#f7f5f0",
+      padding: "10px 0",
+      zIndex: 2
+    }
+  }, s.photo_url ? /*#__PURE__*/React.createElement("img", {
+    src: s.photo_url,
+    alt: "",
+    style: {
+      width: 54,
+      height: 54,
+      borderRadius: 12,
+      objectFit: "cover"
+    }
+  }) : /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: 54,
+      height: 54,
+      borderRadius: 12,
+      background: col('slate'),
+      color: "#fff",
+      display: "grid",
+      placeItems: "center",
+      fontWeight: 800,
+      fontSize: 20
+    }
+  }, String(s.full_name || "?").charAt(0).toUpperCase()), /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: 1,
+      minWidth: 0
+    }
+  }, /*#__PURE__*/React.createElement("b", {
+    className: "serif",
+    style: {
+      fontSize: 19
+    }
+  }, s.full_name), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12.5,
+      color: col('mut')
+    }
+  }, hName(s.hostel_id), " · ", bed ? "Room " + (room ? room.room_number : "?") + "/" + bed.bed_number : "No bed", " · ", String(s.status || "active").replace("_", " "))), /*#__PURE__*/React.createElement("button", {
+    onClick: onClose,
+    style: {
+      border: "none",
+      background: "none",
+      cursor: "pointer",
+      fontSize: 22,
+      color: col('mut')
+    },
+    "data-profile-close": "1"
+  }, "✕")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 8,
+      flexWrap: "wrap",
+      marginBottom: 12
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "mini",
+    style: act(col('slate')),
+    onClick: () => setModal({
+      entity: "students",
+      item: s
+    }),
+    "data-profile-edit": "1"
+  }, "✎ Edit student"), s.status !== "left" ? /*#__PURE__*/React.createElement("button", {
+    className: "mini",
+    style: act(col('green')),
+    onClick: () => setPayOpen(true),
+    "data-profile-receive": "1"
+  }, "₹ Receive fee") : null, parent ? /*#__PURE__*/React.createElement("a", {
+    className: "mini",
+    style: {
+      ...act(col('steel')),
+      textDecoration: "none",
+      color: "#fff"
+    },
+    href: "tel:+91" + ten10(parent)
+  }, "📞 Call parent") : null, parent ? /*#__PURE__*/React.createElement("a", {
+    className: "mini",
+    style: {
+      ...act("#25D366"),
+      textDecoration: "none",
+      color: "#fff"
+    },
+    target: "_blank",
+    rel: "noreferrer",
+    href: "https://wa.me/91" + ten10(s.whatsapp || parent)
+  }, "WhatsApp parent") : null, isDir ? /*#__PURE__*/React.createElement("button", {
+    className: "mini",
+    style: act(col('red')),
+    onClick: () => del("students", s.id)
+  }, "🗑 Delete") : null), sec("Fee summary", /*#__PURE__*/React.createElement("div", {
+    style: grid
+  }, I("Monthly fee", inr(s.monthly_fee)), has014 ? I("Fee plan", planName(s)) : null, has014 ? I("Plan amount", planLabel(s)) : null, has014 ? I("Paid till", s.paid_till ? dmy(s.paid_till) : "—") : null, has014 ? /*#__PURE__*/React.createElement("div", null, I("Status", ""), /*#__PURE__*/React.createElement(Badge, {
+    c: st.c,
+    bg: st.bg
+  }, st.label)) : null, I("Total paid", loading ? "…" : inr(totalPaid)), I("Pending (due now)", loading ? "…" : inr(totalPending)))), loading ? /*#__PURE__*/React.createElement("div", {
+    className: "card",
+    style: {
+      padding: 16,
+      marginBottom: 12,
+      color: col('mut')
+    }
+  }, "Loading fee details…") : null, err ? /*#__PURE__*/React.createElement("div", {
+    className: "card",
+    style: {
+      padding: 16,
+      marginBottom: 12,
+      color: col('red'),
+      fontWeight: 700
+    }
+  }, "⚠ ", err) : null, !loading ? sec("Payment history", /*#__PURE__*/React.createElement("div", {
+    style: {
+      overflowX: "auto"
+    }
+  }, /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Date", "Amount", "Mode", "Receipt", "Period", "Collected by", "Remarks", ""].map(c => /*#__PURE__*/React.createElement("th", {
+    key: c
+  }, c)))), /*#__PURE__*/React.createElement("tbody", null, groups.map(g => /*#__PURE__*/React.createElement("tr", {
+    key: g.key,
+    "data-pay-group": g.key
+  }, /*#__PURE__*/React.createElement("td", null, dmy(g.payment_date)), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("b", null, inr(g.net)), g.discount > 0 ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10.5,
+      color: col('green')
+    }
+  }, "disc ", inr(g.discount)) : null), /*#__PURE__*/React.createElement("td", null, String(g.mode || "-").toUpperCase()), /*#__PURE__*/React.createElement("td", {
+    style: {
+      fontSize: 11.5
+    }
+  }, g.receipt_number || "—"), /*#__PURE__*/React.createElement("td", {
+    style: {
+      fontSize: 12
+    }
+  }, dmy(g.period_from), " → ", dmy(g.period_to), g.months > 1 ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10.5,
+      color: col('mut')
+    }
+  }, g.months, " months") : null), /*#__PURE__*/React.createElement("td", {
+    style: {
+      fontSize: 12
+    }
+  }, uName(g.rows[0].collected_by)), /*#__PURE__*/React.createElement("td", {
+    style: {
+      fontSize: 11.5
+    }
+  }, g.rows[0].remarks || ""), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("button", {
+    className: "mini",
+    style: {
+      background: col('slate')
+    },
+    onClick: () => printReceipt(receiptFromGroup(g, s, hName(s.hostel_id), dues))
+  }, "🧾 Reprint")))), !groups.length ? /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
+    colSpan: "8"
+  }, "Koi payment nahi.")) : null))), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11.5,
+      color: col('mut')
+    }
+  }, groups.length, " receipts")) : null, !loading ? sec("Month-wise dues", /*#__PURE__*/React.createElement("div", {
+    style: {
+      overflowX: "auto"
+    }
+  }, /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Month", "Fee", "Discount", "Paid", "Pending", "Status"].map(c => /*#__PURE__*/React.createElement("th", {
+    key: c
+  }, c)))), /*#__PURE__*/React.createElement("tbody", null, duesSorted.map(d => /*#__PURE__*/React.createElement("tr", {
+    key: d.id
+  }, /*#__PURE__*/React.createElement("td", null, monLabel(d.month)), /*#__PURE__*/React.createElement("td", null, inr(d.fee_amount != null ? d.fee_amount : d.payable)), /*#__PURE__*/React.createElement("td", null, num0(d.discount) > 0 ? inr(d.discount) : "—"), /*#__PURE__*/React.createElement("td", null, inr(d.paid_amount)), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: num0(d.pending) > 0 ? col('red') : col('green'),
+      fontWeight: 700
+    }
+  }, num0(d.pending) > 0 ? inr(d.pending) : "—")), /*#__PURE__*/React.createElement("td", null, d.status || "-"))), !duesSorted.length ? /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
+    colSpan: "6"
+  }, "Koi due nahi.")) : null)))) : null, sec("Personal", /*#__PURE__*/React.createElement("div", {
+    style: grid
+  }, I("Father", s.father_name), I("Mother", s.mother_name), I("Mobile", s.mobile), I("Parent mobile", s.parent_mobile), I("WhatsApp", s.whatsapp), I("Email", s.email), I("Address", s.address), I("State", s.state), I("Emergency contact", s.emergency_contact), I("ID proof", [s.id_proof_type, s.id_proof_number].filter(Boolean).join(" · ")), I("Medical note", s.medical_note))), sec("Hostel", /*#__PURE__*/React.createElement("div", {
+    style: grid
+  }, I("Hostel", (data.hostels.find(h => h.id === s.hostel_id) || {}).name), I("Room / Bed", bed ? (room ? room.room_number : "?") + " / " + bed.bed_number : "—"), I("Joining date", s.joining_date ? dmy(s.joining_date) : ""), I("Exit date", s.exit_date ? dmy(s.exit_date) : ""), I("Status", String(s.status || "active").replace("_", " ")), I("Course", s.course), I("Batch", s.batch), I("Admission no.", s.admission_number), I("Security deposit", inr(s.security_deposit))))), payOpen ? /*#__PURE__*/React.createElement("div", {
+    onClick: e => e.stopPropagation()
+  }, /*#__PURE__*/React.createElement(FeePayModal, {
+    student: s,
+    data: data,
+    role: role,
+    billingMode: ctx.billingMode,
+    hostelName: hName(s.hostel_id),
+    onClose: () => setPayOpen(false),
+    onDone: () => {
+      flash("Payment received");
+      refresh();
+    }
+  })) : null);
+}
+
 function App() {
   const [session, setSession] = useState(null);
   const [profile, setProfile] = useState(null);
@@ -1173,6 +3421,11 @@ function App() {
   // remount that happens on every refresh() (Pages is recreated each render).
   const [hf, setHf] = useState("");
   const [mf, setMf] = useState("");
+  // page filters kept here so data refresh / page remount never resets them
+  const [stuF, setStuF] = useState({ h: [], r: "", q: "", st: "" });
+  const [roomsH, setRoomsH] = useState("");
+  const [rosterH, setRosterH] = useState("");
+  const [profId, setProfId] = useState(null);
   useEffect(() => {
     SB.auth.getSession().then(({
       data
@@ -1301,11 +3554,15 @@ function App() {
     })();
   }, [profile, data, role, refresh, billingMode]);
   const D = useMemo(() => {
-    if (!data) return { occupied:0, beds:0, income:0, expense:0, pending:0, salaryPay:0, perHostel:[], catData:[], students:0, hostels:0, complaintsOpen:0 };
+    if (!data) return { overdue:0, dueSoon:0, occupied:0, beds:0, income:0, expense:0, pending:0, salaryPay:0, perHostel:[], catData:[], students:0, hostels:0, complaintsOpen:0 };
     const occupied = data.beds.filter(b => b.bed_status === "occupied").length;
     const income = data.fee_payments.reduce((a, f) => a + Number(f.amount || 0), 0);
     const expense = data.expenses.filter(e => e.status === "approved").reduce((a, e) => a + Number(e.amount || 0), 0);
-    const pending = data.monthly_dues.reduce((a, d) => a + Number(d.pending || 0), 0);
+    const _t = istToday();
+    const pending = startedPending(data.monthly_dues, _t).reduce((a, d) => a + Number(d.pending || 0), 0);
+    const _fs = data.students.map(s => feeState(s, _t));
+    const overdue = _fs.filter(x => x.kind === "overdue").length;
+    const dueSoon = _fs.filter(x => x.kind === "soon").length;
     const salaryPay = data.employees.reduce((a, e) => a + Number(e.monthly_salary || 0), 0);
     const perHostel = data.hostels.map(h => {
       const inc = data.fee_payments.filter(f => f.hostel_id === h.id).reduce((a, f) => a + Number(f.amount || 0), 0);
@@ -1316,7 +3573,7 @@ function App() {
     const catMap = {};
     data.expenses.filter(e => e.status === "approved").forEach(e => { catMap[e.category] = (catMap[e.category] || 0) + Number(e.amount || 0); });
     return {
-      occupied, beds: data.beds.length, income, expense, pending, salaryPay, perHostel,
+      overdue, dueSoon, occupied, beds: data.beds.length, income, expense, pending, salaryPay, perHostel,
       catData: Object.entries(catMap).map(([k, v]) => ({ k, v, label: inr(v) })),
       students: data.students.length, hostels: data.hostels.length,
       complaintsOpen: data.complaints.filter(c => c.status !== "resolved").length
@@ -1440,9 +3697,10 @@ function App() {
   const NameBtn = ({
     name,
     mobile,
-    sub
+    sub,
+    sid
   }) => /*#__PURE__*/React.createElement("button", {
-    onClick: () => setContact({
+    onClick: () => sid ? setProfId(sid) : setContact({
       name,
       mobile,
       sub
@@ -1606,14 +3864,24 @@ function App() {
       type: "number",
       req: true
     }, {
-      k: "security_deposit",
-      label: "Security Deposit",
-      type: "number"
-    }, {
       k: "joining_date",
       label: "Joining Date",
       type: "date",
       req: true
+    }, {
+      k: "_plan",
+      label: "Fee Plan",
+      type: "custom",
+      render: (v, set) => /*#__PURE__*/React.createElement(PlanFields, {
+        v: v,
+        set: set,
+        role: role,
+        hasPayments: !!v.id && (data.fee_payments || []).some(f => f.student_id === v.id)
+      })
+    }, {
+      k: "security_deposit",
+      label: "Security Deposit",
+      type: "number"
     }, {
       k: "id_proof_type",
       label: "ID Proof Type"
@@ -1821,7 +4089,7 @@ function App() {
   }, "\uD83D\uDDD1"));
   const Pages = {
     dashboard: () => {
-      const k = [["Total Hostels", D.hostels, null, 'slate'], ["Students", D.students, null, 'steel'], ["Occupied Beds", D.occupied + "/" + D.beds, (D.beds ? Math.round(D.occupied / D.beds * 100) : 0) + "% full", 'green'], ["Vacant Beds", D.beds - D.occupied, null, 'amber'], ["Income (paid)", inr(D.income), null, 'green'], ["Expense (approved)", inr(D.expense), null, 'red'], ["Net Profit", inr(D.income - D.expense), null, 'gold'], ["Pending Fees", inr(D.pending), null, 'red'], ["Salary Payable", inr(D.salaryPay), null, 'steel'], ["Open Complaints", D.complaintsOpen, null, 'amber']];
+      const k = [["Total Hostels", D.hostels, null, 'slate'], ["Students", D.students, null, 'steel'], ["Occupied Beds", D.occupied + "/" + D.beds, (D.beds ? Math.round(D.occupied / D.beds * 100) : 0) + "% full", 'green'], ["Vacant Beds", D.beds - D.occupied, null, 'amber'], ["Income (paid)", inr(D.income), null, 'green'], ["Expense (approved)", inr(D.expense), null, 'red'], ["Net Profit", inr(D.income - D.expense), null, 'gold'], ["Pending Fees", inr(D.pending), D.overdue + " overdue \xB7 " + D.dueSoon + " due in 7 days", 'red'], ["Salary Payable", inr(D.salaryPay), null, 'steel'], ["Open Complaints", D.complaintsOpen, null, 'amber']];
       return /*#__PURE__*/React.createElement("div", {
         style: {
           display: "flex",
@@ -1956,7 +4224,8 @@ function App() {
       }, ph.occ, "/", ph.total, " beds \xB7 ", pct, "% \xB7 Profit ", inr(ph.profit)));
     }))),
     rooms: () => {
-      const [hsel, setHsel] = useState(data.hostels[0]?.id || "");
+      const hsel = roomsH && data.hostels.some(h => h.id === roomsH) ? roomsH : data.hostels[0]?.id || "";
+      const setHsel = setRoomsH;
       const [alloc, setAlloc] = useState(null);
       const roomsOf = data.rooms.filter(r => r.hostel_id === hsel);
       const free = data.students.filter(s => s.status === "active" && !s.current_bed_id);
@@ -2256,121 +4525,15 @@ function App() {
         }
       }, "Close"))));
     },
-    students: () => {
-  const tone = {
-    active: ['green', "#e6f4ec"],
-    left: ['red', "#fbe9e7"],
-    temporary_leave: ['amber', "#fdf4e0"]
-  };
-  const [hsel, setHsel] = useState([]);
-  const [rsel, setRsel] = useState("");
-  const chip = on => ({
-    padding: "5px 12px",
-    borderRadius: 8,
-    border: "1px solid " + col('line'),
-    cursor: "pointer",
-    fontSize: 12.5,
-    fontWeight: 700,
-    background: on ? col('slate') : "#fff",
-    color: on ? "#fff" : col('slate')
-  });
-  const toggleH = id => {
-    setRsel("");
-    setHsel(p => p.includes(id) ? p.filter(x => x !== id) : [...p, id]);
-  };
-  const activeHostels = hsel.length ? hsel : data.hostels.map(h => h.id);
-  const roomOpts = data.rooms.filter(r => activeHostels.includes(r.hostel_id)).sort((a, b) => String(a.room_number).localeCompare(String(b.room_number), undefined, {
-    numeric: true
-  }));
-  const bedRoom = bedId => data.beds.find(b => b.id === bedId)?.room_id;
-  const list = data.students.filter(s => {
-    if (hsel.length && !hsel.includes(s.hostel_id)) return false;
-    if (rsel && bedRoom(s.current_bed_id) !== rsel) return false;
-    return true;
-  });
-  return /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(Header, {
-    entity: "students"
-  }), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      flexWrap: "wrap",
-      gap: 8,
-      alignItems: "center",
-      marginBottom: 14
-    }
-  }, /*#__PURE__*/React.createElement("span", {
-    style: {
-      fontSize: 12,
-      fontWeight: 700,
-      color: col('mut')
-    }
-  }, "Hostel:"), /*#__PURE__*/React.createElement("button", {
-    onClick: () => {
-      setHsel([]);
-      setRsel("");
-    },
-    style: chip(hsel.length === 0)
-  }, "All"), data.hostels.map(h => /*#__PURE__*/React.createElement("button", {
-    key: h.id,
-    onClick: () => toggleH(h.id),
-    style: chip(hsel.includes(h.id))
-  }, h.code)), /*#__PURE__*/React.createElement("span", {
-    style: {
-      fontSize: 12,
-      fontWeight: 700,
-      color: col('mut'),
-      marginLeft: 8
-    }
-  }, "Room:"), /*#__PURE__*/React.createElement("select", {
-    className: "inp",
-    style: {
-      width: "auto"
-    },
-    value: rsel,
-    onChange: e => setRsel(e.target.value)
-  }, /*#__PURE__*/React.createElement("option", {
-    value: ""
-  }, "All rooms"), roomOpts.map(r => /*#__PURE__*/React.createElement("option", {
-    key: r.id,
-    value: r.id
-  }, hName(r.hostel_id), " \xB7 Room ", r.room_number))), /*#__PURE__*/React.createElement("span", {
-    style: {
-      fontSize: 12,
-      color: col('mut'),
-      marginLeft: "auto"
-    }
-  }, list.length, " students")), /*#__PURE__*/React.createElement("div", {
-    className: "card",
-    style: {
-      overflowX: "auto"
-    }
-  }, /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Student", "Father", "Mobile", "Course", "Hostel", "Room/Bed", "Fee", "Status", ""].map(c => /*#__PURE__*/React.createElement("th", {
-    key: c
-  }, c)))), /*#__PURE__*/React.createElement("tbody", null, list.map(s => {
-    const bed = data.beds.find(b => b.id === s.current_bed_id);
-    const room = bed ? data.rooms.find(r => r.id === bed.room_id) : null;
-    return /*#__PURE__*/React.createElement("tr", {
-      key: s.id
-    }, /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement(NameBtn, {
-      name: s.full_name,
-      mobile: s.mobile,
-      sub: s.course
-    })), /*#__PURE__*/React.createElement("td", null, s.father_name), /*#__PURE__*/React.createElement("td", null, s.mobile), /*#__PURE__*/React.createElement("td", null, s.course), /*#__PURE__*/React.createElement("td", null, hName(s.hostel_id)), /*#__PURE__*/React.createElement("td", null, bed ? (room ? room.room_number : "?") + "/" + bed.bed_number : "—"), /*#__PURE__*/React.createElement("td", null, inr(s.monthly_fee)), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement(Badge, {
-      c: col(tone[s.status][0]),
-      bg: tone[s.status][1]
-    }, (s.status || "").replace("_", " "))), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement(EditDel, {
-      entity: "students",
-      item: s
-    })));
-  }), !list.length && /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", null, "No students match."))))));
-},
+    students: () => null,
     roster: () => {
-      const [hsel, setHsel] = useState(data.hostels[0]?.id || "");
+      const hsel = rosterH && data.hostels.some(h => h.id === rosterH) ? rosterH : data.hostels[0]?.id || "";
+      const setHsel = setRosterH;
       const h = data.hostels.find(x => x.id === hsel);
       const rooms = data.rooms.filter(r => r.hostel_id === hsel).sort((a, b) => String(a.room_number).localeCompare(String(b.room_number), undefined, {
         numeric: true
       }));
-      const pend = sid => data.monthly_dues.filter(d => d.student_id === sid).reduce((a, d) => a + Number(d.pending || 0), 0);
+      const pend = sid => startedPending(data.monthly_dues.filter(d => d.student_id === sid)).reduce((a, d) => a + Number(d.pending || 0), 0);
       const hb = data.beds.filter(b => b.hostel_id === hsel);
       const occ = hb.filter(b => b.bed_status === "occupied").length;
       const rows = [];
@@ -2437,6 +4600,7 @@ function App() {
           key: i
         }, /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("b", null, r.room)), /*#__PURE__*/React.createElement("td", null, r.bed), /*#__PURE__*/React.createElement("td", null, r.stu ? /*#__PURE__*/React.createElement(NameBtn, {
           name: r.stu.full_name,
+          sid: r.stu.id,
           mobile: r.stu.mobile,
           sub: r.stu.course
         }) : /*#__PURE__*/React.createElement("span", {
@@ -2454,245 +4618,7 @@ function App() {
         }, b.label)));
       }), !rows.length && /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", null, "No rooms/beds yet."))))));
     },
-    fees: () => {
-  const [pay, setPay] = useState(null);
-  // hf (hostel) and mf (month) filters are lifted to App so refresh() can't reset them.
-  const num = v => Number(v || 0);
-  const fdate = s => {
-    if (!s) return "-";
-    const d = new Date(s);
-    if (isNaN(d)) return s;
-    return d.toLocaleDateString("en-IN", {
-      day: "2-digit",
-      month: "short",
-      year: "numeric"
-    });
-  };
-  const mLabel = m => {
-    const p = String(m).split("-");
-    const d = new Date(Number(p[0]), Number(p[1]) - 1, 1);
-    return isNaN(d) ? m : d.toLocaleDateString("en-IN", {
-      month: "long",
-      year: "numeric"
-    });
-  };
-  const months = [...new Set(data.monthly_dues.map(d => String(d.month).slice(0, 7)))].sort().reverse();
-  let dues = data.monthly_dues;
-  if (hf) dues = dues.filter(d => d.hostel_id === hf);
-  if (mf) dues = dues.filter(d => String(d.month).slice(0, 7) === mf);
-  const dueIds = new Set(dues.map(d => d.id));
-  const pays = data.fee_payments.filter(f => (!hf || f.hostel_id === hf) && (!mf || dueIds.has(f.due_id)));
-  const collected = pays.reduce((a, f) => a + num(f.amount), 0);
-  const pending = dues.reduce((a, d) => a + num(d.pending), 0);
-  const genDues = async () => {
-    const {
-      error
-    } = await SB.rpc("generate_monthly_dues", {
-      p_month: monthStart()
-    });
-    if (error) flash("\u26A0 " + error.message);else {
-      flash("Monthly dues generated");
-      refresh();
-    }
-  };
-  const receive = async (due, amt, mode, pFrom, pTo, pDate) => {
-    const pay = num(amt);
-    // Insert the payment FIRST. If it fails, do NOT touch the due — keep modal open so the user can retry.
-    const ins = await SB.from("fee_payments").insert({
-      due_id: due.id,
-      student_id: due.student_id,
-      hostel_id: due.hostel_id,
-      amount: pay,
-      mode,
-      payment_date: pDate || localToday(),
-      period_from: pFrom || null,
-      period_to: pTo || null,
-      receipt_number: "R-" + Math.floor(Math.random() * 9000 + 1000),
-      collected_by: session.user.id,
-      created_by: session.user.id
-    });
-    if (ins.error) { flash("⚠ Payment save nahi hua: " + ins.error.message); return; }
-    // Payment recorded — now update the due. If this errors, surface it (payment still stands).
-    const np = num(due.paid_amount) + pay;
-    const upd = await SB.from("monthly_dues").update({
-      paid_amount: np,
-      status: np >= num(due.payable) ? "paid" : "partial"
-    }).eq("id", due.id);
-    if (upd.error) flash("⚠ Payment record hua par due update nahi hua: " + upd.error.message);
-    else flash("Payment received");
-    setPay(null);
-    refresh();
-  };
-  const remind = d => {
-    const s = data.students.find(x => x.id === d.student_id);
-    const raw = s && (s.whatsapp || s.parent_mobile || s.mobile) || "";
-    const phone = String(raw).replace(/[^0-9]/g, "").replace(/^0+/, "");
-    if (!phone) {
-      flash("Is student ka number nahi hai");
-      return;
-    }
-    const msg = encodeURIComponent("Namaste" + (s ? " " + s.full_name + " ji" : "") + ", aapki hostel fee \u20B9" + num(d.pending).toLocaleString("en-IN") + " (" + String(d.month).slice(0, 7) + ") pending hai. Kripya jald jama karein. - " + (hName(d.hostel_id) || "DDD Hostel"));
-    window.open("https://wa.me/91" + phone + "?text=" + msg, "_blank");
-  };
-  const receipt = d => {
-    const s = data.students.find(x => x.id === d.student_id);
-    const fp = data.fee_payments.filter(f => f.due_id === d.id).sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
-    const period = fp && (fp.period_from || fp.period_to) ? fdate(fp.period_from) + " \u2013 " + fdate(fp.period_to) : String(d.month).slice(0, 7);
-    const w = window.open("", "_blank", "width=420,height=640");
-    if (!w) {
-      flash("Popup block hua \u2014 allow karein");
-      return;
-    }
-    const R = (l, v) => "<div class='r'><span>" + l + "</span><b>" + v + "</b></div>";
-    w.document.write("<html><head><title>Receipt</title><style>body{font-family:Georgia,serif;padding:24px;color:#1f2630}h2{margin:0}hr{border:none;border-top:1px dashed #999;margin:14px 0}.r{display:flex;justify-content:space-between;margin:6px 0;font-size:14px}.big{font-size:18px;font-weight:bold}</style></head><body>" + "<h2>DDD Hostel</h2><div style='color:#777;font-size:12px'>Fee Receipt</div><hr>" + R("Receipt No.", fp ? fp.receipt_number : "-") + R("Payment Date", fp && fp.payment_date ? dmy(fp.payment_date) : "-") + R("Student", s ? s.full_name : "-") + R("Hostel", hName(d.hostel_id) || "-") + R("Month", String(d.month).slice(0, 7)) + R("Fee Period", period) + "<hr>" + R("Payable", "\u20B9" + num(d.payable).toLocaleString("en-IN")) + R("Paid", "\u20B9" + num(d.paid_amount).toLocaleString("en-IN")) + R("Pending", "\u20B9" + num(d.pending).toLocaleString("en-IN")) + "<hr><div class='r big'><span>Status</span><span>" + (num(d.pending) <= 0 ? "PAID" : "PARTIAL") + "</span></div><hr>" + "<div style='font-size:11px;color:#888;text-align:center'>Computer generated \u00B7 " + new Date().toLocaleString() + "</div></body></html>");
-    w.document.close();
-    w.focus();
-    setTimeout(() => w.print(), 300);
-  };
-  return /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(Header, {
-    entity: "_none",
-    extra: /*#__PURE__*/React.createElement("button", {
-      className: "pbtn",
-      style: {
-        background: col('steel')
-      },
-      onClick: genDues
-    }, "\u27F3 Generate This Month's Dues")
-  }), /*#__PURE__*/React.createElement("div", {
-    className: "noprint",
-    style: {
-      display: "flex",
-      flexWrap: "wrap",
-      gap: 8,
-      alignItems: "center",
-      marginBottom: 12
-    }
-  }, /*#__PURE__*/React.createElement("span", {
-    style: {
-      fontSize: 12,
-      fontWeight: 700,
-      color: col('mut')
-    }
-  }, "Hostel:"), /*#__PURE__*/React.createElement("select", {
-    className: "inp",
-    style: {
-      width: "auto"
-    },
-    value: hf,
-    onChange: e => setHf(e.target.value)
-  }, /*#__PURE__*/React.createElement("option", {
-    value: ""
-  }, "All Hostels"), data.hostels.map(h => /*#__PURE__*/React.createElement("option", {
-    key: h.id,
-    value: h.id
-  }, h.name))), /*#__PURE__*/React.createElement("span", {
-    style: {
-      fontSize: 12,
-      fontWeight: 700,
-      color: col('mut'),
-      marginLeft: 6
-    }
-  }, "Month:"), /*#__PURE__*/React.createElement("select", {
-    className: "inp",
-    style: {
-      width: "auto"
-    },
-    value: mf,
-    onChange: e => setMf(e.target.value)
-  }, /*#__PURE__*/React.createElement("option", {
-    value: ""
-  }, "All Months"), months.map(m => /*#__PURE__*/React.createElement("option", {
-    key: m,
-    value: m
-  }, mLabel(m)))), (hf || mf) && /*#__PURE__*/React.createElement("button", {
-    className: "mini",
-    style: {
-      background: col('slate')
-    },
-    onClick: () => {
-      setHf("");
-      setMf("");
-    }
-  }, "Clear"), role === "director" && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("span", {
-    style: {
-      fontSize: 12,
-      fontWeight: 700,
-      color: col('mut'),
-      marginLeft: 6
-    }
-  }, "Billing cycle:"), /*#__PURE__*/React.createElement("select", {
-    className: "inp",
-    style: {
-      width: "auto"
-    },
-    value: billingMode,
-    onChange: e => saveBillingMode(e.target.value),
-    title: "Calendar = har mahine 1 tareekh; Joining-date = har student ki apni date"
-  }, /*#__PURE__*/React.createElement("option", {
-    value: "calendar"
-  }, "Calendar month (1 tareekh)"), /*#__PURE__*/React.createElement("option", {
-    value: "anniversary"
-  }, "Joining-date cycle")))), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "grid",
-      gap: 12,
-      gridTemplateColumns: "repeat(auto-fill,minmax(160px,1fr))",
-      marginBottom: 14
-    }
-  }, /*#__PURE__*/React.createElement(Kpi, {
-    label: hf || mf ? "Collected (filtered)" : "Collected (total)",
-    value: inr(collected),
-    tone: col('green')
-  }), /*#__PURE__*/React.createElement(Kpi, {
-    label: hf || mf ? "Pending (filtered)" : "Pending (total)",
-    value: inr(pending),
-    tone: col('red')
-  })), /*#__PURE__*/React.createElement("div", {
-    className: "card",
-    style: {
-      overflowX: "auto"
-    }
-  }, /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Student", "Hostel", "Month", "Payable", "Paid", "Pending", "Action"].map(c => /*#__PURE__*/React.createElement("th", {
-    key: c
-  }, c)))), /*#__PURE__*/React.createElement("tbody", null, dues.map(d => /*#__PURE__*/React.createElement("tr", {
-    key: d.id
-  }, /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("b", null, sName(d.student_id))), /*#__PURE__*/React.createElement("td", null, hName(d.hostel_id)), /*#__PURE__*/React.createElement("td", null, String(d.month).slice(0, 7)), /*#__PURE__*/React.createElement("td", null, inr(d.payable)), /*#__PURE__*/React.createElement("td", null, inr(d.paid_amount)), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("span", {
-    style: {
-      color: num(d.pending) > 0 ? col('red') : col('green'),
-      fontWeight: 700
-    }
-  }, num(d.pending) > 0 ? inr(d.pending) : "Paid")), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("span", {
-    style: {
-      display: "inline-flex",
-      gap: 6,
-      flexWrap: "wrap"
-    }
-  }, num(d.pending) > 0 && /*#__PURE__*/React.createElement("button", {
-    className: "mini",
-    style: {
-      background: col('green')
-    },
-    onClick: () => setPay(d)
-  }, "Receive"), num(d.pending) > 0 && /*#__PURE__*/React.createElement("button", {
-    className: "mini",
-    style: {
-      background: "#25D366"
-    },
-    onClick: () => remind(d)
-  }, "WhatsApp"), num(d.paid_amount) > 0 && /*#__PURE__*/React.createElement("button", {
-    className: "mini",
-    style: {
-      background: col('slate')
-    },
-    onClick: () => receipt(d)
-  }, "\uD83E\uDDFE Receipt"))))), !dues.length && /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
-    colSpan: "7"
-  }, "No dues for this filter \u2014 click \"Generate This Month's Dues\" ya filter badlein."))))), pay && /*#__PURE__*/React.createElement(PayModal, {
-    due: pay,
-    onClose: () => setPay(null),
-    onSave: receive
-  }));
-},
+    fees: () => null,
     expenses: () => /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(Header, {
       entity: "expenses"
     }), /*#__PURE__*/React.createElement("div", {
@@ -2924,7 +4850,7 @@ function App() {
     const occ = beds.filter(b => b.bed_status === "occupied").length;
     const income = data.fee_payments.filter(f => f.hostel_id === h.id).reduce((a, f) => a + num(f.amount), 0);
     const expense = data.expenses.filter(e => e.hostel_id === h.id && e.status === "approved").reduce((a, e) => a + num(e.amount), 0);
-    const pending = data.monthly_dues.filter(d => d.hostel_id === h.id).reduce((a, d) => a + num(d.pending), 0);
+    const pending = startedPending(data.monthly_dues.filter(d => d.hostel_id === h.id)).reduce((a, d) => a + num(d.pending), 0);
     const staffCost = data.employees.filter(e => e.hostel_id === h.id).reduce((a, e) => a + num(e.monthly_salary), 0);
     return {
       name: h.name,
@@ -3091,7 +5017,7 @@ function App() {
   const anomalies = H.filter(x => avgExp > 0 && x.expense > avgExp * 1.5);
   const mostC = H.slice().sort((a, b) => b.complaints - a.complaints)[0];
   const pmap = {};
-  data.monthly_dues.filter(d => num(d.pending) > 0).forEach(d => {
+  startedPending(data.monthly_dues).forEach(d => {
     pmap[d.student_id] = pmap[d.student_id] || {
       months: 0,
       amt: 0
@@ -3376,6 +5302,7 @@ function App() {
   }
   };
   const Current = Pages[cur] || Pages.dashboard;
+  const pageCtx = { data, role, session, hName, sName, uName, NameBtn, Header, EditDel, setModal, setContact, del, flash, refresh, hf, setHf, mf, setMf, billingMode, saveBillingMode, stuF, setStuF, openProfile: setProfId };
   return /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
@@ -3525,9 +5452,20 @@ function App() {
       fontSize: 21,
       margin: "0 0 16px"
     }
-  }, NAV_LABEL[cur]), /*#__PURE__*/React.createElement(Current, null))), modal && /*#__PURE__*/React.createElement(FormModal, {
+  }, NAV_LABEL[cur]), cur === "dashboard" ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(StudentSearch, {
+    ctx: pageCtx
+  }), /*#__PURE__*/React.createElement(Current, null)) : cur === "students" ? /*#__PURE__*/React.createElement(StudentsPage, {
+    ctx: pageCtx
+  }) : cur === "fees" ? /*#__PURE__*/React.createElement(FeesPage, {
+    ctx: pageCtx
+  }) : /*#__PURE__*/React.createElement(Current, null))), profId && /*#__PURE__*/React.createElement(StudentProfile, {
+    ctx: pageCtx,
+    id: profId,
+    onClose: () => setProfId(null)
+  }), modal && /*#__PURE__*/React.createElement(FormModal, {
     title: modal.title || (modal.item.id ? "Edit " : "Add ") + modal.entity,
     fields: modal.fields || FIELDS[modal.entity],
+    validate: modal.validate || VALIDATE[modal.entity],
     initial: modal.item,
     onClose: () => setModal(null),
     onSave: v => modal.onSave ? modal.onSave(v) : save(modal.entity, v)
@@ -3556,10 +5494,16 @@ function Bell({
   const [open, setOpen] = React.useState(false);
   const num = v => Number(v || 0);
   const alerts = [];
-  const pendCount = data.monthly_dues.filter(d => num(d.pending) > 0).length;
+  const _fs = (data.students || []).map(s => feeState(s));
+  const pendCount = _fs.filter(x => x.kind === "overdue").length;
+  const soonCount = _fs.filter(x => x.kind === "soon").length;
   if (pendCount) alerts.push({
     icon: "💰",
-    t: pendCount + " students ki fee pending"
+    t: pendCount + " students ki fee overdue"
+  });
+  if (soonCount) alerts.push({
+    icon: "⏰",
+    t: soonCount + " students ki fee 7 din mein due"
   });
   const vac = data.beds.filter(b => b.bed_status === "vacant").length;
   if (vac) alerts.push({
@@ -3646,194 +5590,6 @@ function Bell({
       color: "#777"
     }
   }, "Koi alert nahi \uD83C\uDF89")) : null);
-}
-function PayModal({
-  due,
-  onClose,
-  onSave
-}) {
-  const max = Number(due.pending);
-  const bounds = (() => {
-    if (due.period_from || due.period_to) {
-      return [String(due.period_from || "").slice(0, 10) || today(), String(due.period_to || "").slice(0, 10) || today()];
-    }
-    const s = String(due.month).slice(0, 7);
-    const p = s.split("-");
-    const y = Number(p[0]),
-      mo = Number(p[1]);
-    if (!y || !mo) {
-      const t = today();
-      return [t, t];
-    }
-    const last = new Date(y, mo, 0).getDate();
-    return [s + "-01", s + "-" + String(last).padStart(2, "0")];
-  })();
-  const [amt, setAmt] = useState(max);
-  const [mode, setMode] = useState("upi");
-  const [pFrom, setPFrom] = useState(bounds[0]);
-  const [pTo, setPTo] = useState(bounds[1]);
-  const [pDate, setPDate] = useState(localToday());
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState("");
-  const confirm = async () => {
-    if (busy) return; // double-submit guard
-    const n = Number(amt);
-    if (!isFinite(n) || n <= 0 || n > max) {
-      setErr("Amount 0 se zyada aur pending (" + inr(max) + ") se kam ya barabar honi chahiye.");
-      return;
-    }
-    if (!pDate || isNaN(new Date(pDate + "T00:00:00"))) {
-      setErr("Payment date sahi nahi hai.");
-      return;
-    }
-    if (pDate > localToday()) {
-      setErr("Payment date future me nahi ho sakti.");
-      return;
-    }
-    setErr("");
-    setBusy(true);
-    try {
-      await onSave(due, n, mode, pFrom, pTo, pDate);
-    } catch (e) {
-      setErr(e && e.message ? e.message : String(e));
-    }
-    setBusy(false);
-  };
-  const lbl = {
-    fontSize: 11.5,
-    color: col('mut'),
-    fontWeight: 700
-  };
-  return /*#__PURE__*/React.createElement("div", {
-    className: "ovl",
-    onClick: onClose
-  }, /*#__PURE__*/React.createElement("div", {
-    className: "card",
-    style: {
-      padding: 22,
-      maxWidth: 360,
-      width: "100%"
-    },
-    onClick: e => e.stopPropagation()
-  }, /*#__PURE__*/React.createElement("b", {
-    className: "serif",
-    style: {
-      fontSize: 16
-    }
-  }, "Receive Fee"), /*#__PURE__*/React.createElement("label", {
-    style: {
-      display: "block",
-      margin: "14px 0"
-    }
-  }, /*#__PURE__*/React.createElement("span", {
-    style: lbl
-  }, "Amount (due ", inr(max), ")"), /*#__PURE__*/React.createElement("input", {
-    className: "inp",
-    type: "number",
-    value: amt,
-    onChange: e => setAmt(Number(e.target.value)),
-    style: {
-      marginTop: 5
-    }
-  })), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      gap: 10,
-      marginBottom: 14
-    }
-  }, /*#__PURE__*/React.createElement("label", {
-    style: {
-      flex: 1
-    }
-  }, /*#__PURE__*/React.createElement("span", {
-    style: lbl
-  }, "Fee period \u2014 From"), /*#__PURE__*/React.createElement("input", {
-    className: "inp",
-    type: "date",
-    value: pFrom,
-    onChange: e => setPFrom(e.target.value),
-    style: {
-      marginTop: 5
-    }
-  })), /*#__PURE__*/React.createElement("label", {
-    style: {
-      flex: 1
-    }
-  }, /*#__PURE__*/React.createElement("span", {
-    style: lbl
-  }, "To"), /*#__PURE__*/React.createElement("input", {
-    className: "inp",
-    type: "date",
-    value: pTo,
-    onChange: e => setPTo(e.target.value),
-    style: {
-      marginTop: 5
-    }
-  }))), /*#__PURE__*/React.createElement("label", {
-    style: {
-      display: "block",
-      marginBottom: 14
-    }
-  }, /*#__PURE__*/React.createElement("span", {
-    style: lbl
-  }, "Payment kis date ko aaya"), /*#__PURE__*/React.createElement("input", {
-    className: "inp",
-    type: "date",
-    value: pDate,
-    max: localToday(),
-    onChange: e => setPDate(e.target.value),
-    style: {
-      marginTop: 5
-    }
-  })), /*#__PURE__*/React.createElement("label", {
-    style: {
-      display: "block",
-      marginBottom: 16
-    }
-  }, /*#__PURE__*/React.createElement("span", {
-    style: lbl
-  }, "Mode"), /*#__PURE__*/React.createElement("select", {
-    className: "inp",
-    value: mode,
-    onChange: e => setMode(e.target.value),
-    style: {
-      marginTop: 5
-    }
-  }, PAY_MODES.map(m => /*#__PURE__*/React.createElement("option", {
-    key: m
-  }, m)))), err ? /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 12.5,
-      color: col('red'),
-      fontWeight: 700,
-      marginBottom: 10
-    }
-  }, err) : null, /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      gap: 10
-    }
-  }, /*#__PURE__*/React.createElement("button", {
-    onClick: onClose,
-    style: {
-      flex: 1,
-      padding: 10,
-      background: col('paper'),
-      border: "1px solid " + col('line'),
-      borderRadius: 9,
-      fontWeight: 700,
-      cursor: "pointer"
-    }
-  }, "Cancel"), /*#__PURE__*/React.createElement("button", {
-    className: "mini",
-    disabled: busy,
-    style: {
-      flex: 2,
-      background: col('green'),
-      padding: 11
-    },
-    onClick: confirm
-  }, busy ? "…" : "Confirm"))));
 }
 ReactDOM.createRoot(document.getElementById("root")).render(/*#__PURE__*/React.createElement(App, null));
 </script>
