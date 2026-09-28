@@ -460,9 +460,14 @@ const Kpi = ({
   label,
   value,
   sub,
-  tone
+  tone,
+  onClick
 }) => /*#__PURE__*/React.createElement("div", {
-  className: "card",
+  className: onClick ? "card ddd-click" : "card",
+  onClick: onClick,
+  role: onClick ? "button" : undefined,
+  tabIndex: onClick ? 0 : undefined,
+  onKeyDown: onClick ? e => { if (e.key === "Enter") onClick(); } : undefined,
   style: {
     padding: 16,
     display: "flex",
@@ -1266,54 +1271,71 @@ const planLabel = s => {
   return inr(amt) + "/" + m + " mo";
 };
 
+/* Director rule: fee due on the 1st; "Due" on the due date (+ grace days),
+   "Overdue" after that. FEE_GRACE comes from app_settings.fee_grace_days. */
+let FEE_GRACE = 0;
+/* not billable = Left, no joining date, or zero fee -> never due/overdue */
+const isBillable = s => !!s && s.status !== "left" && !!s.joining_date && num0(s.monthly_fee) > 0;
+
 /* Fee status of one student from paid_till */
-const feeState = (s, today) => {
+const feeState = (s, today, grace) => {
   today = today || istToday();
+  grace = grace == null ? FEE_GRACE : grace;
   if (!s || s.status === "left") return {
     kind: "left",
     label: "LEFT",
     c: col('mut'),
     bg: "#eceef1"
   };
-  if (!s.paid_till) {
-    if (!s.joining_date || num0(s.monthly_fee) <= 0) return {
-      kind: "na",
-      label: "FEE NOT SET",
-      c: col('mut'),
-      bg: "#eceef1"
+  if (!isBillable(s)) return {
+    kind: "na",
+    label: !s.joining_date ? "JOINING DATE MISSING" : "FEE NOT SET",
+    c: col('mut'),
+    bg: "#eceef1"
+  };
+  if (!s.paid_till) return {
+    kind: "na",
+    label: "NOT BILLED",
+    c: col('mut'),
+    bg: "#eceef1"
+  };
+  const pt = String(s.paid_till).slice(0, 10);
+  const next = addDaysYmd(pt, 1); // next due date
+  const late = dayDiff(next, today); // 0 on the due date
+  if (late < 0) {
+    const dueIn = -late;
+    if (dueIn <= 7) return {
+      kind: "soon",
+      days: dueIn,
+      paidTill: pt,
+      label: "DUE IN " + dueIn + (dueIn === 1 ? " DAY" : " DAYS"),
+      c: col('amber'),
+      bg: "#fdf4e0"
     };
     return {
-      kind: "na",
-      label: "NOT BILLED",
-      c: col('mut'),
-      bg: "#eceef1"
+      kind: "paid",
+      paidTill: pt,
+      label: "PAID TILL " + dmy(pt),
+      c: col('green'),
+      bg: "#e6f4ec"
     };
   }
-  const pt = String(s.paid_till).slice(0, 10);
-  const over = dayDiff(pt, today); // today - paid_till
-  if (over > 0) return {
+  if (late <= grace) return {
+    kind: "due",
+    days: 0,
+    paidTill: pt,
+    label: late === 0 ? "DUE TODAY" : "DUE",
+    c: col('amber'),
+    bg: "#fdecd2"
+  };
+  const over = late - grace;
+  return {
     kind: "overdue",
     days: over,
     paidTill: pt,
     label: "OVERDUE " + over + (over === 1 ? " DAY" : " DAYS"),
     c: col('red'),
     bg: "#fbe9e7"
-  };
-  const dueIn = -over + 1; // days until paid_till + 1
-  if (dueIn <= 7) return {
-    kind: "soon",
-    days: dueIn,
-    paidTill: pt,
-    label: "DUE IN " + dueIn + (dueIn === 1 ? " DAY" : " DAYS"),
-    c: col('amber'),
-    bg: "#fdf4e0"
-  };
-  return {
-    kind: "paid",
-    paidTill: pt,
-    label: "PAID TILL " + dmy(pt),
-    c: col('green'),
-    bg: "#e6f4ec"
   };
 };
 
@@ -1322,6 +1344,24 @@ const startedPending = (dues, today) => {
   today = today || istToday();
   return (dues || []).filter(d => num0(d.pending) > 0 && dueStart(d) && dueStart(d) <= today);
 };
+
+/* Pending Fees card rule: pending on due + overdue months, billable students only */
+const billablePending = (data, today) => {
+  const ok = new Set((data.students || []).filter(isBillable).map(s => s.id));
+  return startedPending(data.monthly_dues, today).filter(d => ok.has(d.student_id));
+};
+
+/* joining month is pro-rata (mirror of DB ddd_month_fee) */
+const monthFee = (fee, joining, m) => {
+  fee = num0(fee);
+  if (!joining || fee <= 0) return fee;
+  const j = String(joining).slice(0, 10);
+  if (monthStartOf(j) !== monthStartOf(m) || ymdParts(j)[2] === 1) return fee;
+  const [y, mo, d] = ymdParts(j);
+  const dim = daysInMonth(y, mo);
+  return Math.round(fee * (dim - d + 1) / dim);
+};
+const monthStartDate = (s, m) => s.joining_date && monthStartOf(s.joining_date) === m && String(s.joining_date).slice(0, 10) > m ? String(s.joining_date).slice(0, 10) : m;
 
 /* Left before paid_till: months already paid after leaving */
 const remainingAfterLeave = (s, data) => {
@@ -1355,10 +1395,12 @@ const payPreview = (s, dues, n, today) => {
     const row = byMonth[m];
     if (!row) out.push({
       m,
-      owed: num0(s.monthly_fee),
+      start: monthStartDate(s, m),
+      owed: monthFee(s.monthly_fee, s.joining_date, m),
       isNew: true
     });else if (num0(row.pending) > 0) out.push({
       m,
+      start: dueStart(row) || m,
       owed: num0(row.pending),
       isNew: false
     });
@@ -1374,10 +1416,11 @@ const payPreview = (s, dues, n, today) => {
   const to = out.length ? monthEndOf(out[out.length - 1].m) : null;
   // paid_till after this payment: day before first still-unpaid month, else end of covered
   const leftUnpaid = unpaid.filter(x => !covered.has(x)).sort();
-  const newPaidTill = leftUnpaid.length ? addDaysYmd(leftUnpaid[0], -1) : to;
+  const firstLeft = leftUnpaid.length ? mine.filter(d => monthStartOf(d.month) === leftUnpaid[0]).map(dueStart).sort()[0] || leftUnpaid[0] : null;
+  const newPaidTill = firstLeft ? addDaysYmd(firstLeft, -1) : to;
   return {
     months: out,
-    from: out.length ? out[0].m : null,
+    from: out.length ? out[0].start : null,
     to,
     gross,
     planDisc: Math.min(planDisc, gross),
@@ -1408,11 +1451,13 @@ const partialPreview = (s, dues, amount, today) => {
     guard = 0;
   while (left > 0.004 && guard++ < 240) {
     const row = byMonth[m];
-    const owed = !row ? num0(s.monthly_fee) : num0(row.pending);
+    const owed = !row ? monthFee(s.monthly_fee, s.joining_date, m) : num0(row.pending);
+    const start = !row ? monthStartDate(s, m) : dueStart(row) || m;
     if (owed > 0) {
       const a = Math.min(left, owed);
       out.push({
         m,
+        start,
         owed,
         alloc: Math.round(a * 100) / 100
       });
@@ -1425,11 +1470,17 @@ const partialPreview = (s, dues, amount, today) => {
   const balance = Math.round((last.owed - last.alloc) * 100) / 100;
   const full = new Set(out.filter(x => x.alloc >= x.owed).map(x => x.m));
   const stillUnpaid = unpaid.filter(x => !full.has(x)).concat(balance > 0 ? [last.m] : []).sort();
-  const newPaidTill = stillUnpaid.length ? addDaysYmd(stillUnpaid[0], -1) : monthEndOf(last.m);
+  const startOf = m => {
+    const r = out.find(x => x.m === m);
+    if (r) return r.start;
+    const d = mine.filter(x => monthStartOf(x.month) === m).map(dueStart).sort()[0];
+    return d || m;
+  };
+  const newPaidTill = stillUnpaid.length ? addDaysYmd(startOf(stillUnpaid[0]), -1) : monthEndOf(last.m);
   const curMonth = monthStartOf(today);
   return {
     rows: out,
-    from: out[0].m,
+    from: out[0].start,
     to: monthEndOf(last.m),
     amount: amt,
     balance,
@@ -2084,7 +2135,7 @@ function FeePayModal({
       color: col('mut'),
       marginTop: 4
     }
-  }, pv.months.map(x => monLabel(x.m)).join(" · ")), /*#__PURE__*/React.createElement("div", {
+  }, pv.months.map(x => monLabel(x.m) + (x.start !== x.m ? " (" + dmy(x.start) + " se, " + inr(x.owed) + ")" : "")).join(" · ")), /*#__PURE__*/React.createElement("div", {
     style: {
       marginTop: 8
     }
@@ -2376,7 +2427,9 @@ function StudentsPage({
   const list = data.students.filter(s => {
     if (hsel.length && !hsel.includes(s.hostel_id)) return false;
     if (rsel && bedRoom(s.current_bed_id) !== rsel) return false;
-    if (stuF.st && (s.status || "active") !== stuF.st) return false;
+    if (stuF.st === "missing") {
+      if (s.status === "left" || isBillable(s)) return false;
+    } else if (stuF.st && (s.status || "active") !== stuF.st) return false;
     if (stuF.q && !studentMatches(s, stuF.q)) return false;
     return true;
   });
@@ -2463,7 +2516,9 @@ function StudentsPage({
     value: "temporary_leave"
   }, "Temporary leave"), /*#__PURE__*/React.createElement("option", {
     value: "left"
-  }, "Left")), /*#__PURE__*/React.createElement("input", {
+  }, "Left"), /*#__PURE__*/React.createElement("option", {
+    value: "missing"
+  }, "Missing data (joining date / fee)")), /*#__PURE__*/React.createElement("input", {
     className: "inp",
     style: {
       width: 190
@@ -2567,22 +2622,26 @@ function FeesPage({
     mf,
     setMf,
     billingMode,
-    saveBillingMode
+    saveBillingMode,
+    feeSf: sf,
+    setFeeSf: setSf,
+    go
   } = ctx;
   const [tab, setTab] = useState("students");
-  const [sf, setSf] = useState("all");
   const [q, setQ] = useState("");
   const [pay, setPay] = useState(null);
   const [hist, setHist] = useState(null);
   const today = istToday();
   const inHostel = x => !hf || x.hostel_id === hf;
-  const students = data.students.filter(s => s.status !== "left" && inHostel(s));
+  const allActive = data.students.filter(s => s.status !== "left" && inHostel(s));
+  const students = allActive.filter(isBillable);
+  const missingCount = allActive.length - students.length;
   const withState = students.map(s => ({
     s,
     st: feeState(s, today)
   }));
   const dueAmt = {};
-  startedPending(data.monthly_dues, today).forEach(d => {
+  billablePending(data, today).forEach(d => {
     dueAmt[d.student_id] = (dueAmt[d.student_id] || 0) + num0(d.pending);
   });
   const cnt = k => withState.filter(x => x.st.kind === k).length;
@@ -2591,14 +2650,16 @@ function FeesPage({
     if (sf === "advance" && !advance(x)) return false;
     if (sf === "soon" && x.st.kind !== "soon") return false;
     if (sf === "overdue" && x.st.kind !== "overdue") return false;
+    if (sf === "due" && x.st.kind !== "due") return false;
     if (q && !String(x.s.full_name || "").toLowerCase().includes(q.toLowerCase()) && !String(x.s.admission_number || "").toLowerCase().includes(q.toLowerCase())) return false;
     return true;
   }).sort((a, b) => {
     const rank = {
       overdue: 0,
-      soon: 1,
-      na: 2,
-      paid: 3
+      due: 1,
+      soon: 2,
+      na: 3,
+      paid: 4
     };
     return rank[a.st.kind] - rank[b.st.kind] || String(a.st.paidTill || "").localeCompare(String(b.st.paidTill || "")) || String(a.s.full_name).localeCompare(String(b.s.full_name));
   });
@@ -2707,20 +2768,28 @@ function FeesPage({
       fontWeight: 700,
       color: col('mut'),
       marginLeft: 6
-    }
-  }, "Billing cycle:"), /*#__PURE__*/React.createElement("select", {
-    className: "inp",
-    style: {
-      width: "auto"
     },
-    value: billingMode,
-    onChange: e => saveBillingMode(e.target.value),
-    title: "Calendar = har mahine 1 tareekh; Joining-date = har student ki apni date"
-  }, /*#__PURE__*/React.createElement("option", {
-    value: "calendar"
-  }, "Calendar month (1 tareekh)"), /*#__PURE__*/React.createElement("option", {
-    value: "anniversary"
-  }, "Joining-date cycle"))) : null), /*#__PURE__*/React.createElement("div", {
+    "data-billing": "calendar"
+  }, "Billing: Calendar (1 tareekh)"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 12,
+      fontWeight: 700,
+      color: col('mut'),
+      marginLeft: 6
+    },
+    title: "Due date ke baad kitne din tak 'Due' rahe, phir 'Overdue'"
+  }, "Grace days:"), /*#__PURE__*/React.createElement("input", {
+    className: "inp",
+    type: "number",
+    min: 0,
+    max: 31,
+    style: {
+      width: 64
+    },
+    value: ctx.feeGrace,
+    onChange: e => ctx.saveFeeGrace(Math.max(0, Math.min(31, parseInt(e.target.value, 10) || 0))),
+    "data-grace": "1"
+  })) : null), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "grid",
       gap: 12,
@@ -2733,9 +2802,9 @@ function FeesPage({
     sub: "Total " + inr(collected),
     tone: col('green')
   }), /*#__PURE__*/React.createElement(Kpi, {
-    label: "Overdue amount",
+    label: "Pending (due + overdue)",
     value: inr(overdueAmt),
-    sub: cnt("overdue") + " students overdue",
+    sub: cnt("overdue") + " overdue · " + cnt("due") + " due",
     tone: col('red')
   }), /*#__PURE__*/React.createElement(Kpi, {
     label: "Due in 7 days",
@@ -2754,7 +2823,7 @@ function FeesPage({
       alignItems: "center",
       marginBottom: 12
     }
-  }, chip("all", "All", withState.length), chip("advance", "Paid in advance", withState.filter(advance).length), chip("soon", "Due soon", cnt("soon")), chip("overdue", "Overdue", cnt("overdue")), /*#__PURE__*/React.createElement("input", {
+  }, chip("all", "All", withState.length), chip("advance", "Paid in advance", withState.filter(advance).length), chip("soon", "Due soon", cnt("soon")), chip("due", "Due", cnt("due")), chip("overdue", "Overdue", cnt("overdue")), /*#__PURE__*/React.createElement("input", {
     className: "inp",
     style: {
       width: 200,
@@ -2763,7 +2832,23 @@ function FeesPage({
     placeholder: "Search name / adm. no.",
     value: q,
     onChange: e => setQ(e.target.value)
-  })), /*#__PURE__*/React.createElement("div", {
+  })), missingCount > 0 ? /*#__PURE__*/React.createElement("button", {
+    onClick: () => go("students", {
+      st: "missing"
+    }),
+    "data-missing-link": "1",
+    style: {
+      border: "1px dashed " + col('line'),
+      background: "#fff",
+      borderRadius: 9,
+      padding: "7px 12px",
+      marginBottom: 12,
+      cursor: "pointer",
+      fontSize: 12.5,
+      fontWeight: 700,
+      color: col('mut')
+    }
+  }, "⚠ ", missingCount, " students: joining date/fee missing — ye due/overdue mein nahi gine jaate →") : null, /*#__PURE__*/React.createElement("div", {
     className: "card",
     style: {
       overflowX: "auto"
@@ -3405,6 +3490,210 @@ function StudentProfile({
   })) : null);
 }
 
+/* ---- clickable cards / alerts: hover highlight ---- */
+(function () {
+  try {
+    const st = document.createElement("style");
+    st.textContent = ".ddd-click{cursor:pointer;transition:box-shadow .15s,transform .15s}.ddd-click:hover{box-shadow:0 6px 18px #0002;transform:translateY(-1px)}.ddd-alert:hover{background:#f4f1ea}";
+    document.head.appendChild(st);
+  } catch (e) {}
+})();
+
+/* Supabase returns max ~1000 rows per request -> load every page */
+const fetchAll = async table => {
+  const out = [];
+  let from = 0;
+  for (let guard = 0; guard < 500; guard++) {
+    const {
+      data,
+      error
+    } = await SB.from(table).select("*").order("id", {
+      ascending: true
+    }).range(from, from + 999);
+    if (error) return {
+      data: null,
+      error
+    };
+    const rows = data || [];
+    out.push(...rows);
+    if (!rows.length) break;
+    from += rows.length;
+  }
+  return {
+    data: out,
+    error: null
+  };
+};
+
+/* Bell: every alert = { label, icon, count, page, filter } -> click opens page with filter */
+function BellAlerts({
+  data,
+  go
+}) {
+  const [open, setOpen] = useState(false);
+  const today = istToday();
+  const fs = (data.students || []).map(s => feeState(s, today));
+  const n = k => fs.filter(x => x.kind === k).length;
+  const missing = (data.students || []).filter(s => s.status !== "left" && !isBillable(s)).length;
+  const vacant = (data.beds || []).filter(b => b.bed_status === "vacant").length;
+  const openC = (data.complaints || []).filter(c => c.status !== "resolved").length;
+  const salary = (data.employees || []).reduce((a, e) => a + num0(e.monthly_salary), 0);
+  const alerts = [{
+    icon: "💰",
+    count: n("overdue"),
+    label: n("overdue") + " students ki fee overdue",
+    page: "fees",
+    filter: {
+      sf: "overdue"
+    }
+  }, {
+    icon: "📅",
+    count: n("due"),
+    label: n("due") + " students ki fee due",
+    page: "fees",
+    filter: {
+      sf: "due"
+    }
+  }, {
+    icon: "⏰",
+    count: n("soon"),
+    label: n("soon") + " students ki fee 7 din mein due",
+    page: "fees",
+    filter: {
+      sf: "soon"
+    }
+  }, {
+    icon: "🛏",
+    count: vacant,
+    label: vacant + " beds khaali",
+    page: "rooms",
+    filter: {
+      vacant: true
+    }
+  }, {
+    icon: "🔧",
+    count: openC,
+    label: openC + " complaints open",
+    page: "complaints",
+    filter: {
+      comp: "open"
+    }
+  }, {
+    icon: "👷",
+    count: salary > 0 ? 1 : 0,
+    label: "Salary payable: " + inr(salary),
+    page: "staff",
+    filter: {
+      staff: "salary"
+    }
+  }, {
+    icon: "⚠️",
+    count: missing,
+    label: missing + " students: joining date/fee missing",
+    page: "students",
+    filter: {
+      st: "missing"
+    }
+  }];
+  (data.hostels || []).forEach(h => {
+    if (h.agreement_end) {
+      const dd = dayDiff(today, String(h.agreement_end).slice(0, 10));
+      if (dd >= 0 && dd <= 30) alerts.push({
+        icon: "📄",
+        count: 1,
+        label: h.name + " ka agreement 30 din me khatam",
+        page: "hostels",
+        filter: null
+      });
+    }
+  });
+  const shown = alerts.filter(a => a.count > 0);
+  const click = a => {
+    setOpen(false);
+    go(a.page, a.filter);
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: "relative"
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: () => setOpen(o => !o),
+    "data-bell": "1",
+    style: {
+      background: "none",
+      border: "none",
+      cursor: "pointer",
+      fontSize: 18,
+      position: "relative"
+    }
+  }, "🔔", shown.length ? /*#__PURE__*/React.createElement("span", {
+    style: {
+      position: "absolute",
+      top: -2,
+      right: -4,
+      background: "#c0392b",
+      color: "#fff",
+      borderRadius: 10,
+      fontSize: 10,
+      padding: "1px 5px",
+      fontWeight: 700
+    }
+  }, shown.length) : null), open ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: "absolute",
+      right: 0,
+      top: 30,
+      width: 300,
+      background: "#fff",
+      border: "1px solid #e4ddd0",
+      borderRadius: 12,
+      boxShadow: "0 10px 30px #0002",
+      zIndex: 60,
+      padding: 8
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 800,
+      fontSize: 12,
+      padding: "4px 8px",
+      color: "#555"
+    }
+  }, "ALERTS"), shown.length ? shown.map((a, i) => /*#__PURE__*/React.createElement("button", {
+    key: i,
+    className: "ddd-alert",
+    onClick: () => click(a),
+    "data-alert": a.page + ":" + (a.filter ? Object.values(a.filter)[0] : ""),
+    style: {
+      display: "flex",
+      width: "100%",
+      gap: 8,
+      alignItems: "center",
+      padding: "9px 10px",
+      borderRadius: 8,
+      fontSize: 13,
+      border: "none",
+      background: "none",
+      cursor: "pointer",
+      textAlign: "left",
+      font: "inherit"
+    }
+  }, /*#__PURE__*/React.createElement("span", null, a.icon), /*#__PURE__*/React.createElement("span", {
+    style: {
+      flex: 1
+    }
+  }, a.label), /*#__PURE__*/React.createElement("b", {
+    style: {
+      color: col('mut')
+    }
+  }, "→"))) : /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: 10,
+      fontSize: 13,
+      color: "#777"
+    }
+  }, "Sab theek hai ✓")) : null);
+}
+
 function App() {
   const [session, setSession] = useState(null);
   const [profile, setProfile] = useState(null);
@@ -3426,6 +3715,29 @@ function App() {
   const [roomsH, setRoomsH] = useState("");
   const [rosterH, setRosterH] = useState("");
   const [profId, setProfId] = useState(null);
+  const [feeSf, setFeeSf] = useState("all");
+  const [compF, setCompF] = useState("");
+  const [staffF, setStaffF] = useState("");
+  const [roomsVac, setRoomsVac] = useState(false);
+  const [feeGrace, setFeeGrace] = useState(0);
+  FEE_GRACE = feeGrace;
+  // open a page with a filter (Bell alerts + Dashboard cards)
+  const go = (pg, f) => {
+    f = f || {};
+    if (pg === "fees") setFeeSf(f.sf || "all");
+    if (pg === "students" && f.st !== undefined) setStuF(p => ({ ...p, st: f.st, q: "" }));
+    if (pg === "rooms") setRoomsVac(!!f.vacant);
+    if (pg === "complaints") setCompF(f.comp || "");
+    if (pg === "staff") setStaffF(f.staff || "");
+    setPage(pg);
+    setOpen(false);
+    try { window.scrollTo(0, 0); } catch (e) {}
+  };
+  const saveFeeGrace = async n => {
+    setFeeGrace(n);
+    const { error } = await SB.from("app_settings").upsert({ key: "fee_grace_days", value: String(n) }, { onConflict: "key" });
+    if (error) setToast("\u26A0 " + error.message);
+  };
   useEffect(() => {
     SB.auth.getSession().then(({
       data
@@ -3472,7 +3784,7 @@ function App() {
         const {
           data: d,
           error
-        } = await SB.from(x).select("*");
+        } = x === "audit_logs" ? await SB.from(x).select("*") : await fetchAll(x);
         if (error) throw new Error(x + ": " + error.message);
         out[x] = d || [];
       }
@@ -3502,6 +3814,8 @@ function App() {
           data: row
         } = await SB.from("app_settings").select("value").eq("key", "billing_mode").maybeSingle();
         if (row && row.value) setBillingMode(row.value);
+        const { data: g } = await SB.from("app_settings").select("value").eq("key", "fee_grace_days").maybeSingle();
+        if (g && g.value != null) setFeeGrace(Math.max(0, parseInt(g.value, 10) || 0));
       } catch (e) {/* table abhi nahi bani — calendar default */}
     })();
   }, [profile]);
@@ -3523,18 +3837,7 @@ function App() {
   useEffect(() => {
     if (!profile || !data) return;
     if (role !== "director" && role !== "manager") return;
-    if (billingMode === "anniversary") {
-      const key = "ann:" + today();
-      if (autoGenRef.current === key) return; // din mein ek hi baar try
-      autoGenRef.current = key;
-      (async () => {
-        const {
-          error
-        } = await SB.rpc("generate_anniversary_dues", {});
-        if (!error) refresh();
-      })();
-      return;
-    }
+    // Joining-date cycle removed: calendar billing only (Director rule)
     // calendar mode (default)
     const cm = today().slice(0, 7); // current YYYY-MM
     const hasCM = (data.monthly_dues || []).some(d => String(d.month).slice(0, 7) === cm);
@@ -3554,15 +3857,17 @@ function App() {
     })();
   }, [profile, data, role, refresh, billingMode]);
   const D = useMemo(() => {
-    if (!data) return { overdue:0, dueSoon:0, occupied:0, beds:0, income:0, expense:0, pending:0, salaryPay:0, perHostel:[], catData:[], students:0, hostels:0, complaintsOpen:0 };
+    if (!data) return { overdue:0, dueSoon:0, dueCount:0, missing:0, occupied:0, beds:0, income:0, expense:0, pending:0, salaryPay:0, perHostel:[], catData:[], students:0, hostels:0, complaintsOpen:0 };
     const occupied = data.beds.filter(b => b.bed_status === "occupied").length;
     const income = data.fee_payments.reduce((a, f) => a + Number(f.amount || 0), 0);
     const expense = data.expenses.filter(e => e.status === "approved").reduce((a, e) => a + Number(e.amount || 0), 0);
     const _t = istToday();
-    const pending = startedPending(data.monthly_dues, _t).reduce((a, d) => a + Number(d.pending || 0), 0);
+    const pending = billablePending(data, _t).reduce((a, d) => a + Number(d.pending || 0), 0);
     const _fs = data.students.map(s => feeState(s, _t));
     const overdue = _fs.filter(x => x.kind === "overdue").length;
     const dueSoon = _fs.filter(x => x.kind === "soon").length;
+    const dueCount = _fs.filter(x => x.kind === "due").length;
+    const missing = data.students.filter(s => s.status !== "left" && !isBillable(s)).length;
     const salaryPay = data.employees.reduce((a, e) => a + Number(e.monthly_salary || 0), 0);
     const perHostel = data.hostels.map(h => {
       const inc = data.fee_payments.filter(f => f.hostel_id === h.id).reduce((a, f) => a + Number(f.amount || 0), 0);
@@ -3573,7 +3878,7 @@ function App() {
     const catMap = {};
     data.expenses.filter(e => e.status === "approved").forEach(e => { catMap[e.category] = (catMap[e.category] || 0) + Number(e.amount || 0); });
     return {
-      overdue, dueSoon, occupied, beds: data.beds.length, income, expense, pending, salaryPay, perHostel,
+      overdue, dueSoon, dueCount, missing, occupied, beds: data.beds.length, income, expense, pending, salaryPay, perHostel,
       catData: Object.entries(catMap).map(([k, v]) => ({ k, v, label: inr(v) })),
       students: data.students.length, hostels: data.hostels.length,
       complaintsOpen: data.complaints.filter(c => c.status !== "resolved").length
@@ -4089,7 +4394,7 @@ function App() {
   }, "\uD83D\uDDD1"));
   const Pages = {
     dashboard: () => {
-      const k = [["Total Hostels", D.hostels, null, 'slate'], ["Students", D.students, null, 'steel'], ["Occupied Beds", D.occupied + "/" + D.beds, (D.beds ? Math.round(D.occupied / D.beds * 100) : 0) + "% full", 'green'], ["Vacant Beds", D.beds - D.occupied, null, 'amber'], ["Income (paid)", inr(D.income), null, 'green'], ["Expense (approved)", inr(D.expense), null, 'red'], ["Net Profit", inr(D.income - D.expense), null, 'gold'], ["Pending Fees", inr(D.pending), D.overdue + " overdue \xB7 " + D.dueSoon + " due in 7 days", 'red'], ["Salary Payable", inr(D.salaryPay), null, 'steel'], ["Open Complaints", D.complaintsOpen, null, 'amber']];
+      const k = [["Total Hostels", D.hostels, null, 'slate', "hostels"], ["Students", D.students, D.missing ? D.missing + " joining date/fee missing" : null, 'steel', "students"], ["Occupied Beds", D.occupied + "/" + D.beds, (D.beds ? Math.round(D.occupied / D.beds * 100) : 0) + "% full", 'green', "rooms"], ["Vacant Beds", D.beds - D.occupied, null, 'amber', "rooms", { vacant: true }], ["Income (paid)", inr(D.income), null, 'green', "fees"], ["Expense (approved)", inr(D.expense), null, 'red', "expenses"], ["Net Profit", inr(D.income - D.expense), null, 'gold'], ["Pending Fees", inr(D.pending), D.overdue + " overdue \xB7 " + D.dueCount + " due \xB7 " + D.dueSoon + " due in 7 days", 'red', "fees", { sf: "overdue" }], ["Salary Payable", inr(D.salaryPay), null, 'steel', "staff", { staff: "salary" }], ["Open Complaints", D.complaintsOpen, null, 'amber', "complaints", { comp: "open" }]];
       return /*#__PURE__*/React.createElement("div", {
         style: {
           display: "flex",
@@ -4107,7 +4412,8 @@ function App() {
         label: x[0],
         value: x[1],
         sub: x[2],
-        tone: col(x[3])
+        tone: col(x[3]),
+        onClick: x[4] && allowed.includes(x[4]) ? () => go(x[4], x[5]) : undefined
       }))), /*#__PURE__*/React.createElement("div", {
         style: {
           display: "grid",
@@ -4227,7 +4533,7 @@ function App() {
       const hsel = roomsH && data.hostels.some(h => h.id === roomsH) ? roomsH : data.hostels[0]?.id || "";
       const setHsel = setRoomsH;
       const [alloc, setAlloc] = useState(null);
-      const roomsOf = data.rooms.filter(r => r.hostel_id === hsel);
+      const roomsOf = data.rooms.filter(r => r.hostel_id === hsel && (!roomsVac || data.beds.some(b => b.room_id === r.id && b.bed_status === "vacant")));
       const free = data.students.filter(s => s.status === "active" && !s.current_bed_id);
       const addRoom = async v => {
         try {
@@ -4327,6 +4633,11 @@ function App() {
         key: h.id,
         value: h.id
       }, h.name))), /*#__PURE__*/React.createElement("button", {
+        className: "mini",
+        "data-vacant-filter": "1",
+        style: { background: roomsVac ? col('green') : col('slate'), padding: "8px 12px" },
+        onClick: () => setRoomsVac(v => !v)
+      }, roomsVac ? "\u2713 Only vacant" : "Only vacant"), /*#__PURE__*/React.createElement("button", {
         className: "pbtn",
         onClick: () => setModal({
           entity: "_room",
@@ -4681,6 +4992,7 @@ function App() {
   const list = data.employees.filter(e => {
     if (hsel.length && !hsel.includes(e.hostel_id)) return false;
     if (rolesel && e.role !== rolesel) return false;
+    if (staffF === "salary" && !(Number(e.monthly_salary || 0) > 0)) return false;
     return true;
   });
   const toggle = async e => {
@@ -4737,7 +5049,11 @@ function App() {
   }, "All roles"), rolesPresent.map(r => /*#__PURE__*/React.createElement("option", {
     key: r,
     value: r
-  }, r))), /*#__PURE__*/React.createElement("span", {
+  }, r))), /*#__PURE__*/React.createElement("button", {
+    "data-staff-filter": "salary",
+    onClick: () => setStaffF(staffF === "salary" ? "" : "salary"),
+    style: chip(staffF === "salary")
+  }, "Salary payable (" + inr(list.filter(e => Number(e.monthly_salary || 0) > 0).reduce((a, e) => a + Number(e.monthly_salary || 0), 0)) + ")"), /*#__PURE__*/React.createElement("span", {
     style: {
       fontSize: 12,
       color: col('mut'),
@@ -4770,7 +5086,8 @@ function App() {
   }, "No staff match."))))));
 },
     complaints: () => /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(Header, {
-      entity: "complaints"
+      entity: "complaints",
+      extra: /*#__PURE__*/React.createElement("span", { style: { display: "inline-flex", gap: 6 } }, [["", "All"], ["open", "Open"], ["resolved", "Resolved"]].map(([k2, l2]) => /*#__PURE__*/React.createElement("button", { key: k2, "data-comp-filter": k2 || "all", onClick: () => setCompF(k2), style: { padding: "5px 12px", borderRadius: 8, border: "1px solid " + col('line'), cursor: "pointer", fontSize: 12.5, fontWeight: 700, background: compF === k2 ? col('slate') : "#fff", color: compF === k2 ? "#fff" : col('slate') } }, l2)))
     }), /*#__PURE__*/React.createElement("div", {
       className: "card",
       style: {
@@ -4778,7 +5095,7 @@ function App() {
       }
     }, /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Hostel", "Type", "Priority", "Description", "Status", "Action"].map(c => /*#__PURE__*/React.createElement("th", {
       key: c
-    }, c)))), /*#__PURE__*/React.createElement("tbody", null, data.complaints.map(c => /*#__PURE__*/React.createElement("tr", {
+    }, c)))), /*#__PURE__*/React.createElement("tbody", null, data.complaints.filter(c => compF === "open" ? c.status !== "resolved" : compF === "resolved" ? c.status === "resolved" : true).map(c => /*#__PURE__*/React.createElement("tr", {
       key: c.id
     }, /*#__PURE__*/React.createElement("td", null, hName(c.hostel_id)), /*#__PURE__*/React.createElement("td", null, c.type), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement(Badge, {
       c: col(c.priority === "emergency" || c.priority === "high" ? 'red' : c.priority === "medium" ? 'amber' : 'steel'),
@@ -4850,7 +5167,7 @@ function App() {
     const occ = beds.filter(b => b.bed_status === "occupied").length;
     const income = data.fee_payments.filter(f => f.hostel_id === h.id).reduce((a, f) => a + num(f.amount), 0);
     const expense = data.expenses.filter(e => e.hostel_id === h.id && e.status === "approved").reduce((a, e) => a + num(e.amount), 0);
-    const pending = startedPending(data.monthly_dues.filter(d => d.hostel_id === h.id)).reduce((a, d) => a + num(d.pending), 0);
+    const pending = billablePending({ students: data.students, monthly_dues: data.monthly_dues.filter(d => d.hostel_id === h.id) }).reduce((a, d) => a + num(d.pending), 0);
     const staffCost = data.employees.filter(e => e.hostel_id === h.id).reduce((a, e) => a + num(e.monthly_salary), 0);
     return {
       name: h.name,
@@ -5017,7 +5334,7 @@ function App() {
   const anomalies = H.filter(x => avgExp > 0 && x.expense > avgExp * 1.5);
   const mostC = H.slice().sort((a, b) => b.complaints - a.complaints)[0];
   const pmap = {};
-  startedPending(data.monthly_dues).forEach(d => {
+  billablePending(data).forEach(d => {
     pmap[d.student_id] = pmap[d.student_id] || {
       months: 0,
       amt: 0
@@ -5302,7 +5619,7 @@ function App() {
   }
   };
   const Current = Pages[cur] || Pages.dashboard;
-  const pageCtx = { data, role, session, hName, sName, uName, NameBtn, Header, EditDel, setModal, setContact, del, flash, refresh, hf, setHf, mf, setMf, billingMode, saveBillingMode, stuF, setStuF, openProfile: setProfId };
+  const pageCtx = { data, role, session, hName, sName, uName, NameBtn, Header, EditDel, setModal, setContact, del, flash, refresh, hf, setHf, mf, setMf, billingMode, saveBillingMode, stuF, setStuF, openProfile: setProfId, feeSf, setFeeSf, go, feeGrace, saveFeeGrace };
   return /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
@@ -5435,7 +5752,7 @@ function App() {
     style: {
       flex: 1
     }
-  }), /*#__PURE__*/React.createElement(Bell, { data: data }), /*#__PURE__*/React.createElement("span", {
+  }), /*#__PURE__*/React.createElement(BellAlerts, { data: data, go: go }), /*#__PURE__*/React.createElement("span", {
     style: {
       fontSize: 12,
       color: col('mut')
@@ -5487,109 +5804,6 @@ function App() {
       zIndex: 99
     }
   }, toast));
-}
-function Bell({
-  data
-}) {
-  const [open, setOpen] = React.useState(false);
-  const num = v => Number(v || 0);
-  const alerts = [];
-  const _fs = (data.students || []).map(s => feeState(s));
-  const pendCount = _fs.filter(x => x.kind === "overdue").length;
-  const soonCount = _fs.filter(x => x.kind === "soon").length;
-  if (pendCount) alerts.push({
-    icon: "💰",
-    t: pendCount + " students ki fee overdue"
-  });
-  if (soonCount) alerts.push({
-    icon: "⏰",
-    t: soonCount + " students ki fee 7 din mein due"
-  });
-  const vac = data.beds.filter(b => b.bed_status === "vacant").length;
-  if (vac) alerts.push({
-    icon: "🛏",
-    t: vac + " beds khaali"
-  });
-  const openC = data.complaints.filter(c => c.status !== "resolved").length;
-  if (openC) alerts.push({
-    icon: "🔧",
-    t: openC + " complaints open"
-  });
-  (data.hostels || []).forEach(h => {
-    if (h.agreement_end) {
-      const dd = (new Date(h.agreement_end) - new Date()) / 86400000;
-      if (dd >= 0 && dd <= 30) alerts.push({
-        icon: "📄",
-        t: h.name + " ka agreement 30 din me khatam"
-      });
-    }
-  });
-  const salary = (data.employees || []).reduce((a, e) => a + num(e.monthly_salary), 0);
-  if (salary) alerts.push({
-    icon: "👷",
-    t: "Salary payable: ₹" + salary.toLocaleString("en-IN")
-  });
-  return /*#__PURE__*/React.createElement("div", {
-    style: {
-      position: "relative"
-    }
-  }, /*#__PURE__*/React.createElement("button", {
-    onClick: () => setOpen(o => !o),
-    style: {
-      background: "none",
-      border: "none",
-      cursor: "pointer",
-      fontSize: 18,
-      position: "relative"
-    }
-  }, "\uD83D\uDD14", alerts.length ? /*#__PURE__*/React.createElement("span", {
-    style: {
-      position: "absolute",
-      top: -2,
-      right: -4,
-      background: "#c0392b",
-      color: "#fff",
-      borderRadius: 10,
-      fontSize: 10,
-      padding: "1px 5px",
-      fontWeight: 700
-    }
-  }, alerts.length) : null), open ? /*#__PURE__*/React.createElement("div", {
-    style: {
-      position: "absolute",
-      right: 0,
-      top: 30,
-      width: 280,
-      background: "#fff",
-      border: "1px solid #e4ddd0",
-      borderRadius: 12,
-      boxShadow: "0 10px 30px #0002",
-      zIndex: 60,
-      padding: 8
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontWeight: 800,
-      fontSize: 12,
-      padding: "4px 8px",
-      color: "#555"
-    }
-  }, "ALERTS"), alerts.length ? alerts.map((a, i) => /*#__PURE__*/React.createElement("div", {
-    key: i,
-    style: {
-      display: "flex",
-      gap: 8,
-      padding: "8px 10px",
-      fontSize: 13,
-      borderTop: "1px solid #f0ece3"
-    }
-  }, /*#__PURE__*/React.createElement("span", null, a.icon), /*#__PURE__*/React.createElement("span", null, a.t))) : /*#__PURE__*/React.createElement("div", {
-    style: {
-      padding: 12,
-      fontSize: 13,
-      color: "#777"
-    }
-  }, "Koi alert nahi \uD83C\uDF89")) : null);
 }
 ReactDOM.createRoot(document.getElementById("root")).render(/*#__PURE__*/React.createElement(App, null));
 </script>
