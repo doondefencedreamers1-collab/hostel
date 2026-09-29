@@ -2425,7 +2425,10 @@ function StudentsPage({
     numeric: true
   }));
   const bedRoom = bedId => data.beds.find(b => b.id === bedId)?.room_id;
+  const pr = stuF.pj ? periodRange(ctx.per, today) : null; // from Dashboard: joined / left in period
   const list = data.students.filter(s => {
+    if (pr && stuF.pj === "join" && !inPeriod(s.joining_date, pr)) return false;
+    if (pr && stuF.pj === "left" && !inPeriod(s.exit_date, pr)) return false;
     if (hsel.length && !hsel.includes(s.hostel_id)) return false;
     if (rsel && bedRoom(s.current_bed_id) !== rsel) return false;
     if (stuF.st === "missing") {
@@ -2530,7 +2533,16 @@ function StudentsPage({
       q: e.target.value
     }),
     "data-stu-search": "1"
-  }), /*#__PURE__*/React.createElement("span", {
+  }), pr ? /*#__PURE__*/React.createElement("button", {
+    onClick: () => upd({
+      pj: ""
+    }),
+    "data-pj-chip": stuF.pj,
+    style: {
+      ...chip(true),
+      background: col('steel')
+    }
+  }, stuF.pj === "join" ? "Joined" : "Left", " in ", pr.label, " ✕") : null, /*#__PURE__*/React.createElement("span", {
     style: {
       fontSize: 12,
       color: col('mut'),
@@ -2628,7 +2640,8 @@ function FeesPage({
     setFeeSf: setSf,
     go
   } = ctx;
-  const [tab, setTab] = useState("students");
+  const tab = ctx.feeTab || "students";
+  const setTab = ctx.setFeeTab;
   const [q, setQ] = useState("");
   const [pay, setPay] = useState(null);
   const [hist, setHist] = useState(null);
@@ -2744,7 +2757,7 @@ function FeesPage({
       alignItems: "center",
       marginBottom: 12
     }
-  }, tabBtn("students", "Students · Paid till"), tabBtn("ledger", "Monthly ledger"), /*#__PURE__*/React.createElement("span", {
+  }, tabBtn("students", "Students · Paid till"), tabBtn("ledger", "Monthly ledger"), tabBtn("collected", "Collected"), /*#__PURE__*/React.createElement("span", {
     style: {
       fontSize: 12,
       fontWeight: 700,
@@ -2816,7 +2829,9 @@ function FeesPage({
     value: withState.filter(advance).length,
     sub: "beyond this month",
     tone: col('green')
-  })), tab === "students" ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+  })), tab === "collected" ? /*#__PURE__*/React.createElement(FeesCollected, {
+    ctx: ctx
+  }) : tab === "students" ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       flexWrap: "wrap",
@@ -3495,7 +3510,7 @@ function StudentProfile({
 (function () {
   try {
     const st = document.createElement("style");
-    st.textContent = ".ddd-click{cursor:pointer;transition:box-shadow .15s,transform .15s}.ddd-click:hover{box-shadow:0 6px 18px #0002;transform:translateY(-1px)}.ddd-alert:hover{background:#f4f1ea}";
+    st.textContent = ".ddd-click{cursor:pointer;transition:box-shadow .15s,transform .15s}.ddd-click:hover{box-shadow:0 6px 18px #0002;transform:translateY(-1px)}.ddd-alert:hover{background:#f4f1ea}@keyframes dddsk{0%{opacity:.55}50%{opacity:1}100%{opacity:.55}}.ddd-skel{background:#ece7dc;border-radius:6px;animation:dddsk 1.2s ease-in-out infinite}";
     document.head.appendChild(st);
   } catch (e) {}
 })();
@@ -5295,6 +5310,1549 @@ function SalaryPage({
   }) : null);
 }
 
+/* =====================================================================
+   020 — PERIOD FILTER (Dashboard / Reports / Fees Collected / Expenses)
+   All dates are IST "YYYY-MM-DD" strings. Numbers for the Dashboard come
+   from ONE RPC dashboard_summary(p_from, p_to, p_hostel) under RLS.
+   ===================================================================== */
+const PERIOD_OPTS = [["today", "Today"], ["yesterday", "Yesterday"], ["week", "This week"], ["last7", "Last 7 days"], ["month", "This month"], ["lastmonth", "Last month"], ["pickmonth", "Select month"], ["quarter", "This quarter"], ["year", "This year (Jan–Dec)"], ["pickyear", "Select year"], ["fy", "This financial year (Apr–Mar)"], ["pickfy", "Select financial year"], ["lastfy", "Last financial year"], ["custom", "Custom range"], ["all", "All time"]];
+const ALL_FROM = "2000-01-01";
+const MON3 = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const isYmd = s => /^\d{4}-\d{2}-\d{2}$/.test(String(s || ""));
+const fyStartYear = d => {
+  const [y, m] = ymdParts(d);
+  return m >= 4 ? y : y - 1;
+};
+const fyLabel = y => "FY " + y + "-" + String(y + 1).slice(2);
+const monYear = s => {
+  const [y, m] = ymdParts(s);
+  return MON3[m - 1] + " " + y;
+};
+const isWholeMonths = (from, to) => ymdParts(from)[2] === 1 && to === monthEndOf(to);
+const monthsBetween = (from, to) => {
+  const [y1, m1] = ymdParts(from),
+    [y2, m2] = ymdParts(to);
+  return (y2 - y1) * 12 + (m2 - m1) + 1;
+};
+
+/* label shown on every card: "Sep 2026", "FY 2026-27", "01-09 to 15-09-2026" */
+const rangeLabel = (from, to, k) => {
+  if (k === "all" || from === ALL_FROM) return "All time";
+  if (from === to) return dmy(from);
+  const [y1, m1, d1] = ymdParts(from),
+    [y2, m2] = ymdParts(to);
+  if (isWholeMonths(from, to)) {
+    if (from === to.slice(0, 8) + "01") return monYear(from);
+    if (m1 === 4 && d1 === 1 && m2 === 3 && y2 === y1 + 1) return fyLabel(y1);
+    if (m1 === 1 && m2 === 12 && y1 === y2) return String(y1);
+    return y1 === y2 ? MON3[m1 - 1] + "–" + MON3[m2 - 1] + " " + y1 : monYear(from) + " – " + monYear(to);
+  }
+  return (y1 === y2 ? dmy(from).slice(0, 5) : dmy(from)) + " to " + dmy(to);
+};
+/* previous period for ▲/▼ (mirror of SQL ddd_prev_period) */
+const prevRange = (from, to) => isWholeMonths(from, to) ? {
+  from: addMonthsYmd(from, -monthsBetween(from, to)),
+  to: addDaysYmd(from, -1)
+} : {
+  from: addDaysYmd(from, -(dayDiff(from, to) + 1)),
+  to: addDaysYmd(from, -1)
+};
+const vsLabel = (from, to) => {
+  if (!from || !to) return "";
+  if (isWholeMonths(from, to) && from === to.slice(0, 8) + "01") {
+    const [y, m] = ymdParts(from);
+    return MON3[m - 1] + (y !== ymdParts(istToday())[0] ? " " + y : "");
+  }
+  return rangeLabel(from, to);
+};
+
+/* period object {k, m, y, fy, from, to} -> {k, from, to, label} */
+const periodRange = (p, today) => {
+  p = p || {};
+  today = today || istToday();
+  const [y, m] = ymdParts(today);
+  let from, to;
+  switch (p.k) {
+    case "today":
+      from = to = today;
+      break;
+    case "yesterday":
+      from = to = addDaysYmd(today, -1);
+      break;
+    case "week":
+      {
+        const dow = (new Date(toUtc(today)).getUTCDay() + 6) % 7;
+        from = addDaysYmd(today, -dow);
+        to = addDaysYmd(from, 6);
+        break;
+      }
+    case "last7":
+      from = addDaysYmd(today, -6);
+      to = today;
+      break;
+    case "lastmonth":
+      from = addMonthsYmd(monthStartOf(today), -1);
+      to = monthEndOf(from);
+      break;
+    case "pickmonth":
+      {
+        const mm = /^\d{4}-\d{2}$/.test(p.m || "") ? p.m + "-01" : monthStartOf(today);
+        from = mm;
+        to = monthEndOf(mm);
+        break;
+      }
+    case "quarter":
+      {
+        const q = Math.floor((m - 1) / 3) * 3 + 1;
+        from = ymd(y, q, 1);
+        to = monthEndOf(ymd(y, q + 2, 1));
+        break;
+      }
+    case "year":
+      from = ymd(y, 1, 1);
+      to = ymd(y, 12, 31);
+      break;
+    case "pickyear":
+      {
+        const yy = parseInt(p.y, 10) || y;
+        from = ymd(yy, 1, 1);
+        to = ymd(yy, 12, 31);
+        break;
+      }
+    case "fy":
+      {
+        const f = fyStartYear(today);
+        from = ymd(f, 4, 1);
+        to = ymd(f + 1, 3, 31);
+        break;
+      }
+    case "lastfy":
+      {
+        const f = fyStartYear(today) - 1;
+        from = ymd(f, 4, 1);
+        to = ymd(f + 1, 3, 31);
+        break;
+      }
+    case "pickfy":
+      {
+        const f = parseInt(p.fy, 10) || fyStartYear(today);
+        from = ymd(f, 4, 1);
+        to = ymd(f + 1, 3, 31);
+        break;
+      }
+    case "custom":
+      {
+        from = isYmd(p.from) ? p.from : today;
+        to = isYmd(p.to) ? p.to : from;
+        if (to < from) {
+          const t = from;
+          from = to;
+          to = t;
+        }
+        break;
+      }
+    case "all":
+      from = ALL_FROM;
+      to = today;
+      break;
+    default:
+      from = monthStartOf(today);
+      to = monthEndOf(today);
+  }
+  const k = PERIOD_OPTS.some(o => o[0] === p.k) ? p.k : "month";
+  return {
+    k,
+    from,
+    to,
+    label: rangeLabel(from, to, k)
+  };
+};
+const inPeriod = (d, r) => {
+  const s = String(d || "").slice(0, 10);
+  return !!s && s >= r.from && s <= r.to;
+};
+
+/* last choice survives reloads (per browser); never required */
+const PERIOD_KEY = "ddd_period_v1";
+const loadPeriod = () => {
+  try {
+    const v = JSON.parse(window.localStorage.getItem(PERIOD_KEY) || "null");
+    if (v && v.p && PERIOD_OPTS.some(o => o[0] === v.p.k)) return {
+      p: v.p,
+      h: typeof v.h === "string" ? v.h : ""
+    };
+  } catch (e) {}
+  return {
+    p: {
+      k: "month"
+    },
+    h: ""
+  };
+};
+const savePeriod = v => {
+  try {
+    window.localStorage.setItem(PERIOD_KEY, JSON.stringify(v));
+  } catch (e) {}
+};
+const deltaOf = (cur, prev, vs) => {
+  cur = num0(cur);
+  prev = num0(prev);
+  if (!prev && !cur) return null;
+  if (!prev) return {
+    up: true,
+    t: "▲ new vs " + vs
+  };
+  const pct = Math.round((cur - prev) / Math.abs(prev) * 100);
+  return {
+    up: pct >= 0,
+    t: (pct >= 0 ? "▲ " : "▼ ") + Math.abs(pct) + "% vs " + vs
+  };
+};
+const downloadCSV = (name, head, rows) => {
+  const q = v => {
+    const s = v == null ? "" : String(v);
+    return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
+  const text = [head.map(q).join(",")].concat(rows.map(r => r.map(q).join(","))).join("\n");
+  const blob = new Blob(["﻿" + text], {
+    type: "text/csv;charset=utf-8"
+  });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+};
+
+/* rows for export (same RLS data the pages show) */
+const periodPayments = (data, r, hid) => (data.fee_payments || []).filter(f => inPeriod(f.payment_date, r) && (!hid || f.hostel_id === hid)).slice().sort((a, b) => String(a.payment_date).localeCompare(String(b.payment_date)) || String(a.created_at || "").localeCompare(String(b.created_at || "")));
+const periodExpenses = (data, r, hid) => (data.expenses || []).filter(e => inPeriod(e.expense_date, r) && (!hid || e.hostel_id === hid)).slice().sort((a, b) => String(a.expense_date).localeCompare(String(b.expense_date)));
+const paymentsCSV = (ctx, r, hid) => {
+  const {
+    data,
+    hName,
+    uName
+  } = ctx;
+  const stu = id => (data.students || []).find(s => s.id === id) || {};
+  const rows = periodPayments(data, r, hid).map(f => [dmy(f.payment_date), f.receipt_number || "", stu(f.student_id).full_name || "", stu(f.student_id).admission_number || "", hName(f.hostel_id), num0(f.amount), f.mode || "", f.transaction_id || "", uName(f.collected_by || f.created_by)]);
+  downloadCSV("DDD-payments-" + r.from + "-to-" + r.to + ".csv", ["Date", "Receipt", "Student", "Adm No", "Hostel", "Amount", "Mode", "Txn", "Collected by"], rows);
+  return rows.length;
+};
+const expensesCSV = (ctx, r, hid) => {
+  const {
+    data,
+    hName
+  } = ctx;
+  const rows = periodExpenses(data, r, hid).map(e => [dmy(e.expense_date), hName(e.hostel_id), e.category || "", num0(e.amount), e.paid_to || "", e.mode || "", e.status || ""]);
+  downloadCSV("DDD-expenses-" + r.from + "-to-" + r.to + ".csv", ["Date", "Hostel", "Category", "Amount", "Paid To", "Mode", "Status"], rows);
+  return rows.length;
+};
+
+/* ---------- shared filter bar ---------- */
+function PeriodBar({
+  ctx,
+  noHostel,
+  extra
+}) {
+  const {
+    data,
+    per,
+    setPer,
+    perH,
+    setPerH
+  } = ctx;
+  const today = istToday();
+  const r = periodRange(per, today);
+  const set = patch => setPer({
+    ...per,
+    ...patch
+  });
+  const lbl = {
+    fontSize: 12,
+    fontWeight: 700,
+    color: col('mut')
+  };
+  const years = [];
+  for (let y = ymdParts(today)[0] + 1; y >= 2020; y--) years.push(y);
+  const fys = [];
+  for (let f = fyStartYear(today) + 1; f >= 2020; f--) fys.push(f);
+  const hOk = perH && data.hostels.some(h => h.id === perH) ? perH : "";
+  const pick = k => {
+    const p = {
+      k
+    };
+    if (k === "custom") {
+      p.from = r.from === ALL_FROM ? today : r.from;
+      p.to = r.to;
+    }
+    if (k === "pickmonth") p.m = r.from.slice(0, 7);
+    if (k === "pickyear") p.y = ymdParts(r.from)[0];
+    if (k === "pickfy") p.fy = fyStartYear(r.from === ALL_FROM ? today : r.from);
+    setPer(p);
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    className: "card noprint",
+    "data-period-bar": "1",
+    style: {
+      padding: "10px 12px",
+      display: "flex",
+      flexWrap: "wrap",
+      gap: 8,
+      alignItems: "center",
+      marginBottom: 14
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: lbl
+  }, "Period:"), /*#__PURE__*/React.createElement("select", {
+    className: "inp",
+    style: {
+      width: "auto"
+    },
+    value: r.k,
+    onChange: e => pick(e.target.value),
+    "data-period": "1"
+  }, PERIOD_OPTS.map(([k, l]) => /*#__PURE__*/React.createElement("option", {
+    key: k,
+    value: k
+  }, l))), r.k === "pickmonth" ? /*#__PURE__*/React.createElement("input", {
+    className: "inp",
+    type: "month",
+    style: {
+      width: "auto"
+    },
+    value: per.m || r.from.slice(0, 7),
+    onChange: e => e.target.value && set({
+      m: e.target.value
+    }),
+    "data-period-month": "1"
+  }) : null, r.k === "pickyear" ? /*#__PURE__*/React.createElement("select", {
+    className: "inp",
+    style: {
+      width: "auto"
+    },
+    value: String(per.y || ymdParts(r.from)[0]),
+    onChange: e => set({
+      y: parseInt(e.target.value, 10)
+    }),
+    "data-period-year": "1"
+  }, years.map(y => /*#__PURE__*/React.createElement("option", {
+    key: y,
+    value: String(y)
+  }, y))) : null, r.k === "pickfy" ? /*#__PURE__*/React.createElement("select", {
+    className: "inp",
+    style: {
+      width: "auto"
+    },
+    value: String(per.fy || fyStartYear(r.from)),
+    onChange: e => set({
+      fy: parseInt(e.target.value, 10)
+    }),
+    "data-period-fy": "1"
+  }, fys.map(f => /*#__PURE__*/React.createElement("option", {
+    key: f,
+    value: String(f)
+  }, fyLabel(f)))) : null, r.k === "custom" ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("span", {
+    style: lbl
+  }, "From"), /*#__PURE__*/React.createElement("input", {
+    className: "inp",
+    type: "date",
+    style: {
+      width: "auto"
+    },
+    value: r.from,
+    onChange: e => isYmd(e.target.value) && set({
+      from: e.target.value
+    }),
+    "data-period-from": "1"
+  }), /*#__PURE__*/React.createElement("span", {
+    style: lbl
+  }, "To"), /*#__PURE__*/React.createElement("input", {
+    className: "inp",
+    type: "date",
+    style: {
+      width: "auto"
+    },
+    value: r.to,
+    onChange: e => isYmd(e.target.value) && set({
+      to: e.target.value
+    }),
+    "data-period-to": "1"
+  })) : null, !noHostel ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("span", {
+    style: {
+      ...lbl,
+      marginLeft: 6
+    }
+  }, "Hostel:"), /*#__PURE__*/React.createElement("select", {
+    className: "inp",
+    style: {
+      width: "auto"
+    },
+    value: hOk,
+    onChange: e => setPerH(e.target.value),
+    "data-period-hostel": "1"
+  }, /*#__PURE__*/React.createElement("option", {
+    value: ""
+  }, "All Hostels"), data.hostels.map(h => /*#__PURE__*/React.createElement("option", {
+    key: h.id,
+    value: h.id
+  }, h.name)))) : null, /*#__PURE__*/React.createElement("span", {
+    "data-period-label": "1",
+    style: {
+      marginLeft: "auto",
+      fontWeight: 800,
+      background: col('slate'),
+      color: "#fff",
+      borderRadius: 8,
+      padding: "5px 10px",
+      fontSize: 12.5,
+      whiteSpace: "nowrap"
+    }
+  }, "📅 ", r.label), extra);
+}
+
+/* ---------- dashboard card ---------- */
+function DCard({
+  id,
+  label,
+  value,
+  sub,
+  tag,
+  delta,
+  good,
+  tone,
+  onClick
+}) {
+  const dc = delta ? delta.up === (good !== false) ? col('green') : col('red') : null;
+  return /*#__PURE__*/React.createElement("div", {
+    className: onClick ? "card ddd-click" : "card",
+    "data-dcard": id,
+    onClick: onClick,
+    role: onClick ? "button" : undefined,
+    tabIndex: onClick ? 0 : undefined,
+    onKeyDown: onClick ? e => {
+      if (e.key === "Enter") onClick();
+    } : undefined,
+    style: {
+      padding: 14,
+      display: "flex",
+      flexDirection: "column",
+      gap: 6,
+      cursor: onClick ? "pointer" : undefined
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 12,
+      color: col('mut'),
+      fontWeight: 600,
+      display: "flex",
+      flexWrap: "wrap",
+      justifyContent: "space-between",
+      gap: 4,
+      alignItems: "flex-start"
+    }
+  }, /*#__PURE__*/React.createElement("span", null, label), tag ? /*#__PURE__*/React.createElement("span", {
+    "data-dtag": id,
+    style: {
+      fontSize: 10,
+      fontWeight: 700,
+      color: col('mut'),
+      background: "#f1ede4",
+      borderRadius: 6,
+      padding: "1px 6px",
+      whiteSpace: "nowrap"
+    }
+  }, tag) : null), /*#__PURE__*/React.createElement("span", {
+    className: "serif",
+    "data-dval": id,
+    style: {
+      fontSize: 22,
+      fontWeight: 800
+    }
+  }, value), sub ? /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11,
+      color: col('mut')
+    }
+  }, sub) : null, delta ? /*#__PURE__*/React.createElement("span", {
+    "data-delta": id,
+    style: {
+      fontSize: 11.5,
+      fontWeight: 700,
+      color: dc
+    }
+  }, delta.t) : null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      height: 3,
+      borderRadius: 3,
+      background: (tone || col('slate')) + "33",
+      marginTop: "auto"
+    }
+  }));
+}
+const Skel = ({
+  n
+}) => /*#__PURE__*/React.createElement(React.Fragment, null, Array.from({
+  length: n
+}).map((_, i) => /*#__PURE__*/React.createElement("div", {
+  key: i,
+  className: "card",
+  "data-skel": "1",
+  style: {
+    padding: 14,
+    display: "flex",
+    flexDirection: "column",
+    gap: 10
+  }
+}, /*#__PURE__*/React.createElement("div", {
+  className: "ddd-skel",
+  style: {
+    height: 10,
+    width: "55%"
+  }
+}), /*#__PURE__*/React.createElement("div", {
+  className: "ddd-skel",
+  style: {
+    height: 20,
+    width: "75%"
+  }
+}), /*#__PURE__*/React.createElement("div", {
+  className: "ddd-skel",
+  style: {
+    height: 8,
+    width: "40%"
+  }
+}))));
+
+/* ---------- Director: month-wise Income vs Expense vs Salary ---------- */
+const SERIES = [["income", "Income", "#2a78d6"], ["expense", "Expense", "#eb6834"], ["salary", "Salary", "#1baf7a"]];
+function MonthChart({
+  rows
+}) {
+  const [hov, setHov] = useState(null);
+  const [table, setTable] = useState(false);
+  const max = Math.max(1, ...rows.map(r => Math.max(num0(r.income), num0(r.expense), num0(r.salary))));
+  const H = 150;
+  return /*#__PURE__*/React.createElement("div", {
+    "data-month-chart": "1"
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 14,
+      alignItems: "center",
+      flexWrap: "wrap",
+      fontSize: 12,
+      marginBottom: 10
+    }
+  }, SERIES.map(s => /*#__PURE__*/React.createElement("span", {
+    key: s[0],
+    style: {
+      display: "inline-flex",
+      alignItems: "center",
+      gap: 5,
+      color: col('mut'),
+      fontWeight: 600
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      width: 10,
+      height: 10,
+      borderRadius: 2,
+      background: s[2]
+    }
+  }), s[1])), /*#__PURE__*/React.createElement("button", {
+    className: "mini",
+    style: {
+      marginLeft: "auto",
+      background: col('slate')
+    },
+    onClick: () => setTable(t => !t),
+    "data-chart-table": "1"
+  }, table ? "Chart" : "Table")), table ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      overflowX: "auto"
+    }
+  }, /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Month", "Income", "Expense", "Salary", "Net"].map(c => /*#__PURE__*/React.createElement("th", {
+    key: c
+  }, c)))), /*#__PURE__*/React.createElement("tbody", null, rows.map(r => {
+    const net = num0(r.income) - num0(r.expense) - num0(r.salary);
+    return /*#__PURE__*/React.createElement("tr", {
+      key: r.month
+    }, /*#__PURE__*/React.createElement("td", null, monYear(r.month)), /*#__PURE__*/React.createElement("td", null, inr(r.income)), /*#__PURE__*/React.createElement("td", null, inr(r.expense)), /*#__PURE__*/React.createElement("td", null, inr(r.salary)), /*#__PURE__*/React.createElement("td", {
+      style: {
+        fontWeight: 700,
+        color: net >= 0 ? col('green') : col('red')
+      }
+    }, inr(net)));
+  })))) : /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: "relative"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "flex-end",
+      gap: 6,
+      height: H + 22,
+      overflowX: "auto",
+      borderBottom: "1px solid " + col('line')
+    }
+  }, rows.map((r, i) => /*#__PURE__*/React.createElement("div", {
+    key: r.month,
+    onMouseEnter: () => setHov(i),
+    onMouseLeave: () => setHov(null),
+    onClick: () => setHov(h => h === i ? null : i),
+    style: {
+      flex: "1 0 34px",
+      display: "flex",
+      flexDirection: "column",
+      alignItems: "center",
+      gap: 4,
+      cursor: "default",
+      background: hov === i ? "#f4f1ea" : "transparent",
+      borderRadius: 6,
+      paddingTop: 4
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "flex-end",
+      gap: 2,
+      height: H
+    }
+  }, SERIES.map(s => /*#__PURE__*/React.createElement("div", {
+    key: s[0],
+    style: {
+      width: 8,
+      height: Math.max(num0(r[s[0]]) > 0 ? 2 : 0, Math.round(num0(r[s[0]]) / max * H)),
+      background: s[2],
+      borderRadius: "4px 4px 0 0"
+    }
+  }))), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 10,
+      color: col('mut'),
+      whiteSpace: "nowrap"
+    }
+  }, MON3[ymdParts(r.month)[1] - 1])))), hov != null && rows[hov] ? /*#__PURE__*/React.createElement("div", {
+    "data-chart-tip": "1",
+    style: {
+      position: "absolute",
+      top: 0,
+      left: Math.min(70, hov / Math.max(1, rows.length) * 100) + "%",
+      background: "#fff",
+      border: "1px solid " + col('line'),
+      borderRadius: 8,
+      padding: "6px 10px",
+      fontSize: 12,
+      boxShadow: "0 6px 18px #0002",
+      pointerEvents: "none",
+      zIndex: 5
+    }
+  }, /*#__PURE__*/React.createElement("b", null, monYear(rows[hov].month)), SERIES.map(s => /*#__PURE__*/React.createElement("div", {
+    key: s[0],
+    style: {
+      display: "flex",
+      gap: 8,
+      justifyContent: "space-between"
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: col('mut')
+    }
+  }, s[1]), /*#__PURE__*/React.createElement("b", null, inr(rows[hov][s[0]]))))) : null));
+}
+
+/* ---------- printable summary (PDF via browser print) ---------- */
+const printSummary = (sum, r, hostelName, dir) => {
+  const w = window.open("", "_blank", "width=720,height=900");
+  if (!w) {
+    alert("Popup block hua — browser mein popups allow karein");
+    return;
+  }
+  const c = sum.cur,
+    s = sum.snap;
+  const R = (l, v) => "<tr><td>" + esc(l) + "</td><td style='text-align:right'><b>" + esc(v) + "</b></td></tr>";
+  const rows = [["Fee Collected", inr(c.collected)], ["Payments", String(c.payments)], ["Refunds", inr(c.refunds)], ["Fee Billed", inr(c.billed)], ["Collection %", c.collection_pct == null ? "—" : c.collection_pct + "%"]].concat(dir ? [["Expense (approved)", inr(c.expense)], ["Salary Paid", inr(c.salary_paid)], ["Net Profit", inr(c.net_profit)]] : []).concat([["New Admissions", String(c.admissions)], ["Students Left", String(c.left)], ["Complaints opened / closed", c.complaints_opened + " / " + c.complaints_closed]]);
+  const snap = [["Students (active)", String(s.students)], ["Occupied / Total beds", s.occupied + " / " + s.beds], ["Vacant beds", String(s.vacant)], ["Pending fees", inr(s.pending)], ["Overdue / Due / Due in 7 days", s.overdue + " / " + s.due + " / " + s.soon]].concat(dir ? [["Salary payable", inr(s.salary_payable)]] : []).concat([["Open complaints", String(s.complaints_open)]]);
+  const hostTable = dir && (sum.hostels || []).length ? "<h3>Hostel-wise</h3><table><tr><th>Hostel</th><th>Students</th><th>Billed</th><th>Collected</th><th>Pending</th><th>Occ%</th></tr>" + sum.hostels.map(h => "<tr><td>" + esc(h.name) + "</td><td>" + h.students + "</td><td>" + inr(h.billed) + "</td><td>" + inr(h.collected) + "</td><td>" + inr(h.pending) + "</td><td>" + (h.beds ? Math.round(h.occupied / h.beds * 100) : 0) + "%</td></tr>").join("") + "</table>" : "";
+  w.document.write("<html><head><title>DDD Report " + esc(r.label) + "</title><style>body{font-family:Georgia,serif;padding:24px;color:#1f2630}h2{margin:0}h3{margin:18px 0 6px}table{border-collapse:collapse;width:100%;font-size:13px}td,th{border-bottom:1px solid #ddd;padding:6px 8px;text-align:left}.m{color:#777;font-size:12px}</style></head><body>" + "<h2>DDD Hostel — Report</h2><div class='m'>Period: <b>" + esc(r.label) + "</b> (" + esc(dmy(r.from === ALL_FROM ? "" : r.from) || "start") + " to " + esc(dmy(r.to)) + ") · Hostel: <b>" + esc(hostelName) + "</b></div>" + "<h3>Period</h3><table>" + rows.map(x => R(x[0], x[1])).join("") + "</table>" + "<h3>As of " + esc(dmy(s.asof)) + "</h3><table>" + snap.map(x => R(x[0], x[1])).join("") + "</table>" + hostTable + "<div class='m' style='margin-top:18px;text-align:center'>Computer generated · " + esc(new Date().toLocaleString("en-IN", {
+    timeZone: "Asia/Kolkata"
+  })) + " IST</div></body></html>");
+  w.document.close();
+  w.focus();
+  setTimeout(() => {
+    try {
+      w.print();
+    } catch (e) {}
+  }, 300);
+};
+
+/* ---------- DASHBOARD ---------- */
+function DashboardPage({
+  ctx
+}) {
+  const {
+    data,
+    role,
+    go,
+    per,
+    perH,
+    hName,
+    uName,
+    allowed
+  } = ctx;
+  const dir = role === "director";
+  const today = istToday();
+  const r = periodRange(per, today);
+  const hid = perH && data.hostels.some(h => h.id === perH) ? perH : "";
+  const key = r.from + "|" + r.to + "|" + hid;
+  const [st, setSt] = useState({
+    key: "",
+    sum: null,
+    err: "",
+    loading: true
+  });
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    let alive = true;
+    setSt(s => ({
+      ...s,
+      loading: true,
+      err: ""
+    }));
+    Promise.resolve(SB.rpc("dashboard_summary", {
+      p_from: r.from,
+      p_to: r.to,
+      p_hostel: hid || null
+    })).then(res => {
+      if (!alive) return;
+      if (res.error) setSt({
+        key,
+        sum: null,
+        err: res.error.message || String(res.error),
+        loading: false
+      });else setSt({
+        key,
+        sum: res.data,
+        err: "",
+        loading: false
+      });
+    }, e => {
+      if (alive) setSt({
+        key,
+        sum: null,
+        err: String(e && e.message || e),
+        loading: false
+      });
+    });
+    return () => {
+      alive = false;
+    };
+  }, [key, data, tick]);
+  const sum = st.key === key ? st.sum : null;
+  const nav = (pg, f) => (allowed || []).includes(pg) ? () => go(pg, {
+    ...(f || {}),
+    hostel: hid
+  }) : undefined;
+  const grid = {
+    display: "grid",
+    gap: 12,
+    gridTemplateColumns: "repeat(auto-fill,minmax(165px,1fr))"
+  };
+  const hostelName = hid ? (data.hostels.find(h => h.id === hid) || {}).name || hName(hid) : "All Hostels";
+  const exp = /*#__PURE__*/React.createElement("span", {
+    style: {
+      display: "inline-flex",
+      gap: 6,
+      flexWrap: "wrap"
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "mini",
+    style: {
+      background: col('gold'),
+      color: col('ink')
+    },
+    disabled: !sum,
+    onClick: () => sum && printSummary(sum, r, hostelName, dir),
+    "data-export": "pdf"
+  }, "⬇ PDF summary"), /*#__PURE__*/React.createElement("button", {
+    className: "mini",
+    style: {
+      background: col('green')
+    },
+    onClick: () => paymentsCSV(ctx, r, hid),
+    "data-export": "payments"
+  }, "⬇ Payments CSV"), dir ? /*#__PURE__*/React.createElement("button", {
+    className: "mini",
+    style: {
+      background: col('red')
+    },
+    onClick: () => expensesCSV(ctx, r, hid),
+    "data-export": "expenses"
+  }, "⬇ Expenses CSV") : null);
+  let body;
+  if (st.err && !sum) {
+    const missing = /dashboard_summary|schema cache|does not exist|Could not find/i.test(st.err);
+    body = /*#__PURE__*/React.createElement("div", {
+      className: "card",
+      "data-dash-error": "1",
+      style: {
+        padding: 18,
+        borderLeft: "4px solid " + col('red')
+      }
+    }, /*#__PURE__*/React.createElement("b", {
+      style: {
+        color: col('red')
+      }
+    }, "⚠ Dashboard numbers load nahi hue"), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 13,
+        margin: "8px 0"
+      }
+    }, missing ? "Database mein 020 (dashboard_summary) abhi nahi chala. Pehle Supabase SQL Editor mein 020_dashboard_summary.sql chalayein." : "Internet / server error. Dobara try karein."), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 11.5,
+        color: col('mut'),
+        wordBreak: "break-word"
+      }
+    }, st.err), /*#__PURE__*/React.createElement("button", {
+      className: "mini",
+      style: {
+        background: col('slate'),
+        marginTop: 10
+      },
+      onClick: () => setTick(t => t + 1),
+      "data-retry": "1"
+    }, "⟳ Retry"));
+  } else if (!sum) {
+    body = /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+      style: grid
+    }, /*#__PURE__*/React.createElement(Skel, {
+      n: dir ? 9 : 6
+    })), /*#__PURE__*/React.createElement("div", {
+      style: grid
+    }, /*#__PURE__*/React.createElement(Skel, {
+      n: dir ? 6 : 5
+    })));
+  } else {
+    const c = sum.cur || {},
+      p = sum.prev || {},
+      s = sum.snap || {};
+    const cmp = r.k !== "all";
+    const vs = vsLabel(sum.prev_from, sum.prev_to);
+    const d = (a, b) => cmp ? deltaOf(a, b, vs) : null;
+    const tagS = "as of " + dmy(s.asof);
+    const tagShort = "as of " + (String(s.asof).slice(0, 4) === today.slice(0, 4) ? dmy(s.asof).slice(0, 5) : dmy(s.asof));
+    const single = isWholeMonths(r.from, r.to) && r.from === r.to.slice(0, 8) + "01";
+    const periodCards = [{
+      id: "collected",
+      label: "Fee Collected",
+      value: inr(c.collected),
+      sub: num0(c.refunds) > 0 ? c.payments + " payments · refunds " + inr(c.refunds) : c.payments + " payments",
+      delta: d(c.collected, p.collected),
+      tone: col('green'),
+      onClick: nav("fees", {
+        tab: "collected"
+      })
+    }, {
+      id: "billed",
+      label: "Fee Billed",
+      value: inr(c.billed),
+      sub: "dues of months in period",
+      tone: col('steel'),
+      onClick: nav("fees", {
+        tab: "ledger",
+        month: single ? r.from.slice(0, 7) : ""
+      })
+    }, {
+      id: "pct",
+      label: "Collection %",
+      value: c.collection_pct == null ? "—" : c.collection_pct + "%",
+      sub: "collected ÷ billed",
+      tone: col('gold'),
+      onClick: nav("fees", {
+        tab: "collected"
+      })
+    }].concat(dir ? [{
+      id: "expense",
+      label: "Expense (approved)",
+      value: inr(c.expense),
+      delta: d(c.expense, p.expense),
+      good: false,
+      tone: col('red'),
+      onClick: nav("expenses")
+    }, {
+      id: "salpaid",
+      label: "Salary Paid",
+      value: inr(c.salary_paid),
+      tone: col('steel'),
+      onClick: nav("salary", {
+        sf: "paid"
+      })
+    }, {
+      id: "profit",
+      label: "Net Profit",
+      value: inr(c.net_profit),
+      sub: "Collected − Expense − Salary",
+      delta: d(c.net_profit, p.net_profit),
+      tone: col('gold'),
+      onClick: nav("reports")
+    }] : []).concat([{
+      id: "adm",
+      label: "New Admissions",
+      value: c.admissions,
+      delta: d(c.admissions, p.admissions),
+      tone: col('green'),
+      onClick: nav("students", {
+        pj: "join"
+      })
+    }, {
+      id: "left",
+      label: "Students Left",
+      value: c.left,
+      tone: col('red'),
+      onClick: nav("students", {
+        pj: "left"
+      })
+    }, {
+      id: "comp",
+      label: "Complaints",
+      value: c.complaints_opened + " opened",
+      sub: c.complaints_closed + " closed",
+      tone: col('amber'),
+      onClick: nav("complaints")
+    }]);
+    const snapCards = (hid ? [] : [{
+      id: "hostels",
+      label: "Total Hostels",
+      value: data.hostels.length,
+      tone: col('slate'),
+      onClick: nav("hostels")
+    }]).concat([{
+      id: "students",
+      label: "Students (active)",
+      value: s.students,
+      sub: s.missing ? s.missing + " joining date/fee missing" : null,
+      tone: col('steel'),
+      onClick: nav("students")
+    }, {
+      id: "occ",
+      label: "Occupied Beds",
+      value: s.occupied + "/" + s.beds,
+      sub: (s.beds ? Math.round(s.occupied / s.beds * 100) : 0) + "% full",
+      tone: col('green'),
+      onClick: nav("rooms")
+    }, {
+      id: "vac",
+      label: "Vacant Beds",
+      value: s.vacant,
+      tone: col('amber'),
+      onClick: nav("rooms", {
+        vacant: true
+      })
+    }, {
+      id: "pending",
+      label: "Pending Fees",
+      value: inr(s.pending),
+      sub: s.overdue + " overdue · " + s.due + " due · " + s.soon + " due in 7 days",
+      tone: col('red'),
+      onClick: nav("fees", {
+        sf: "overdue"
+      })
+    }]).concat(dir ? [{
+      id: "salpay",
+      label: "Salary Payable",
+      value: inr(s.salary_payable),
+      sub: monLabel(s.salary_month) + " · " + num0(s.salary_pending_staff) + " staff pending",
+      tone: col('steel'),
+      onClick: nav("salary", {
+        sf: "pending",
+        month: s.salary_month
+      })
+    }] : []).concat([{
+      id: "copen",
+      label: "Open Complaints",
+      value: s.complaints_open,
+      tone: col('amber'),
+      onClick: nav("complaints", {
+        comp: "open"
+      })
+    }]);
+    const catMap = {};
+    if (dir) periodExpenses(data, r, hid).filter(e => e.status === "approved").forEach(e => {
+      catMap[e.category || "Other"] = (catMap[e.category || "Other"] || 0) + num0(e.amount);
+    });
+    const cats = Object.entries(catMap).sort((a, b) => b[1] - a[1]);
+    const modes = sum.modes || [];
+    const modeTot = modes.reduce((a, m) => a + num0(m.amount), 0);
+    const day = sum.day;
+    const byWho = {};
+    (day || []).forEach(x => {
+      const k = x.by_name || (x.by_id ? uName(x.by_id) : "—");
+      byWho[k] = (byWho[k] || 0) + num0(x.amount);
+    });
+    const secTitle = t => /*#__PURE__*/React.createElement("b", {
+      className: "serif",
+      style: {
+        fontSize: 15
+      }
+    }, t);
+    body = /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 12,
+        fontWeight: 800,
+        color: col('mut'),
+        letterSpacing: .4
+      },
+      "data-sec": "period"
+    }, "PERIOD · ", r.label, cmp ? /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontWeight: 600
+      }
+    }, " (compare: ", rangeLabel(sum.prev_from, sum.prev_to), ")") : null), /*#__PURE__*/React.createElement("div", {
+      style: grid
+    }, periodCards.map(x => /*#__PURE__*/React.createElement(DCard, {
+      key: x.id,
+      ...x,
+      tag: r.label
+    }))), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 12,
+        fontWeight: 800,
+        color: col('mut'),
+        letterSpacing: .4
+      },
+      "data-sec": "snapshot"
+    }, "SNAPSHOT · ", tagS), /*#__PURE__*/React.createElement("div", {
+      style: grid
+    }, snapCards.map(x => /*#__PURE__*/React.createElement(DCard, {
+      key: x.id,
+      ...x,
+      tag: x.id === "hostels" ? null : tagShort
+    }))), day ? /*#__PURE__*/React.createElement("div", {
+      className: "card",
+      style: {
+        padding: 16
+      },
+      "data-day-list": "1"
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        flexWrap: "wrap",
+        gap: 10,
+        alignItems: "baseline"
+      }
+    }, secTitle("Collection — " + dmy(r.from)), /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontSize: 13,
+        color: col('mut')
+      }
+    }, /*#__PURE__*/React.createElement("b", {
+      style: {
+        color: col('green')
+      }
+    }, inr(c.collected)), " · ", day.length, " payments")), Object.keys(byWho).length ? /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        flexWrap: "wrap",
+        gap: 8,
+        margin: "10px 0"
+      },
+      "data-by-who": "1"
+    }, Object.entries(byWho).map(([k, v]) => /*#__PURE__*/React.createElement("span", {
+      key: k,
+      className: "badge",
+      style: {
+        background: "#f1ede4",
+        color: col('ink')
+      }
+    }, k, ": ", /*#__PURE__*/React.createElement("b", null, inr(v))))) : null, /*#__PURE__*/React.createElement("div", {
+      style: {
+        overflowX: "auto"
+      }
+    }, /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Time", "Student", "Hostel", "Amount", "Mode", "Receipt", "Collected by"].map(h => /*#__PURE__*/React.createElement("th", {
+      key: h
+    }, h)))), /*#__PURE__*/React.createElement("tbody", null, day.map(x => /*#__PURE__*/React.createElement("tr", {
+      key: x.id
+    }, /*#__PURE__*/React.createElement("td", null, x.created_at ? new Date(x.created_at).toLocaleTimeString("en-IN", {
+      timeZone: "Asia/Kolkata",
+      hour: "2-digit",
+      minute: "2-digit"
+    }) : "—"), /*#__PURE__*/React.createElement("td", null, x.student_id ? /*#__PURE__*/React.createElement(ctx.NameBtn, {
+      name: x.student || "—",
+      sid: x.student_id
+    }) : x.student || "—"), /*#__PURE__*/React.createElement("td", null, hName(x.hostel_id)), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("b", null, inr(x.amount))), /*#__PURE__*/React.createElement("td", null, String(x.mode || "—").toUpperCase()), /*#__PURE__*/React.createElement("td", null, x.receipt_number || "—"), /*#__PURE__*/React.createElement("td", null, x.by_name || (x.by_id ? uName(x.by_id) : "—")))), !day.length ? /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
+      colSpan: "7"
+    }, "Is din koi payment nahi.")) : null)))) : /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 12,
+        color: col('mut')
+      }
+    }, "Tip: kisi ek din ki collection list (kisne kitna jama kiya) ke liye Period mein \"Today\", \"Yesterday\" ya Custom mein same From/To date chunein."), dir ? /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "grid",
+        gap: 14,
+        gridTemplateColumns: "repeat(auto-fit,minmax(300px,1fr))"
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "card",
+      style: {
+        padding: 18,
+        gridColumn: "1 / -1"
+      }
+    }, secTitle("Income vs Expense (month-wise)"), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 11.5,
+        color: col('mut'),
+        margin: "2px 0 12px"
+      }
+    }, (sum.monthly || []).length ? monYear(sum.monthly[0].month) + " – " + monYear(sum.monthly[sum.monthly.length - 1].month) : "", " · Income = fee collected · Salary = salary paid"), /*#__PURE__*/React.createElement(MonthChart, {
+      rows: sum.monthly || []
+    })), /*#__PURE__*/React.createElement("div", {
+      className: "card",
+      style: {
+        padding: 18
+      },
+      "data-mode-split": "1"
+    }, secTitle("Payment mode — " + r.label), /*#__PURE__*/React.createElement("div", {
+      style: {
+        marginTop: 14
+      }
+    }, modes.length ? modes.map(m => {
+      const pct = modeTot ? Math.round(num0(m.amount) / modeTot * 100) : 0;
+      return /*#__PURE__*/React.createElement("div", {
+        key: m.mode,
+        style: {
+          marginBottom: 10
+        },
+        "data-mode": m.mode
+      }, /*#__PURE__*/React.createElement("div", {
+        style: {
+          display: "flex",
+          justifyContent: "space-between",
+          fontSize: 12.5
+        }
+      }, /*#__PURE__*/React.createElement("b", null, String(m.mode).toUpperCase()), /*#__PURE__*/React.createElement("span", null, inr(m.amount), " · ", pct, "% · ", m.count)), /*#__PURE__*/React.createElement("div", {
+        style: {
+          height: 8,
+          background: col('line'),
+          borderRadius: 99,
+          marginTop: 4,
+          overflow: "hidden"
+        }
+      }, /*#__PURE__*/React.createElement("div", {
+        style: {
+          width: pct + "%",
+          height: "100%",
+          background: "#2a78d6",
+          borderRadius: 99
+        }
+      })));
+    }) : /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: col('mut'),
+        fontSize: 13
+      }
+    }, "Is period mein koi payment nahi."))), /*#__PURE__*/React.createElement("div", {
+      className: "card",
+      style: {
+        padding: 18
+      }
+    }, secTitle("Expense by Category — " + r.label), /*#__PURE__*/React.createElement("div", {
+      style: {
+        marginTop: 14
+      }
+    }, cats.length ? /*#__PURE__*/React.createElement(Bars, {
+      data: cats.map(([k, v]) => ({
+        k,
+        v,
+        label: inr(v),
+        c: col('gold')
+      }))
+    }) : /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: col('mut'),
+        fontSize: 13
+      }
+    }, "Is period mein approved expense nahi."))), /*#__PURE__*/React.createElement("div", {
+      className: "card",
+      style: {
+        padding: 18,
+        gridColumn: "1 / -1",
+        overflowX: "auto"
+      },
+      "data-hostel-table": "1"
+    }, secTitle("Hostel-wise — " + r.label), /*#__PURE__*/React.createElement("table", {
+      style: {
+        marginTop: 10
+      }
+    }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Hostel", "Students", "Billed", "Collected", "Pending (" + tagS + ")", "Occupancy"].map(h => /*#__PURE__*/React.createElement("th", {
+      key: h
+    }, h)))), /*#__PURE__*/React.createElement("tbody", null, (sum.hostels || []).map(h => /*#__PURE__*/React.createElement("tr", {
+      key: h.id,
+      "data-hrow": h.code
+    }, /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("b", null, h.name), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 11,
+        color: col('mut')
+      }
+    }, h.code)), /*#__PURE__*/React.createElement("td", null, h.students), /*#__PURE__*/React.createElement("td", null, inr(h.billed)), /*#__PURE__*/React.createElement("td", {
+      style: {
+        color: col('green')
+      }
+    }, inr(h.collected)), /*#__PURE__*/React.createElement("td", {
+      style: {
+        color: num0(h.pending) > 0 ? col('red') : col('green')
+      }
+    }, num0(h.pending) > 0 ? inr(h.pending) : "—"), /*#__PURE__*/React.createElement("td", null, h.occupied, "/", h.beds, " · ", h.beds ? Math.round(h.occupied / h.beds * 100) : 0, "%"))))))) : null);
+  }
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      gap: 14
+    },
+    "data-dashboard": "1"
+  }, /*#__PURE__*/React.createElement(PeriodBar, {
+    ctx: ctx,
+    extra: exp
+  }), st.loading && sum ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11.5,
+      color: col('mut')
+    }
+  }, "Updating…") : null, body);
+}
+
+/* ---------- Fees → Collected tab (payments in the period) ---------- */
+function FeesCollected({
+  ctx
+}) {
+  const {
+    data,
+    hName,
+    uName,
+    hf,
+    NameBtn
+  } = ctx;
+  const r = periodRange(ctx.per, istToday());
+  const rows = periodPayments(data, r, hf).slice().reverse();
+  const tot = rows.reduce((a, f) => a + num0(f.amount), 0);
+  const modes = {};
+  rows.forEach(f => {
+    const k = String(f.mode || "other").toLowerCase();
+    modes[k] = (modes[k] || 0) + num0(f.amount);
+  });
+  const stu = id => data.students.find(s => s.id === id) || {};
+  return /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(PeriodBar, {
+    ctx: ctx,
+    noHostel: true,
+    extra: /*#__PURE__*/React.createElement("button", {
+      className: "mini",
+      style: {
+        background: col('green')
+      },
+      onClick: () => paymentsCSV(ctx, r, hf),
+      "data-export": "fees-payments"
+    }, "⬇ CSV")
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      flexWrap: "wrap",
+      gap: 8,
+      marginBottom: 12,
+      alignItems: "center"
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "badge",
+    style: {
+      background: "#e6f4ec",
+      color: col('green'),
+      fontSize: 13
+    },
+    "data-collected-total": "1"
+  }, "Collected ", r.label, ": ", /*#__PURE__*/React.createElement("b", null, inr(tot)), " · ", rows.length, " payments"), Object.entries(modes).map(([k, v]) => /*#__PURE__*/React.createElement("span", {
+    key: k,
+    className: "badge",
+    style: {
+      background: "#f1ede4",
+      color: col('ink')
+    }
+  }, k.toUpperCase(), " ", inr(v)))), /*#__PURE__*/React.createElement("div", {
+    className: "card",
+    style: {
+      overflowX: "auto"
+    }
+  }, /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Date", "Receipt", "Student", "Hostel", "Amount", "Mode", "Collected by"].map(c => /*#__PURE__*/React.createElement("th", {
+    key: c
+  }, c)))), /*#__PURE__*/React.createElement("tbody", null, rows.map(f => /*#__PURE__*/React.createElement("tr", {
+    key: f.id,
+    "data-pay-row": f.id
+  }, /*#__PURE__*/React.createElement("td", null, dmy(f.payment_date)), /*#__PURE__*/React.createElement("td", null, f.receipt_number || "—"), /*#__PURE__*/React.createElement("td", null, f.student_id ? /*#__PURE__*/React.createElement(NameBtn, {
+    name: stu(f.student_id).full_name || "—",
+    sid: f.student_id
+  }) : "—"), /*#__PURE__*/React.createElement("td", null, hName(f.hostel_id)), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("b", null, inr(f.amount))), /*#__PURE__*/React.createElement("td", null, String(f.mode || "—").toUpperCase()), /*#__PURE__*/React.createElement("td", null, uName(f.collected_by || f.created_by)))), !rows.length ? /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
+    colSpan: "7"
+  }, "Is period mein koi payment nahi.")) : null))));
+}
+
+/* ---------- Expenses (period + hostel) ---------- */
+function ExpensesPage({
+  ctx
+}) {
+  const {
+    data,
+    role,
+    hName,
+    Header,
+    EditDel,
+    save,
+    perH
+  } = ctx;
+  const dir = role === "director";
+  const r = periodRange(ctx.per, istToday());
+  const hid = perH && data.hostels.some(h => h.id === perH) ? perH : "";
+  const rows = periodExpenses(data, r, hid).slice().reverse();
+  const appr = rows.filter(e => e.status === "approved").reduce((a, e) => a + num0(e.amount), 0);
+  const pend = rows.filter(e => e.status === "pending").length;
+  return /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(Header, {
+    entity: "expenses"
+  }), /*#__PURE__*/React.createElement(PeriodBar, {
+    ctx: ctx,
+    extra: dir ? /*#__PURE__*/React.createElement("button", {
+      className: "mini",
+      style: {
+        background: col('red')
+      },
+      onClick: () => expensesCSV(ctx, r, hid),
+      "data-export": "exp-page"
+    }, "⬇ CSV") : null
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      flexWrap: "wrap",
+      gap: 8,
+      marginBottom: 12
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "badge",
+    style: {
+      background: "#f1ede4",
+      color: col('ink')
+    },
+    "data-exp-count": "1"
+  }, rows.length, " expenses · ", r.label), dir ? /*#__PURE__*/React.createElement("span", {
+    className: "badge",
+    style: {
+      background: "#fbe9e7",
+      color: col('red')
+    },
+    "data-exp-total": "1"
+  }, "Approved total: ", /*#__PURE__*/React.createElement("b", null, inr(appr))) : null, pend ? /*#__PURE__*/React.createElement("span", {
+    className: "badge",
+    style: {
+      background: "#fdf4e0",
+      color: col('amber')
+    }
+  }, pend, " pending approval") : null), /*#__PURE__*/React.createElement("div", {
+    className: "card",
+    style: {
+      overflowX: "auto"
+    }
+  }, /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Hostel", "Date", "Category", "Amount", "Paid To", "Status", "Action"].map(c => /*#__PURE__*/React.createElement("th", {
+    key: c
+  }, c)))), /*#__PURE__*/React.createElement("tbody", null, rows.map(e => {
+    const tone = e.status === "approved" ? 'green' : e.status === "rejected" ? 'red' : 'amber';
+    return /*#__PURE__*/React.createElement("tr", {
+      key: e.id,
+      "data-exp-row": e.id
+    }, /*#__PURE__*/React.createElement("td", null, hName(e.hostel_id)), /*#__PURE__*/React.createElement("td", null, dmy(e.expense_date)), /*#__PURE__*/React.createElement("td", null, e.category), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("b", null, inr(e.amount))), /*#__PURE__*/React.createElement("td", null, e.paid_to), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement(Badge, {
+      c: col(tone),
+      bg: col(tone) + "1c"
+    }, e.status)), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("span", {
+      style: {
+        display: "inline-flex",
+        gap: 4,
+        alignItems: "center"
+      }
+    }, e.status === "pending" && dir ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("button", {
+      className: "mini",
+      style: {
+        background: col('green')
+      },
+      onClick: () => save("expenses", {
+        id: e.id,
+        status: "approved"
+      })
+    }, "Approve"), /*#__PURE__*/React.createElement("button", {
+      className: "mini",
+      style: {
+        background: col('red')
+      },
+      onClick: () => save("expenses", {
+        id: e.id,
+        status: "rejected"
+      })
+    }, "Reject")) : null, /*#__PURE__*/React.createElement(EditDel, {
+      entity: "expenses",
+      item: e
+    }))));
+  }), !rows.length ? /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
+    colSpan: "7"
+  }, data.expenses.length ? "Is period / hostel mein koi expense nahi." : "No expenses yet.")) : null))));
+}
+
+/* ---------- Reports (period + hostel) ---------- */
+function ReportsPage({
+  ctx
+}) {
+  const {
+    data,
+    role,
+    perH
+  } = ctx;
+  const dir = role === "director";
+  const r = periodRange(ctx.per, istToday());
+  const hid = perH && data.hostels.some(h => h.id === perH) ? perH : "";
+  const hostels = hid ? data.hostels.filter(h => h.id === hid) : data.hostels;
+  const pendAll = billablePending(data);
+  const rows = hostels.map(h => {
+    const beds = data.beds.filter(b => b.hostel_id === h.id);
+    const occ = beds.filter(b => b.bed_status === "occupied").length;
+    const income = periodPayments(data, r, h.id).reduce((a, f) => a + num0(f.amount), 0);
+    const expense = periodExpenses(data, r, h.id).filter(e => e.status === "approved").reduce((a, e) => a + num0(e.amount), 0);
+    const pending = pendAll.filter(d => d.hostel_id === h.id).reduce((a, d) => a + num0(d.pending), 0);
+    const staffCost = dir ? (data.staff_salary_profile || []).filter(p => data.employees.some(e => e.id === p.employee_id && e.hostel_id === h.id && e.status !== "left")).reduce((a, p) => a + num0(p.monthly_salary), 0) : 0;
+    return {
+      name: h.name,
+      code: h.code,
+      beds: beds.length,
+      occ,
+      vacant: beds.length - occ,
+      occPct: beds.length ? Math.round(occ / beds.length * 100) : 0,
+      income,
+      expense,
+      profit: income - expense,
+      pending,
+      staffCost
+    };
+  });
+  const tot = rows.reduce((a, x) => ({
+    beds: a.beds + x.beds,
+    occ: a.occ + x.occ,
+    income: a.income + x.income,
+    expense: a.expense + x.expense,
+    profit: a.profit + x.profit,
+    pending: a.pending + x.pending,
+    staffCost: a.staffCost + x.staffCost
+  }), {
+    beds: 0,
+    occ: 0,
+    income: 0,
+    expense: 0,
+    profit: 0,
+    pending: 0,
+    staffCost: 0
+  });
+  const cols = [["Hostel"], ["Beds"], ["Occ"], ["Vacant"], ["Occ%"], ["Income"]].concat(dir ? [["Expense"], ["Profit/Loss"]] : []).concat([["Pending"]]).concat(dir ? [["Staff Cost"]] : []);
+  const exportCSV = () => {
+    const head = ["Hostel", "Code", "Beds", "Occupied", "Vacant", "Occupancy%", "Income"].concat(dir ? ["Expense", "ProfitLoss"] : []).concat(["PendingFees"]).concat(dir ? ["StaffCost"] : []);
+    downloadCSV("DDD-report-" + r.from + "-to-" + r.to + ".csv", head, rows.map(x => [x.name, x.code, x.beds, x.occ, x.vacant, x.occPct, x.income].concat(dir ? [x.expense, x.profit] : []).concat([x.pending]).concat(dir ? [x.staffCost] : [])));
+  };
+  const cells = x => [/*#__PURE__*/React.createElement("td", {
+    key: "n"
+  }, /*#__PURE__*/React.createElement("b", null, x.name), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: col('mut')
+    }
+  }, x.code)), /*#__PURE__*/React.createElement("td", {
+    key: "b"
+  }, x.beds), /*#__PURE__*/React.createElement("td", {
+    key: "o"
+  }, x.occ), /*#__PURE__*/React.createElement("td", {
+    key: "v"
+  }, x.beds - x.occ), /*#__PURE__*/React.createElement("td", {
+    key: "p"
+  }, x.beds ? Math.round(x.occ / x.beds * 100) : 0, "%"), /*#__PURE__*/React.createElement("td", {
+    key: "i",
+    style: {
+      color: col('green')
+    }
+  }, inr(x.income))].concat(dir ? [/*#__PURE__*/React.createElement("td", {
+    key: "e",
+    style: {
+      color: col('red')
+    }
+  }, inr(x.expense)), /*#__PURE__*/React.createElement("td", {
+    key: "pl",
+    style: {
+      fontWeight: 700,
+      color: x.profit >= 0 ? col('green') : col('red')
+    }
+  }, inr(x.profit))] : []).concat([/*#__PURE__*/React.createElement("td", {
+    key: "pe",
+    style: {
+      color: x.pending > 0 ? col('red') : col('green')
+    }
+  }, x.pending > 0 ? inr(x.pending) : "—")]).concat(dir ? [/*#__PURE__*/React.createElement("td", {
+    key: "s"
+  }, inr(x.staffCost))] : []);
+  return /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(PeriodBar, {
+    ctx: ctx,
+    extra: /*#__PURE__*/React.createElement("span", {
+      style: {
+        display: "inline-flex",
+        gap: 6
+      }
+    }, /*#__PURE__*/React.createElement("button", {
+      className: "mini",
+      style: {
+        background: col('green')
+      },
+      onClick: exportCSV,
+      "data-export": "report"
+    }, "⬇ Excel (CSV)"), /*#__PURE__*/React.createElement("button", {
+      className: "mini",
+      style: {
+        background: col('gold'),
+        color: col('ink')
+      },
+      onClick: () => window.print()
+    }, "🖨 Print / PDF"))
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: col('mut'),
+      marginBottom: 8
+    }
+  }, "Income", dir ? " / Expense" : "", " = ", r.label, " · Pending & beds = aaj tak (as of ", dmy(istToday()), ")"), /*#__PURE__*/React.createElement("div", {
+    className: "card",
+    style: {
+      overflowX: "auto"
+    }
+  }, /*#__PURE__*/React.createElement("table", {
+    "data-report": "1"
+  }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, cols.map(c => /*#__PURE__*/React.createElement("th", {
+    key: c[0]
+  }, c[0])))), /*#__PURE__*/React.createElement("tbody", null, rows.map((x, i) => /*#__PURE__*/React.createElement("tr", {
+    key: i
+  }, cells(x))), rows.length ? /*#__PURE__*/React.createElement("tr", {
+    style: {
+      fontWeight: 800,
+      borderTop: "2px solid " + col('line')
+    },
+    "data-report-total": "1"
+  }, cells({
+    ...tot,
+    name: "TOTAL",
+    code: ""
+  })) : null, !rows.length ? /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
+    colSpan: cols.length
+  }, "No hostels.")) : null))));
+}
+
 function App() {
   const [session, setSession] = useState(null);
   const [profile, setProfile] = useState(null);
@@ -5325,6 +6883,11 @@ function App() {
   const [salH, setSalH] = useState("");
   const [salSf, setSalSf] = useState("all");
   const [salModal, setSalModal] = useState(null);
+  // 020: period + hostel filter shared by Dashboard / Reports / Expenses / Fees (kept in App, remembered per browser)
+  const [perSt, setPerSt] = useState(loadPeriod);
+  const setPer = p => setPerSt(s => { const n = { ...s, p: p }; savePeriod(n); return n; });
+  const setPerH = h => setPerSt(s => { const n = { ...s, h: h || "" }; savePeriod(n); return n; });
+  const [feeTab, setFeeTab] = useState("students");
   FEE_GRACE = feeGrace;
   // open a page with a filter (Bell alerts + Dashboard cards)
   const go = (pg, f) => {
@@ -5335,6 +6898,9 @@ function App() {
     if (pg === "complaints") setCompF(f.comp || "");
     if (pg === "staff") setStaffF(f.staff || "");
     if (pg === "salary") { setSalSf(f.sf || "all"); if (f.month) setSalMonth(f.month); }
+    if (pg === "fees") { setFeeTab(f.tab || "students"); if (f.hostel !== undefined) setHf(f.hostel || ""); if (f.month !== undefined) setMf(f.month || ""); }
+    if (pg === "students") setStuF(p => ({ ...p, pj: f.pj || "", ...(f.pj ? { st: "", q: "", r: "" } : {}), ...(f.hostel ? { h: [f.hostel], r: "" } : {}) }));
+    if ((pg === "expenses" || pg === "reports") && f.hostel !== undefined) setPerH(f.hostel || "");
     setPage(pg);
     setOpen(false);
     try { window.scrollTo(0, 0); } catch (e) {}
@@ -6027,80 +7593,7 @@ function App() {
     }
   }, "\uD83D\uDDD1"));
   const Pages = {
-    dashboard: () => {
-      const k = [["Total Hostels", D.hostels, null, 'slate', "hostels"], ["Students", D.students, D.missing ? D.missing + " joining date/fee missing" : null, 'steel', "students"], ["Occupied Beds", D.occupied + "/" + D.beds, (D.beds ? Math.round(D.occupied / D.beds * 100) : 0) + "% full", 'green', "rooms"], ["Vacant Beds", D.beds - D.occupied, null, 'amber', "rooms", { vacant: true }], ["Income (paid)", inr(D.income), null, 'green', "fees"], ["Expense (approved)", inr(D.expense), null, 'red', "expenses"], ["Net Profit", inr(D.income - D.expense), null, 'gold'], ["Pending Fees", inr(D.pending), D.overdue + " overdue \xB7 " + D.dueCount + " due \xB7 " + D.dueSoon + " due in 7 days", 'red', "fees", { sf: "overdue" }], ...(role === "director" ? [["Salary Payable", inr(D.salaryPay), D.salarySub, 'steel', "salary", { sf: "pending" }]] : []), ["Open Complaints", D.complaintsOpen, null, 'amber', "complaints", { comp: "open" }]];
-      return /*#__PURE__*/React.createElement("div", {
-        style: {
-          display: "flex",
-          flexDirection: "column",
-          gap: 18
-        }
-      }, /*#__PURE__*/React.createElement("div", {
-        style: {
-          display: "grid",
-          gap: 12,
-          gridTemplateColumns: "repeat(auto-fill,minmax(150px,1fr))"
-        }
-      }, k.map((x, i) => /*#__PURE__*/React.createElement(Kpi, {
-        key: i,
-        label: x[0],
-        value: x[1],
-        sub: x[2],
-        tone: col(x[3]),
-        onClick: x[4] && allowed.includes(x[4]) ? () => go(x[4], x[5]) : undefined
-      }))), /*#__PURE__*/React.createElement("div", {
-        style: {
-          display: "grid",
-          gap: 14,
-          gridTemplateColumns: "repeat(auto-fit,minmax(300px,1fr))"
-        }
-      }, /*#__PURE__*/React.createElement("div", {
-        className: "card",
-        style: {
-          padding: 18
-        }
-      }, /*#__PURE__*/React.createElement("b", {
-        className: "serif",
-        style: {
-          fontSize: 15
-        }
-      }, "Profit / Loss by Hostel"), /*#__PURE__*/React.createElement("div", {
-        style: {
-          marginTop: 14
-        }
-      }, /*#__PURE__*/React.createElement(Bars, {
-        data: D.perHostel.map(h => ({
-          k: h.code,
-          v: h.profit,
-          label: inr(h.profit),
-          c: h.profit >= 0 ? col('green') : col('red')
-        }))
-      }))), /*#__PURE__*/React.createElement("div", {
-        className: "card",
-        style: {
-          padding: 18
-        }
-      }, /*#__PURE__*/React.createElement("b", {
-        className: "serif",
-        style: {
-          fontSize: 15
-        }
-      }, "Expense by Category"), /*#__PURE__*/React.createElement("div", {
-        style: {
-          marginTop: 14
-        }
-      }, D.catData.length ? /*#__PURE__*/React.createElement(Bars, {
-        data: D.catData.map(c => ({
-          ...c,
-          c: col('gold')
-        }))
-      }) : /*#__PURE__*/React.createElement("span", {
-        style: {
-          color: col('mut'),
-          fontSize: 13
-        }
-      }, "No approved expenses yet.")))));
-    },
+    dashboard: () => null,
     hostels: () => /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(Header, {
       entity: "hostels"
     }), /*#__PURE__*/React.createElement("div", {
@@ -6564,50 +8057,7 @@ function App() {
       }), !rows.length && /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", null, "No rooms/beds yet."))))));
     },
     fees: () => null,
-    expenses: () => /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(Header, {
-      entity: "expenses"
-    }), /*#__PURE__*/React.createElement("div", {
-      className: "card",
-      style: {
-        overflowX: "auto"
-      }
-    }, /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Hostel", "Date", "Category", "Amount", "Paid To", "Status", "Action"].map(c => /*#__PURE__*/React.createElement("th", {
-      key: c
-    }, c)))), /*#__PURE__*/React.createElement("tbody", null, data.expenses.map(e => /*#__PURE__*/React.createElement("tr", {
-      key: e.id
-    }, /*#__PURE__*/React.createElement("td", null, hName(e.hostel_id)), /*#__PURE__*/React.createElement("td", null, e.expense_date), /*#__PURE__*/React.createElement("td", null, e.category), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("b", null, inr(e.amount))), /*#__PURE__*/React.createElement("td", null, e.paid_to), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement(Badge, {
-      c: col(e.status === "approved" ? 'green' : e.status === "rejected" ? 'red' : 'amber'),
-      bg: col(e.status === "approved" ? 'green' : e.status === "rejected" ? 'red' : 'amber') + "1c"
-    }, e.status)), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("span", {
-      style: {
-        display: "inline-flex",
-        gap: 4,
-        alignItems: "center"
-      }
-    }, e.status === "pending" && role === "director" && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("button", {
-      className: "mini",
-      style: {
-        background: col('green')
-      },
-      onClick: () => save("expenses", {
-        id: e.id,
-        status: "approved"
-      })
-    }, "Approve"), /*#__PURE__*/React.createElement("button", {
-      className: "mini",
-      style: {
-        background: col('red')
-      },
-      onClick: () => save("expenses", {
-        id: e.id,
-        status: "rejected"
-      })
-    }, "Reject")), /*#__PURE__*/React.createElement(EditDel, {
-      entity: "expenses",
-      item: e
-    }))))), !data.expenses.length && /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
-      colSpan: "7"
-    }, "No expenses yet.")))))),
+    expenses: () => null,
     staff: () => null,
     complaints: () => /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(Header, {
       entity: "complaints",
@@ -6682,158 +8132,7 @@ function App() {
       colSpan: "4"
     }, "No activity logged yet.")))))
 ,
-    reports: () => {
-  const [hf, setHf] = useState("");
-  const num = v => Number(v || 0);
-  const hostels = hf ? data.hostels.filter(h => h.id === hf) : data.hostels;
-  const rowFor = h => {
-    const beds = data.beds.filter(b => b.hostel_id === h.id);
-    const occ = beds.filter(b => b.bed_status === "occupied").length;
-    const income = data.fee_payments.filter(f => f.hostel_id === h.id).reduce((a, f) => a + num(f.amount), 0);
-    const expense = data.expenses.filter(e => e.hostel_id === h.id && e.status === "approved").reduce((a, e) => a + num(e.amount), 0);
-    const pending = billablePending({ students: data.students, monthly_dues: data.monthly_dues.filter(d => d.hostel_id === h.id) }).reduce((a, d) => a + num(d.pending), 0);
-    const staffCost = role === "director" ? (data.staff_salary_profile || []).filter(p => data.employees.some(e => e.id === p.employee_id && e.hostel_id === h.id && e.status !== "left")).reduce((a, p) => a + num(p.monthly_salary), 0) : 0;
-    return {
-      name: h.name,
-      code: h.code,
-      beds: beds.length,
-      occ,
-      vacant: beds.length - occ,
-      occPct: beds.length ? Math.round(occ / beds.length * 100) : 0,
-      income,
-      expense,
-      profit: income - expense,
-      pending,
-      staffCost
-    };
-  };
-  const rows = hostels.map(rowFor);
-  const tot = rows.reduce((a, r) => ({
-    beds: a.beds + r.beds,
-    occ: a.occ + r.occ,
-    income: a.income + r.income,
-    expense: a.expense + r.expense,
-    profit: a.profit + r.profit,
-    pending: a.pending + r.pending
-  }), {
-    beds: 0,
-    occ: 0,
-    income: 0,
-    expense: 0,
-    profit: 0,
-    pending: 0
-  });
-  const exportCSV = () => {
-    const head = ["Hostel", "Code", "Beds", "Occupied", "Vacant", "Occupancy%", "Income", "Expense", "ProfitLoss", "PendingFees", "StaffCost"];
-    const lines = [head.join(",")].concat(rows.map(r => [r.name, r.code, r.beds, r.occ, r.vacant, r.occPct, r.income, r.expense, r.profit, r.pending, role === "director" ? r.staffCost : ""].join(",")));
-    const blob = new Blob([lines.join("\n")], {
-      type: "text/csv"
-    });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = "DDD-report-" + today() + ".csv";
-    a.click();
-  };
-  return /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
-    className: "noprint",
-    style: {
-      display: "flex",
-      flexWrap: "wrap",
-      gap: 8,
-      alignItems: "center",
-      marginBottom: 14
-    }
-  }, /*#__PURE__*/React.createElement("span", {
-    style: {
-      fontSize: 12,
-      fontWeight: 700,
-      color: col('mut')
-    }
-  }, "Hostel:"), /*#__PURE__*/React.createElement("select", {
-    className: "inp",
-    style: {
-      width: "auto"
-    },
-    value: hf,
-    onChange: e => setHf(e.target.value)
-  }, /*#__PURE__*/React.createElement("option", {
-    value: ""
-  }, "All Hostels"), data.hostels.map(h => /*#__PURE__*/React.createElement("option", {
-    key: h.id,
-    value: h.id
-  }, h.name))), /*#__PURE__*/React.createElement("div", {
-    style: {
-      flex: 1
-    }
-  }), /*#__PURE__*/React.createElement("button", {
-    className: "pbtn",
-    style: {
-      background: col('green')
-    },
-    onClick: exportCSV
-  }, "\u2B07 Excel (CSV)"), /*#__PURE__*/React.createElement("button", {
-    className: "pbtn",
-    style: {
-      background: col('gold'),
-      color: col('ink')
-    },
-    onClick: () => window.print()
-  }, "\uD83D\uDDA8 Print / PDF")), /*#__PURE__*/React.createElement("div", {
-    className: "card",
-    style: {
-      overflowX: "auto"
-    }
-  }, /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Hostel", "Beds", "Occ", "Vacant", "Occ%", "Income", "Expense", "Profit/Loss", "Pending"].concat(role === "director" ? ["Staff Cost"] : []).map(c => /*#__PURE__*/React.createElement("th", {
-    key: c
-  }, c)))), /*#__PURE__*/React.createElement("tbody", null, rows.map((r, i) => /*#__PURE__*/React.createElement("tr", {
-    key: i
-  }, /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("b", null, r.name), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 11,
-      color: col('mut')
-    }
-  }, r.code)), /*#__PURE__*/React.createElement("td", null, r.beds), /*#__PURE__*/React.createElement("td", null, r.occ), /*#__PURE__*/React.createElement("td", null, r.vacant), /*#__PURE__*/React.createElement("td", null, r.occPct, "%"), /*#__PURE__*/React.createElement("td", {
-    style: {
-      color: col('green')
-    }
-  }, inr(r.income)), /*#__PURE__*/React.createElement("td", {
-    style: {
-      color: col('red')
-    }
-  }, inr(r.expense)), /*#__PURE__*/React.createElement("td", {
-    style: {
-      fontWeight: 700,
-      color: r.profit >= 0 ? col('green') : col('red')
-    }
-  }, inr(r.profit)), /*#__PURE__*/React.createElement("td", {
-    style: {
-      color: r.pending > 0 ? col('red') : col('green')
-    }
-  }, r.pending > 0 ? inr(r.pending) : "—"), role === "director" ? /*#__PURE__*/React.createElement("td", null, inr(r.staffCost)) : null)), /*#__PURE__*/React.createElement("tr", {
-    style: {
-      fontWeight: 800,
-      borderTop: "2px solid " + col('line')
-    }
-  }, /*#__PURE__*/React.createElement("td", null, "TOTAL"), /*#__PURE__*/React.createElement("td", null, tot.beds), /*#__PURE__*/React.createElement("td", null, tot.occ), /*#__PURE__*/React.createElement("td", null, tot.beds - tot.occ), /*#__PURE__*/React.createElement("td", null, tot.beds ? Math.round(tot.occ / tot.beds * 100) : 0, "%"), /*#__PURE__*/React.createElement("td", {
-    style: {
-      color: col('green')
-    }
-  }, inr(tot.income)), /*#__PURE__*/React.createElement("td", {
-    style: {
-      color: col('red')
-    }
-  }, inr(tot.expense)), /*#__PURE__*/React.createElement("td", {
-    style: {
-      color: tot.profit >= 0 ? col('green') : col('red')
-    }
-  }, inr(tot.profit)), /*#__PURE__*/React.createElement("td", {
-    style: {
-      color: col('red')
-    }
-  }, inr(tot.pending)), /*#__PURE__*/React.createElement("td", null)), !rows.length && /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
-    colSpan: "10"
-  }, "No hostels."))))));
-},
+    reports: () => null,
     insights: () => {
   const num = v => Number(v || 0);
   const H = data.hostels.map(h => {
@@ -7143,7 +8442,7 @@ function App() {
   }
   };
   const Current = Pages[cur] || Pages.dashboard;
-  const pageCtx = { data, role, session, hName, sName, uName, NameBtn, Header, EditDel, setModal, setContact, del, flash, refresh, hf, setHf, mf, setMf, billingMode, saveBillingMode, stuF, setStuF, openProfile: setProfId, feeSf, setFeeSf, go, feeGrace, saveFeeGrace, salMonth, setSalMonth, salH, setSalH, salSf, setSalSf, openSal: setSalModal };
+  const pageCtx = { data, role, session, hName, sName, uName, NameBtn, Header, EditDel, setModal, setContact, del, flash, refresh, hf, setHf, mf, setMf, billingMode, saveBillingMode, stuF, setStuF, openProfile: setProfId, feeSf, setFeeSf, go, feeGrace, saveFeeGrace, salMonth, setSalMonth, salH, setSalH, salSf, setSalSf, openSal: setSalModal, per: perSt.p, setPer, perH: perSt.h, setPerH, feeTab, setFeeTab, save, allowed };
   return /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
@@ -7295,7 +8594,13 @@ function App() {
     }
   }, NAV_LABEL[cur]), cur === "dashboard" ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(StudentSearch, {
     ctx: pageCtx
-  }), /*#__PURE__*/React.createElement(Current, null)) : cur === "students" ? /*#__PURE__*/React.createElement(StudentsPage, {
+  }), /*#__PURE__*/React.createElement(DashboardPage, {
+    ctx: pageCtx
+  })) : cur === "students" ? /*#__PURE__*/React.createElement(StudentsPage, {
+    ctx: pageCtx
+  }) : cur === "expenses" ? /*#__PURE__*/React.createElement(ExpensesPage, {
+    ctx: pageCtx
+  }) : cur === "reports" ? /*#__PURE__*/React.createElement(ReportsPage, {
     ctx: pageCtx
   }) : cur === "salary" && role === "director" ? /*#__PURE__*/React.createElement(SalaryPage, {
     ctx: pageCtx
