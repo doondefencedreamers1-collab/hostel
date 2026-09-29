@@ -30,8 +30,9 @@ declare
 begin
   perform public.ddd_require_director();
   if p_month is null then raise exception 'Month required'; end if;
-  if m_start > date_trunc('month', (now() at time zone 'Asia/Kolkata'))::date then
-    raise exception 'Future month ki salary generate nahi ho sakti';
+  -- 023: only a month that has ENDED (IST) — current month from the 1st of next month
+  if m_start >= date_trunc('month', (now() at time zone 'Asia/Kolkata'))::date then
+    raise exception 'Is mahine ki salary mahina khatam hone ke baad (agle mahine ki 1 tareekh se) hi generate hogi';
   end if;
   for r in
     select e.id, e.hostel_id, e.joining_date, e.exit_date, coalesce(e.status, 'active') status,
@@ -53,8 +54,8 @@ begin
       v_emp := 0; v_empr := 0;
     end if;
     -- default = present; only "Mark Absent" days are stored (present = false)
-    select count(*) into v_abs from staff_attendance
-     where employee_id = r.id and not present and date between v_from and v_to;
+    v_abs := (select count(*) from staff_attendance
+               where employee_id = r.id and not present and date between v_from and v_to);
     v_att := v_days - v_abs;
     v_adv := greatest(0, least(public.ddd_advance_available(r.id, null), v_gross - v_emp));
     insert into salary_runs(employee_id, hostel_id, month, period_from, period_to, days_in_month, base_salary,
@@ -74,8 +75,8 @@ declare r salary_runs%rowtype; v_today date := (now() at time zone 'Asia/Kolkata
         v_out numeric; v_abs int;
 begin
   perform public.ddd_require_director();
-  select * into r from salary_runs where id = p_run for update;
-  if not found then raise exception 'Salary row not found'; end if;
+  r := (select s from salary_runs s where s.id = p_run for update);
+  if r.id is null then raise exception 'Salary row not found'; end if;
   if r.status <> 'pending' then raise exception 'Ye salary pehle hi paid hai'; end if;
   if p_date is null or p_date > v_today then raise exception 'Paid date aaj ya pehle ki honi chahiye'; end if;
   if v_mode not in ('cash', 'upi', 'bank') then raise exception 'Mode Cash / UPI / Bank hona chahiye'; end if;
@@ -85,14 +86,15 @@ begin
     raise exception 'Advance cut (%) outstanding advance (%) se zyada hai — pehle Edit karein', r.advance_deduction, greatest(v_out, 0);
   end if;
   -- freeze absent / present days at payment time (slip never changes later)
-  select count(*) into v_abs from staff_attendance
-   where employee_id = r.employee_id and not present and date between r.period_from and r.period_to;
+  v_abs := (select count(*) from staff_attendance
+             where employee_id = r.employee_id and not present and date between r.period_from and r.period_to);
   update salary_runs
      set absent_days = v_abs, attendance_days = (r.period_to - r.period_from + 1) - v_abs,
          status = 'paid', paid_date = p_date, mode = v_mode, txn_ref = nullif(trim(p_txn), ''),
          remarks = coalesce(nullif(trim(p_remarks), ''), remarks), paid_by = auth.uid(),
          slip_no = coalesce(slip_no, 'SAL-' || to_char(month, 'YYMM') || '-' || lpad(nextval('public.salary_slip_seq')::text, 4, '0'))
-   where id = r.id returning * into r;
+   where id = r.id;
+  r := (select s from salary_runs s where s.id = p_run);
   insert into salary_edits(run_id, field, old_value, new_value, reason, edited_by)
   values (r.id, 'status', 'pending', 'paid', 'Payment Done (' || v_mode || ')', auth.uid());
   return to_jsonb(r);

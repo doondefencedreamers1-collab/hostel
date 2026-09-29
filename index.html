@@ -1474,7 +1474,7 @@ const partialPreview = (s, dues, amount, today) => {
   while (left > 0.004 && guard++ < 240) {
     const row = byMonth[m];
     const owed = !row ? monthFee(s.monthly_fee, s.joining_date, m) : num0(row.pending);
-    const start = !row ? monthStartDate(s, m) : dueStart(row) || m;
+    const start = !row ? monthStartDate(s, m) : addDaysYmd(duePaidTo(row, s), 1);
     if (owed > 0) {
       const a = Math.min(left, owed);
       out.push({
@@ -1490,26 +1490,214 @@ const partialPreview = (s, dues, amount, today) => {
   if (!out.length) return null;
   const last = out[out.length - 1];
   const balance = Math.round((last.owed - last.alloc) * 100) / 100;
+  // exact last day the money covers in the last month (mirror of DB paid_to)
+  const lastDue = byMonth[last.m];
+  const sim = lastDue ? {
+    ...lastDue,
+    paid_amount: num0(lastDue.paid_amount) + last.alloc
+  } : {
+    month: last.m,
+    period_from: last.start,
+    period_to: monthEndOf(last.m),
+    fee_amount: last.owed,
+    discount: 0,
+    paid_amount: last.alloc
+  };
+  const toExact = balance > 0 ? derivePaidTo(sim, s) : String(lastDue && lastDue.period_to || monthEndOf(last.m)).slice(0, 10);
+  out.forEach(x => {
+    const d = byMonth[x.m];
+    x.a = x.start;
+    x.b = x === last ? toExact < x.start ? x.start : toExact : String(d && d.period_to || monthEndOf(x.m)).slice(0, 10);
+    x.owedPart = x.alloc;
+  });
   const full = new Set(out.filter(x => x.alloc >= x.owed).map(x => x.m));
   const stillUnpaid = unpaid.filter(x => !full.has(x)).concat(balance > 0 ? [last.m] : []).sort();
-  const startOf = m => {
-    const r = out.find(x => x.m === m);
-    if (r) return r.start;
-    const d = mine.filter(x => monthStartOf(x.month) === m).map(dueStart).sort()[0];
-    return d || m;
-  };
-  const newPaidTill = stillUnpaid.length ? addDaysYmd(startOf(stillUnpaid[0]), -1) : monthEndOf(last.m);
+  const nextDue = stillUnpaid.length ? mine.find(x => monthStartOf(x.month) === stillUnpaid[0]) : null;
+  const newPaidTill = balance > 0 ? toExact : stillUnpaid.length ? nextDue ? duePaidTo(nextDue, s) : addDaysYmd(stillUnpaid[0], -1) : toExact;
   const curMonth = monthStartOf(today);
   return {
     rows: out,
     from: out[0].start,
-    to: monthEndOf(last.m),
+    to: toExact,
+    toExact,
     amount: amt,
     balance,
     balanceMonth: last.m,
     overdueCount: out.filter(x => x.m <= curMonth).length,
     newPaidTill,
     tooMuch: amt > num0(s.monthly_fee) * 36
+  };
+};
+
+/* =====================================================================
+   024 — day-wise date range ("kab se kab tak")
+   month share = round(fee x day / days-in-month), cumulative, so pieces add
+   up; a piece that reaches the end of a due = the rest of that due.
+   Mirrors DB ddd_due_paid_to / ddd_fee_range_plan.
+   ===================================================================== */
+const cumFee = (F, dim, k) => Math.round(num0(F) * Math.max(0, k) / dim);
+const dueFullFee = (d, s) => {
+  const ms = monthStartOf(d.month);
+  const pf = String(d.period_from || ms).slice(0, 10);
+  return pf <= ms ? num0(d.fee_amount) : num0(s && s.monthly_fee);
+};
+const derivePaidTo = (d, s) => {
+  const ms = monthStartOf(d.month);
+  const pf = String(d.period_from || ms).slice(0, 10);
+  const pt = String(d.period_to || monthEndOf(d.month)).slice(0, 10);
+  const got = num0(d.paid_amount) + num0(d.discount);
+  if (num0(d.fee_amount) - got <= 0) return pt;
+  if (got <= 0) return addDaysYmd(pf, -1);
+  const F = dueFullFee(d, s);
+  if (F <= 0) return addDaysYmd(pf, -1);
+  const [y, m] = ymdParts(ms);
+  const dim = daysInMonth(y, m);
+  const k0 = ymdParts(pf)[2] - 1;
+  let k = k0;
+  while (addDaysYmd(ms, k) <= addDaysYmd(pt, -1) && cumFee(F, dim, k + 1) - cumFee(F, dim, k0) <= got) k++;
+  return addDaysYmd(ms, k - 1);
+};
+/* last paid day of a due (DB keeps monthly_dues.paid_to after 024) */
+const duePaidTo = (d, s) => d.paid_to ? String(d.paid_to).slice(0, 10) : derivePaidTo(d, s);
+/* first day that still has to be paid */
+const firstUnpaidDay = s => s.paid_till ? addDaysYmd(String(s.paid_till).slice(0, 10), 1) : s.joining_date ? String(s.joining_date).slice(0, 10) : null;
+/* MON3 (month short names) comes from dash_module */
+/* "Aug: 01–31 = ₹12,000 | Sep: 01–15 = ₹6,000 | Total ₹18,000" */
+const breakdownText = rows => {
+  if (!rows || !rows.length) return "";
+  const multiY = new Set(rows.map(r => ymdParts(r.a)[0])).size > 1;
+  const dd = v => String(ymdParts(v)[2]).padStart(2, "0");
+  const total = rows.reduce((x, r) => x + num0(r.owed), 0);
+  return rows.map(r => (multiY ? monLabel(r.a) : MON3[ymdParts(r.a)[1] - 1]) + ": " + dd(r.a) + "–" + dd(r.b) + " = " + inr(r.owed)).join(" | ") + " | Total " + inr(total);
+};
+/* Client mirror of record_fee_payment_range(): same rules, same amounts */
+const rangePreview = (s, dues, from, to, opt) => {
+  opt = opt || {};
+  if (!from || !to) return {
+    err: "From aur To date dono chunein."
+  };
+  from = String(from).slice(0, 10);
+  to = String(to).slice(0, 10);
+  if (to < from) return {
+    err: "To date From date se pehle nahi ho sakti."
+  };
+  const j = s.joining_date ? String(s.joining_date).slice(0, 10) : null;
+  if (j && from < j) return {
+    err: "From date joining date (" + dmy(j) + ") se pehle nahi ho sakti."
+  };
+  if (s.exit_date && to > String(s.exit_date).slice(0, 10)) return {
+    err: "To date exit date (" + dmy(s.exit_date) + ") ke baad nahi ho sakti."
+  };
+  const [fy, fm] = ymdParts(from),
+    [ty, tm] = ymdParts(to);
+  if (ty * 12 + tm - (fy * 12 + fm) + 1 > 36) return {
+    err: "Ek baar mein zyada se zyada 36 months."
+  };
+  const first = firstUnpaidDay(s);
+  if (first && from > first) {
+    if (!opt.skip) return {
+      err: "Pehle overdue clear karein — From date " + dmy(first) + " honi chahiye (paid till " + dmy(addDaysYmd(first, -1)) + ").",
+      needSkip: true
+    };
+    if (!opt.isDir) return {
+      err: "Sirf Director overdue chhod kar aage ki dates le sakta hai."
+    };
+  }
+  const mine = (dues || []).filter(d => d.student_id === s.id);
+  const byMonth = {};
+  mine.forEach(d => {
+    const k = monthStartOf(d.month);
+    if (!byMonth[k] || String(d.month) < String(byMonth[k].month)) byMonth[k] = d;
+  });
+  const rows = [];
+  let m = monthStartOf(from),
+    guard = 0;
+  while (m <= to && guard++ < 40) {
+    const me = monthEndOf(m);
+    const a = from > m ? from : m;
+    const b = to < me ? to : me;
+    const d0 = byMonth[m];
+    const fee0 = monthFee(s.monthly_fee, s.joining_date, m);
+    const d = d0 || {
+      month: m,
+      period_from: monthStartDate(s, m),
+      period_to: me,
+      fee_amount: fee0,
+      discount: 0,
+      paid_amount: 0,
+      pending: fee0
+    };
+    const pf = String(d.period_from || m).slice(0, 10),
+      pt = String(d.period_to || me).slice(0, 10);
+    if (a < pf || b > pt) return {
+      err: monLabel(m) + " ki due " + dmy(pf) + " se " + dmy(pt) + " tak hai — dates iske andar honi chahiye."
+    };
+    const ptd = d0 ? duePaidTo(d0, s) : addDaysYmd(pf, -1);
+    if (a <= ptd) return {
+      err: "Yeh dates pehle se paid hain (" + monLabel(m) + " mein " + dmy(ptd) + " tak paid)."
+    };
+    if (a > addDaysYmd(ptd, 1)) return {
+      err: "Beech ke din khali nahi chhod sakte — " + monLabel(m) + " mein " + dmy(addDaysYmd(ptd, 1)) + " se shuru karein."
+    };
+    const pend = num0(d.pending);
+    let owed;
+    if (b === pt) owed = pend;else {
+      const [y, mo] = ymdParts(m);
+      const dim = daysInMonth(y, mo);
+      const F = dueFullFee(d, s);
+      owed = Math.min(pend, cumFee(F, dim, ymdParts(b)[2]) - cumFee(F, dim, ymdParts(a)[2] - 1));
+    }
+    rows.push({
+      m,
+      a,
+      b,
+      owed,
+      whole: a === pf && b === pt,
+      pf,
+      pt,
+      pendAfter: Math.round((pend - owed) * 100) / 100,
+      key: d0 ? d0.id : "new" + m
+    });
+    m = addMonthsYmd(m, 1);
+  }
+  const gross = rows.reduce((x, r) => x + r.owed, 0);
+  if (!(gross > 0)) return {
+    err: "In dates ka koi amount baaki nahi hai."
+  };
+  const pm = num0(s.plan_months) || 1;
+  const std = Math.round(num0(s.monthly_fee) * pm * 100) / 100;
+  const planDisc = rows.every(r => r.whole) && rows.length === pm && s.plan_amount != null && s.plan_amount !== "" && num0(s.plan_amount) < std ? Math.min(gross, std - num0(s.plan_amount)) : 0;
+  // paid till after this payment = paid_to of the first due still pending
+  const after = {};
+  mine.forEach(d => {
+    after[d.id] = {
+      pf: String(d.period_from || monthStartOf(d.month)).slice(0, 10),
+      pt: String(d.period_to || monthEndOf(d.month)).slice(0, 10),
+      pend: num0(d.pending),
+      paidTo: duePaidTo(d, s)
+    };
+  });
+  rows.forEach(r => {
+    after[r.key] = {
+      pf: r.pf,
+      pt: r.pt,
+      pend: r.pendAfter,
+      paidTo: r.pendAfter > 0 ? r.b : r.pt
+    };
+  });
+  const list = Object.values(after).sort((x, y) => x.pf.localeCompare(y.pf));
+  const open = list.find(x => x.pend > 0);
+  const newPaidTill = open ? open.paidTo : list.map(x => x.pt).sort().slice(-1)[0];
+  const last = rows[rows.length - 1];
+  return {
+    rows,
+    from,
+    to,
+    gross,
+    planDisc,
+    newPaidTill,
+    balance: last.pendAfter > 0 ? last.pendAfter : 0,
+    balanceMonth: last.m
   };
 };
 
@@ -1522,7 +1710,7 @@ const printReceipt = r => {
   }
   const R = (l, v) => "<div class='r'><span>" + esc(l) + "</span><b>" + esc(v) + "</b></div>";
   const money = v => "₹" + num0(v).toLocaleString("en-IN");
-  w.document.write("<html><head><title>Receipt " + esc(r.receipt_number) + "</title><style>body{font-family:Georgia,serif;padding:24px;color:#1f2630}h2{margin:0}hr{border:none;border-top:1px dashed #999;margin:14px 0}.r{display:flex;justify-content:space-between;gap:12px;margin:6px 0;font-size:14px}.big{font-size:18px;font-weight:bold}.note{font-size:11px;color:#777;text-align:right;margin-top:-4px}</style></head><body>" + "<h2>DDD Hostel</h2><div style='color:#777;font-size:12px'>Fee Receipt</div><hr>" + R("Receipt No.", r.receipt_number || "-") + R("Payment Date", dmy(r.payment_date)) + R("Student", r.student_name || "-") + (r.admission_number ? R("Admission No.", r.admission_number) : "") + R("Hostel", r.hostel || "-") + R("Fee Plan", r.plan || "-") + R("Months Covered", String(r.months || 1)) + R("Period", dmy(r.period_from) + " to " + dmy(r.period_to)) + R("Mode", String(r.mode || "-").toUpperCase() + (r.transaction_id ? " · " + r.transaction_id : "")) + "<hr>" + R("Gross Amount", money(r.gross)) + (num0(r.discount) > 0 ? R("Discount", "− " + money(r.discount)) + "<div class='note'>Approved by Director</div>" : "") + "<hr><div class='r big'><span>Net Paid</span><span>" + money(r.net) + "</span></div>" + (r.partial ? R("Payment Type", "PARTIAL") + (num0(r.balance) > 0 ? R("Balance due (" + monLabel(r.balance_month) + ")", money(r.balance)) : "") : "") + "<div class='r big'><span>Paid Till</span><span>" + esc(dmy(r.paid_till)) + "</span></div><hr>" + "<div style='font-size:11px;color:#888;text-align:center'>Computer generated · " + esc(new Date().toLocaleString("en-IN", {
+  w.document.write("<html><head><title>Receipt " + esc(r.receipt_number) + "</title><style>body{font-family:Georgia,serif;padding:24px;color:#1f2630}h2{margin:0}hr{border:none;border-top:1px dashed #999;margin:14px 0}.r{display:flex;justify-content:space-between;gap:12px;margin:6px 0;font-size:14px}.big{font-size:18px;font-weight:bold}.note{font-size:11px;color:#777;text-align:right;margin-top:-4px}</style></head><body>" + "<h2>DDD Hostel</h2><div style='color:#777;font-size:12px'>Fee Receipt</div><hr>" + R("Receipt No.", r.receipt_number || "-") + R("Payment Date", dmy(r.payment_date)) + R("Student", r.student_name || "-") + (r.admission_number ? R("Admission No.", r.admission_number) : "") + R("Hostel", r.hostel || "-") + R("Fee Plan", r.plan || "-") + R("Period", dmy(r.period_from) + " to " + dmy(r.period_to)) + R("Months Covered", String(r.months || 1)) + (r.breakdown && r.breakdown.length ? r.breakdown.map(b => R("  " + dmy(b.a) + " to " + dmy(b.b), money(b.owed))).join("") : "") + R("Mode", String(r.mode || "-").toUpperCase() + (r.transaction_id ? " · " + r.transaction_id : "")) + "<hr>" + R("Gross Amount", money(r.gross)) + (num0(r.discount) > 0 ? R("Discount", "− " + money(r.discount)) + "<div class='note'>Approved by Director</div>" : "") + "<hr><div class='r big'><span>Net Paid</span><span>" + money(r.net) + "</span></div>" + (r.partial ? R("Payment Type", "PARTIAL") + (num0(r.balance) > 0 ? R("Balance due (" + monLabel(r.balance_month) + ")", money(r.balance)) : "") : "") + "<div class='r big'><span>Paid Till</span><span>" + esc(dmy(r.paid_till)) + "</span></div><hr>" + "<div style='font-size:11px;color:#888;text-align:center'>Computer generated · " + esc(new Date().toLocaleString("en-IN", {
     timeZone: "Asia/Kolkata"
   })) + " IST</div></body></html>");
   w.document.close();
@@ -1568,6 +1756,12 @@ const paymentGroups = (pays, sid) => {
     };
   }).sort((a, b) => String(b.payment_date || "").localeCompare(String(a.payment_date || "")) || String(b.created_at).localeCompare(String(a.created_at)));
 };
+const groupBreakdown = g => g.rows.map(f => ({
+  m: monthStartOf(f.period_from || f.payment_date),
+  a: String(f.period_from || f.payment_date).slice(0, 10),
+  b: String(f.period_to || f.period_from || f.payment_date).slice(0, 10),
+  owed: num0(f.amount) + num0(f.discount_amount)
+}));
 const receiptFromGroup = (g, s, hostelName, dues) => {
   const lastRow = g.rows[g.rows.length - 1];
   const due = (dues || []).find(d => d.id === lastRow.due_id);
@@ -1588,10 +1782,11 @@ const receiptFromGroup = (g, s, hostelName, dues) => {
     gross: g.gross,
     discount: g.discount,
     net: g.net,
-    paid_till: bal > 0 ? addDaysYmd(g.period_from && lastRow.period_from ? lastRow.period_from : g.period_to, -1) : g.period_to,
+    paid_till: bal > 0 ? due && due.paid_to ? String(due.paid_to).slice(0, 10) : addDaysYmd(lastRow.period_from, -1) : g.period_to,
     partial,
     balance: bal,
-    balance_month: lastRow.period_from
+    balance_month: lastRow.period_from,
+    breakdown: groupBreakdown(g)
   };
 };
 const lblStyle = () => ({
@@ -1791,6 +1986,10 @@ function FeePayModal({
   const [disc, setDisc] = useState(0);
   const [ptype, setPtype] = useState("full");
   const [pamt, setPamt] = useState("");
+  const [edited, setEdited] = useState(false); // From/To changed by hand
+  const [dFrom, setDFrom] = useState("");
+  const [dTo, setDTo] = useState("");
+  const [skip, setSkip] = useState(false); // Director unticked "Pehle overdue clear"
   const [mode, setMode] = useState("upi");
   const [pDate, setPDate] = useState(today);
   const [txn, setTxn] = useState("");
@@ -1799,35 +1998,80 @@ function FeePayModal({
   const [err, setErr] = useState("");
   const [done, setDone] = useState(null);
   const groupId = useRef(typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : null);
+  const first = firstUnpaidDay(s) || today;
   const isPartial = ptype === "partial";
-  const pp = isPartial ? partialPreview(s, data.monthly_dues, pamt, today) : null;
-  const n = sel === "custom" ? parseInt(custom, 10) || 0 : Number(sel);
-  const pv = n >= 1 && n <= 36 ? payPreview(s, data.monthly_dues, n, today) : null;
-  const extra = isDir ? Math.max(0, num0(disc)) : 0;
-  const totalDisc = pv ? Math.min(pv.gross, pv.planDisc + extra) : 0;
-  const amount = pv ? Math.round((pv.gross - totalDisc) * 100) / 100 : 0;
+  const n = sel === "custom" ? parseInt(custom, 10) || 0 : sel === "dates" ? 0 : Number(sel);
+  // partial by amount (dates follow the amount) unless dates were changed by hand
+  const pp = isPartial && !edited ? partialPreview(s, data.monthly_dues, pamt, today) : null;
+  const auto = isPartial ? pp ? {
+    from: pp.from,
+    to: pp.to
+  } : {
+    from: first,
+    to: ""
+  } : sel === "dates" ? {
+    from: first,
+    to: monthEndOf(first)
+  } : n >= 1 && n <= 36 ? {
+    from: first,
+    to: monthEndOf(addMonthsYmd(monthStartOf(first), n - 1))
+  } : {
+    from: first,
+    to: ""
+  };
+  const from = edited ? dFrom : auto.from;
+  const to = edited ? dTo : auto.to;
+  const useRange = !isPartial || edited;
+  const rp = useRange && from && to ? rangePreview(s, data.monthly_dues, from, to, {
+    skip: isDir && skip,
+    isDir,
+    today
+  }) : null;
+  const rpOk = !!rp && !rp.err;
+  const extra = isDir && !isPartial ? Math.max(0, num0(disc)) : 0;
+  const totalDisc = rpOk ? Math.min(rp.gross, rp.planDisc + extra) : 0;
+  const amount = rpOk ? Math.round((rp.gross - totalDisc) * 100) / 100 : 0;
   const blocked = !s.joining_date ? "Is student ki Joining Date nahi hai — pehle Students mein set karein." : num0(s.monthly_fee) <= 0 ? "Is student ki Monthly Fee 0 hai — pehle set karein." : billingMode === "anniversary" ? "Multi-month payment sirf Calendar billing mode mein chalta hai (Fees → Billing cycle)." : "";
+  const setDate = (k, v) => {
+    setDFrom(k === "from" ? v : from || "");
+    setDTo(k === "to" ? v : to || "");
+    setEdited(true);
+    setErr("");
+  };
+  const pickPreset = k => {
+    setSel(k);
+    setEdited(false);
+    setErr("");
+  };
   const submit = async () => {
     if (busy) return; // double-submit guard
     if (blocked) {
       setErr(blocked);
       return;
     }
-    if (isPartial) {
-      if (!(num0(pamt) > 0)) {
-        setErr("Amount 0 se zyada daalein.");
+    if (!pDate || pDate > today) {
+      setErr("Payment date aaj ya pehle ki honi chahiye.");
+      return;
+    }
+    if (useRange) {
+      if (!rp) {
+        setErr("From aur To date chunein.");
         return;
       }
-      if (!pp) {
-        setErr("Amount allocate nahi ho paya.");
+      if (rp.err) {
+        setErr(rp.err);
         return;
       }
-      if (pp.tooMuch) {
-        setErr("Amount bahut zyada hai (max 36 months ki fee).");
+      if (!isPartial && sel === "custom" && !(n >= 1 && n <= 36) && !edited) {
+        setErr("Months 1 se 36 ke beech (poora number) hone chahiye.");
         return;
       }
-      if (!pDate || pDate > today) {
-        setErr("Payment date aaj ya pehle ki honi chahiye.");
+      if (isDir && !isPartial && (num0(disc) < 0 || rp.planDisc + num0(disc) > rp.gross)) {
+        setErr("Discount gross amount se zyada nahi ho sakta.");
+        return;
+      }
+      if (!(amount >= 0)) {
+        setErr("Amount sahi nahi hai.");
         return;
       }
       setErr("");
@@ -1835,42 +2079,48 @@ function FeePayModal({
       const {
         data: res,
         error
-      } = await SB.rpc("record_partial_payment", {
+      } = await SB.rpc("record_fee_payment_range", {
         p_student_id: s.id,
-        p_amount: Math.round(num0(pamt) * 100) / 100,
+        p_from: from,
+        p_to: to,
+        p_amount: amount,
+        p_discount: extra,
         p_mode: mode,
         p_payment_date: pDate,
         p_transaction_id: txn.trim() || null,
         p_remarks: remarks.trim() || null,
-        p_group_id: groupId.current
+        p_group_id: groupId.current,
+        p_skip_overdue: isDir && skip
       });
       setBusy(false);
       if (error) {
-        setErr(error.message || String(error));
+        const m = error.message || String(error);
+        setErr(/record_fee_payment_range|schema cache|does not exist/i.test(m) ? "Database update (024) abhi live nahi hai — pehle 024 SQL chalayein, phir page refresh karein." : m);
         return;
       }
-      setDone(res);
+      const bd = res && Array.isArray(res.breakdown) ? res.breakdown.map(x => ({
+        m: x.month,
+        a: x.from,
+        b: x.to,
+        owed: num0(x.owed)
+      })) : rp.rows;
+      setDone({
+        ...res,
+        breakdown: bd
+      });
       onDone && onDone(res);
       return;
     }
-    if (!(n >= 1 && n <= 36) || sel === "custom" && !Number.isInteger(Number(custom))) {
-      setErr("Months 1 se 36 ke beech (poora number) hone chahiye.");
+    if (!(num0(pamt) > 0)) {
+      setErr("Amount 0 se zyada daalein.");
       return;
     }
-    if (!pv) {
-      setErr("Period calculate nahi ho paya.");
+    if (!pp) {
+      setErr("Amount allocate nahi ho paya.");
       return;
     }
-    if (isDir && (num0(disc) < 0 || pv.planDisc + num0(disc) > pv.gross)) {
-      setErr("Discount gross amount se zyada nahi ho sakta.");
-      return;
-    }
-    if (!(amount >= 0)) {
-      setErr("Amount sahi nahi hai.");
-      return;
-    }
-    if (!pDate || pDate > today) {
-      setErr("Payment date aaj ya pehle ki honi chahiye.");
+    if (pp.tooMuch) {
+      setErr("Amount bahut zyada hai (max 36 months ki fee).");
       return;
     }
     setErr("");
@@ -1878,11 +2128,9 @@ function FeePayModal({
     const {
       data: res,
       error
-    } = await SB.rpc("record_fee_payment", {
+    } = await SB.rpc("record_partial_payment", {
       p_student_id: s.id,
-      p_months: n,
-      p_amount: amount,
-      p_discount: extra,
+      p_amount: Math.round(num0(pamt) * 100) / 100,
       p_mode: mode,
       p_payment_date: pDate,
       p_transaction_id: txn.trim() || null,
@@ -1894,7 +2142,15 @@ function FeePayModal({
       setErr(error.message || String(error));
       return;
     }
-    setDone(res);
+    setDone({
+      ...res,
+      breakdown: pp.rows.map(x => ({
+        m: x.m,
+        a: x.a,
+        b: x.b,
+        owed: x.alloc
+      }))
+    });
     onDone && onDone(res);
   };
   const box = {
@@ -1933,7 +2189,8 @@ function FeePayModal({
       paid_till: done.paid_till,
       partial: !!done.partial,
       balance: done.balance,
-      balance_month: done.balance_month
+      balance_month: done.balance_month,
+      breakdown: done.breakdown
     };
     return /*#__PURE__*/React.createElement("div", {
       className: "ovl",
@@ -1942,7 +2199,7 @@ function FeePayModal({
       className: "card",
       style: {
         padding: 22,
-        maxWidth: 400,
+        maxWidth: 420,
         width: "100%"
       },
       onClick: e => e.stopPropagation()
@@ -1956,7 +2213,14 @@ function FeePayModal({
       style: {
         margin: "12px 0"
       }
-    }, row("Receipt", done.receipt_number, true), row("Covers", dmy(done.period_from) + " to " + dmy(done.period_to)), row("Net paid", inr(done.net), true), row("Paid till", dmy(done.paid_till), true), done.partial && num0(done.balance) > 0 ? row("Balance (" + monLabel(done.balance_month) + ")", inr(done.balance), true) : null), /*#__PURE__*/React.createElement("div", {
+    }, row("Receipt", done.receipt_number, true), row("Covers", dmy(done.period_from) + " to " + dmy(done.period_to)), done.breakdown && done.breakdown.length ? /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 11.5,
+        color: col('mut'),
+        margin: "2px 0 6px"
+      },
+      "data-done-breakdown": "1"
+    }, breakdownText(done.breakdown)) : null, row("Net paid", inr(done.net), true), row("Paid till", dmy(done.paid_till), true), done.partial && num0(done.balance) > 0 ? row("Balance (" + monLabel(done.balance_month) + ")", inr(done.balance), true) : null), /*#__PURE__*/React.createElement("div", {
       style: {
         display: "flex",
         gap: 10
@@ -1978,6 +2242,135 @@ function FeePayModal({
       onClick: onClose
     }, "Done"))));
   }
+  const dateInputs = /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 12
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "1fr 1fr",
+      gap: 10
+    }
+  }, /*#__PURE__*/React.createElement("label", {
+    style: box
+  }, /*#__PURE__*/React.createElement("span", {
+    style: lblStyle()
+  }, "From date"), /*#__PURE__*/React.createElement("input", {
+    className: "inp",
+    type: "date",
+    value: from || "",
+    min: s.joining_date ? String(s.joining_date).slice(0, 10) : undefined,
+    onChange: e => setDate("from", e.target.value),
+    "data-from": "1"
+  })), /*#__PURE__*/React.createElement("label", {
+    style: box
+  }, /*#__PURE__*/React.createElement("span", {
+    style: lblStyle()
+  }, "To date"), /*#__PURE__*/React.createElement("input", {
+    className: "inp",
+    type: "date",
+    value: to || "",
+    min: from || undefined,
+    max: s.exit_date ? String(s.exit_date).slice(0, 10) : undefined,
+    onChange: e => setDate("to", e.target.value),
+    "data-to": "1"
+  }))), isDir ? /*#__PURE__*/React.createElement("label", {
+    style: {
+      display: "flex",
+      gap: 6,
+      alignItems: "center",
+      fontSize: 12,
+      marginTop: 8,
+      color: col('slate'),
+      fontWeight: 700
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "checkbox",
+    checked: !skip,
+    onChange: e => {
+      setSkip(!e.target.checked);
+      setErr("");
+    },
+    "data-skip": "1"
+  }), "Pehle overdue clear ", skip ? /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: col('amber')
+    }
+  }, "(off — aage ki dates le sakte hain)") : null) : null, edited ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: col('mut'),
+      marginTop: 4
+    }
+  }, "Dates badli gayi hain — amount inhi dates se bana hai. ", /*#__PURE__*/React.createElement("a", {
+    href: "#",
+    onClick: e => {
+      e.preventDefault();
+      setEdited(false);
+    },
+    "data-reset-dates": "1"
+  }, "Auto dates")) : null);
+  const rangeBox = useRange && rp ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 12,
+      padding: 12,
+      background: col('paper'),
+      borderRadius: 10,
+      border: "1px solid " + col('line')
+    }
+  }, rp.err ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12.5,
+      color: col('red'),
+      fontWeight: 700
+    },
+    "data-range-err": "1"
+  }, rp.err) : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 800,
+      fontSize: 13.5
+    },
+    "data-covers": "1"
+  }, "Covers: ", dmy(rp.from), " to ", dmy(rp.to)), (() => {
+    const cur = monthStartOf(today);
+    const od = rp.rows.filter(r => r.m <= cur && r.a <= today),
+      adv = rp.rows.length - od.length;
+    return od.length ? /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 12,
+        marginTop: 6,
+        color: col('red'),
+        fontWeight: 700
+      }
+    }, "Pehle overdue clear: ", od.length, " month", od.length > 1 ? "s" : "", " (", inr(od.reduce((x, r) => x + r.owed, 0)), ")", adv > 0 ? ", phir " + adv + " month advance" : "") : /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 12,
+        marginTop: 6,
+        color: col('green'),
+        fontWeight: 700
+      }
+    }, adv, " month advance");
+  })(), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      marginTop: 6,
+      color: col('slate'),
+      fontWeight: 700
+    },
+    "data-breakdown": "1"
+  }, breakdownText(rp.rows)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 8
+    }
+  }, row("Gross", inr(rp.gross)), rp.planDisc > 0 ? row("Plan discount (Director-approved)", "− " + inr(rp.planDisc)) : null, isDir && !isPartial && num0(disc) > 0 ? row("Director discount", "− " + inr(num0(disc))) : null, row("Amount to collect", inr(amount), true), row("Paid till after this", dmy(rp.newPaidTill), true), rp.balance > 0 ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: col('amber'),
+      fontWeight: 700
+    },
+    "data-range-balance": "1"
+  }, "Baaki ", monLabel(rp.balanceMonth), ": ", inr(rp.balance), " (", dmy(addDaysYmd(rp.to, 1)), " se)") : null))) : null;
   return /*#__PURE__*/React.createElement("div", {
     className: "ovl",
     onClick: onClose
@@ -1985,7 +2378,7 @@ function FeePayModal({
     className: "card",
     style: {
       padding: 22,
-      maxWidth: 420,
+      maxWidth: 440,
       width: "100%",
       maxHeight: "92vh",
       overflowY: "auto"
@@ -2020,6 +2413,7 @@ function FeePayModal({
     type: "button",
     onClick: () => {
       setPtype(k);
+      setEdited(false);
       setErr("");
     },
     "data-ptype": k,
@@ -2045,11 +2439,15 @@ function FeePayModal({
     className: "inp",
     type: "number",
     min: 1,
-    value: pamt,
-    onChange: e => setPamt(e.target.value),
+    value: edited ? rpOk ? String(rp.gross) : "" : pamt,
+    onChange: e => {
+      setPamt(e.target.value);
+      setEdited(false);
+      setErr("");
+    },
     "data-partial-amount": "1",
     placeholder: "e.g. 4500"
-  })), pp ? /*#__PURE__*/React.createElement("div", {
+  })), dateInputs, !edited && pp ? /*#__PURE__*/React.createElement("div", {
     style: {
       marginTop: 12,
       padding: 12,
@@ -2063,7 +2461,19 @@ function FeePayModal({
       fontSize: 13.5
     },
     "data-partial-covers": "1"
-  }, "Adjust: ", pp.rows.map(x => monLabel(x.m) + " " + inr(x.alloc) + (x.alloc < x.owed ? " (partial)" : "")).join(" · ")), pp.balance > 0 ? /*#__PURE__*/React.createElement("div", {
+  }, "Adjust: ", pp.rows.map(x => monLabel(x.m) + " " + inr(x.alloc) + (x.alloc < x.owed ? " (partial)" : "")).join(" · ")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      marginTop: 6,
+      color: col('slate'),
+      fontWeight: 700
+    },
+    "data-breakdown": "1"
+  }, breakdownText(pp.rows.map(x => ({
+    a: x.a,
+    b: x.b,
+    owed: x.alloc
+  })))), pp.balance > 0 ? /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 12,
       marginTop: 6,
@@ -2081,22 +2491,22 @@ function FeePayModal({
       color: col('red'),
       fontWeight: 700
     }
-  }, "Amount bahut zyada hai (max 36 months).") : null) : null) : null, !isPartial ? /*#__PURE__*/React.createElement("div", {
+  }, "Amount bahut zyada hai (max 36 months).") : null) : null, rangeBox) : /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
     style: {
       margin: "14px 0 6px"
     }
   }, /*#__PURE__*/React.createElement("span", {
     style: lblStyle()
-  }, "Pay for")) : null, /*#__PURE__*/React.createElement("div", {
+  }, "Pay for")), /*#__PURE__*/React.createElement("div", {
     style: {
-      display: isPartial ? "none" : "flex",
+      display: "flex",
       gap: 6,
       flexWrap: "wrap"
     }
-  }, [["1", "1 Month"], ["3", "3"], ["6", "6"], ["12", "12"], ["24", "24"], ["custom", "Custom"]].map(([k, l]) => /*#__PURE__*/React.createElement("button", {
+  }, [["1", "1 Month"], ["3", "3 Months"], ["6", "6 Months"], ["12", "12 Months"], ["24", "24 Months"], ["custom", "Custom"], ["dates", "Dates chuno"]].map(([k, l]) => /*#__PURE__*/React.createElement("button", {
     key: k,
     type: "button",
-    onClick: () => setSel(k),
+    onClick: () => pickPreset(k),
     "data-pay": k,
     style: {
       padding: "6px 11px",
@@ -2105,10 +2515,10 @@ function FeePayModal({
       cursor: "pointer",
       fontWeight: 700,
       fontSize: 12.5,
-      background: sel === k ? col('slate') : "#fff",
-      color: sel === k ? "#fff" : col('slate')
+      background: sel === k && !(edited && k !== "dates") ? col('slate') : "#fff",
+      color: sel === k && !(edited && k !== "dates") ? "#fff" : col('slate')
     }
-  }, l, k !== "custom" && k !== "1" ? " Months" : ""))), !isPartial && sel === "custom" ? /*#__PURE__*/React.createElement("label", {
+  }, l))), sel === "custom" ? /*#__PURE__*/React.createElement("label", {
     style: {
       ...box,
       marginTop: 10
@@ -2122,46 +2532,11 @@ function FeePayModal({
     max: 36,
     step: 1,
     value: custom,
-    onChange: e => setCustom(e.target.value)
-  })) : null, !isPartial && pv ? /*#__PURE__*/React.createElement("div", {
-    style: {
-      marginTop: 12,
-      padding: 12,
-      background: col('paper'),
-      borderRadius: 10,
-      border: "1px solid " + col('line')
+    onChange: e => {
+      setCustom(e.target.value);
+      setEdited(false);
     }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontWeight: 800,
-      fontSize: 13.5
-    },
-    "data-covers": "1"
-  }, "Covers: ", dmy(pv.from), " to ", dmy(pv.to)), pv.overdueCount > 0 ? /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 12,
-      marginTop: 6,
-      color: col('red'),
-      fontWeight: 700
-    }
-  }, "Pehle overdue clear: ", pv.overdueCount, " month", pv.overdueCount > 1 ? "s" : "", " (", inr(pv.overdueAmt), ")", pv.advanceCount > 0 ? ", phir " + pv.advanceCount + " month advance" : "") : /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 12,
-      marginTop: 6,
-      color: col('green'),
-      fontWeight: 700
-    }
-  }, pv.advanceCount, " month advance"), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 11.5,
-      color: col('mut'),
-      marginTop: 4
-    }
-  }, pv.months.map(x => monLabel(x.m) + (x.start !== x.m ? " (" + dmy(x.start) + " se, " + inr(x.owed) + ")" : "")).join(" · ")), /*#__PURE__*/React.createElement("div", {
-    style: {
-      marginTop: 8
-    }
-  }, row("Gross", inr(pv.gross)), pv.planDisc > 0 ? row("Plan discount (Director-approved)", "− " + inr(pv.planDisc)) : null, isDir && num0(disc) > 0 ? row("Director discount", "− " + inr(num0(disc))) : null, row("Amount to collect", inr(amount), true), row("Paid till after this", dmy(pv.newPaidTill), true))) : null, /*#__PURE__*/React.createElement("div", {
+  })) : null, dateInputs, rangeBox), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "grid",
       gridTemplateColumns: "1fr 1fr",
@@ -2242,7 +2617,8 @@ function FeePayModal({
       fontSize: 12.5,
       color: col('red'),
       fontWeight: 700
-    }
+    },
+    "data-err": "1"
   }, err) : null, /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
@@ -2262,14 +2638,159 @@ function FeePayModal({
     }
   }, "Cancel"), /*#__PURE__*/React.createElement("button", {
     className: "pbtn",
-    disabled: busy || !!blocked || (isPartial ? !pp || pp.tooMuch : !pv),
+    disabled: busy || !!blocked || (useRange ? !rpOk : !pp || pp.tooMuch),
     style: {
       flex: 2,
       justifyContent: "center"
     },
     onClick: submit,
     "data-confirm": "1"
-  }, busy ? "Saving…" : "Confirm " + (isPartial ? pp ? inr(pp.amount) : "" : pv ? inr(amount) : "")))));
+  }, busy ? "Saving…" : "Confirm " + (useRange ? rpOk ? inr(amount) : "" : pp ? inr(pp.amount) : "")))));
+}
+
+/* Director: change the dates of a saved payment (same money, reason required) */
+function PayDatesModal({
+  g,
+  onClose,
+  onSaved
+}) {
+  const [from, setFrom] = useState(String(g.period_from || "").slice(0, 10));
+  const [to, setTo] = useState(String(g.period_to || "").slice(0, 10));
+  const [reason, setReason] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const save = async () => {
+    if (busy) return;
+    if (!from || !to || to < from) {
+      setErr("From / To date sahi chunein.");
+      return;
+    }
+    if (reason.trim().length < 3) {
+      setErr("Reason likhna zaroori hai.");
+      return;
+    }
+    setErr("");
+    setBusy(true);
+    const {
+      data: res,
+      error
+    } = await SB.rpc("edit_fee_payment_dates", {
+      p_payment_id: g.first_id,
+      p_from: from,
+      p_to: to,
+      p_reason: reason.trim()
+    });
+    setBusy(false);
+    if (error) {
+      setErr(error.message || String(error));
+      return;
+    }
+    onSaved && onSaved(res);
+  };
+  const box = {
+    display: "flex",
+    flexDirection: "column",
+    gap: 5
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    className: "ovl",
+    onClick: onClose,
+    style: {
+      zIndex: 60
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "card",
+    style: {
+      padding: 20,
+      maxWidth: 380,
+      width: "100%"
+    },
+    onClick: e => e.stopPropagation()
+  }, /*#__PURE__*/React.createElement("b", {
+    className: "serif",
+    style: {
+      fontSize: 15
+    }
+  }, "Payment ki dates badlein"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: col('mut'),
+      margin: "6px 0 10px"
+    }
+  }, g.receipt_number || "", " · ", inr(g.gross), " · abhi ", dmy(g.period_from), " to ", dmy(g.period_to), /*#__PURE__*/React.createElement("br", null), "Amount wahi rahega — nayi dates ka hisaab bhi ", inr(g.gross), " hona chahiye."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "1fr 1fr",
+      gap: 10
+    }
+  }, /*#__PURE__*/React.createElement("label", {
+    style: box
+  }, /*#__PURE__*/React.createElement("span", {
+    style: lblStyle()
+  }, "From date"), /*#__PURE__*/React.createElement("input", {
+    className: "inp",
+    type: "date",
+    value: from,
+    onChange: e => setFrom(e.target.value),
+    "data-edit-from": "1"
+  })), /*#__PURE__*/React.createElement("label", {
+    style: box
+  }, /*#__PURE__*/React.createElement("span", {
+    style: lblStyle()
+  }, "To date"), /*#__PURE__*/React.createElement("input", {
+    className: "inp",
+    type: "date",
+    value: to,
+    onChange: e => setTo(e.target.value),
+    "data-edit-to": "1"
+  })), /*#__PURE__*/React.createElement("label", {
+    style: {
+      ...box,
+      gridColumn: "1/-1"
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: lblStyle()
+  }, "Reason (zaroori)"), /*#__PURE__*/React.createElement("input", {
+    className: "inp",
+    value: reason,
+    onChange: e => setReason(e.target.value),
+    placeholder: "e.g. galat mahina chuna tha",
+    "data-edit-reason": "1"
+  }))), err ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 10,
+      fontSize: 12.5,
+      color: col('red'),
+      fontWeight: 700
+    },
+    "data-edit-err": "1"
+  }, err) : null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 10,
+      marginTop: 14
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: onClose,
+    style: {
+      flex: 1,
+      padding: 9,
+      background: col('paper'),
+      border: "1px solid " + col('line'),
+      borderRadius: 9,
+      fontWeight: 700,
+      cursor: "pointer"
+    }
+  }, "Cancel"), /*#__PURE__*/React.createElement("button", {
+    className: "pbtn",
+    disabled: busy,
+    style: {
+      flex: 2,
+      justifyContent: "center"
+    },
+    onClick: save,
+    "data-edit-save": "1"
+  }, busy ? "Saving…" : "Save dates"))));
 }
 
 /* =====================================================================
@@ -2286,6 +2807,27 @@ function FeeHistoryModal({
 }) {
   const isDir = role === "director";
   const [busy, setBusy] = useState(false);
+  const [editG, setEditG] = useState(null);
+  const [edits, setEdits] = useState([]);
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    if (!isDir) return;
+    let live = true;
+    (async () => {
+      try {
+        const {
+          data: rows,
+          error
+        } = await SB.from("fee_payment_edits").select("*").eq("student_id", s.id).order("edited_at", {
+          ascending: false
+        });
+        if (live && !error) setEdits(rows || []);
+      } catch (e) {}
+    })();
+    return () => {
+      live = false;
+    };
+  }, [s.id, isDir, tick]);
   const groups = paymentGroups(data.fee_payments, s.id);
   const st = feeState(s);
   const rem = remainingAfterLeave(s, data);
@@ -2367,7 +2909,13 @@ function FeeHistoryModal({
       fontSize: 10.5,
       color: col('mut')
     }
-  }, g.receipt_number || "")), /*#__PURE__*/React.createElement("td", null, dmy(g.period_from), " → ", dmy(g.period_to)), /*#__PURE__*/React.createElement("td", null, g.months), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("b", null, inr(g.net)), g.discount > 0 ? /*#__PURE__*/React.createElement("div", {
+  }, g.receipt_number || "")), /*#__PURE__*/React.createElement("td", null, dmy(g.period_from), " → ", dmy(g.period_to), g.rows.length > 1 || groupBreakdown(g).some(x => x.a !== monthStartOf(x.a) || x.b !== monthEndOf(x.a)) ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10.5,
+      color: col('mut')
+    },
+    "data-hist-breakdown": g.key
+  }, breakdownText(groupBreakdown(g))) : null), /*#__PURE__*/React.createElement("td", null, g.months), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("b", null, inr(g.net)), g.discount > 0 ? /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 10.5,
       color: col('green')
@@ -2386,6 +2934,14 @@ function FeeHistoryModal({
   }, "🧾"), isDir ? /*#__PURE__*/React.createElement("button", {
     className: "mini",
     style: {
+      background: col('steel')
+    },
+    disabled: busy,
+    onClick: () => setEditG(g),
+    "data-edit-dates": g.first_id
+  }, "📅 Dates") : null, isDir ? /*#__PURE__*/React.createElement("button", {
+    className: "mini",
+    style: {
       background: col('red')
     },
     disabled: busy,
@@ -2393,7 +2949,36 @@ function FeeHistoryModal({
     "data-del": g.first_id
   }, "Delete") : null)))), !groups.length ? /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
     colSpan: "5"
-  }, "Koi payment nahi.")) : null))));
+  }, "Koi payment nahi.")) : null)), isDir && edits.length ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 12
+    },
+    "data-date-edits": "1"
+  }, /*#__PURE__*/React.createElement("b", {
+    style: {
+      fontSize: 12.5
+    }
+  }, "Dates badli gayi (history)"), edits.map(x => /*#__PURE__*/React.createElement("div", {
+    key: x.id,
+    style: {
+      fontSize: 11.5,
+      color: col('mut'),
+      marginTop: 4
+    }
+  }, dmy(String(x.edited_at || "").slice(0, 10)), " · ", x.receipt_number || "", ": ", dmy(x.old_from), "–", dmy(x.old_to), " → ", /*#__PURE__*/React.createElement("b", {
+    style: {
+      color: col('slate')
+    }
+  }, dmy(x.new_from), "–", dmy(x.new_to)), " · ", x.reason))) : null), editG ? /*#__PURE__*/React.createElement(PayDatesModal, {
+    g: editG,
+    onClose: () => setEditG(null),
+    onSaved: res => {
+      setEditG(null);
+      setTick(t => t + 1);
+      flash("Dates badli · Paid till " + (res && res.paid_till ? dmy(res.paid_till) : "—"));
+      refresh();
+    }
+  }) : null);
 }
 
 /* =====================================================================
@@ -2997,7 +3582,13 @@ function FeesPage({
     style: {
       fontSize: 11.5
     }
-  }, dmy(d.period_from || monthStartOf(d.month)), " → ", dmy(d.period_to || monthEndOf(d.month))), /*#__PURE__*/React.createElement("td", null, inr(d.payable), num0(d.discount) > 0 ? /*#__PURE__*/React.createElement("div", {
+  }, dmy(d.period_from || monthStartOf(d.month)), " → ", dmy(d.period_to || monthEndOf(d.month)), num0(d.pending) > 0 && num0(d.paid_amount) + num0(d.discount) > 0 && d.paid_to ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: col('amber'),
+      fontWeight: 700
+    },
+    "data-due-paidto": d.id
+  }, "paid ", dmy(d.period_from || monthStartOf(d.month)), " to ", dmy(d.paid_to)) : null), /*#__PURE__*/React.createElement("td", null, inr(d.payable), num0(d.discount) > 0 ? /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 10.5,
       color: col('green')
@@ -3466,12 +4057,12 @@ function StudentProfile({
     style: {
       fontSize: 12
     }
-  }, dmy(g.period_from), " → ", dmy(g.period_to), g.months > 1 ? /*#__PURE__*/React.createElement("div", {
+  }, dmy(g.period_from), " → ", dmy(g.period_to), g.rows.length > 1 || groupBreakdown(g).some(x => x.a !== monthStartOf(x.a) || x.b !== monthEndOf(x.a)) ? /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 10.5,
       color: col('mut')
     }
-  }, g.months, " months") : null), /*#__PURE__*/React.createElement("td", {
+  }, breakdownText(groupBreakdown(g))) : null), /*#__PURE__*/React.createElement("td", {
     style: {
       fontSize: 12
     }
