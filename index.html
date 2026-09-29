@@ -3731,6 +3731,19 @@ const monthName = s => {
 };
 const advanceOutstanding = (data, empId) => (data.salary_advances || []).filter(a => a.employee_id === empId).reduce((s, a) => s + num0(a.amount), 0) - (data.salary_runs || []).filter(r => r.employee_id === empId && r.status === "paid").reduce((s, r) => s + num0(r.advance_deduction), 0);
 
+/* attendance: every day is PRESENT by default; a row with present=false = ABSENT */
+const absentDays = (data, empId, from, to) => (data.staff_attendance || []).filter(a => a.employee_id === empId && a.present === false && String(a.date).slice(0, 10) >= String(from).slice(0, 10) && String(a.date).slice(0, 10) <= String(to).slice(0, 10)).length;
+/* salary row: paid rows keep the numbers frozen at payment; pending rows are live */
+const runDays = (data, r) => {
+  const total = dayDiff(String(r.period_from).slice(0, 10), String(r.period_to).slice(0, 10)) + 1;
+  const abs = r.status === "paid" ? num0(r.absent_days) : absentDays(data, r.employee_id, r.period_from, r.period_to);
+  return {
+    total,
+    absent: abs,
+    present: total - abs
+  };
+};
+
 /* salary cycle for "today": month due this cycle = previous month (paid on the 10th) */
 const salaryCycle = (data, today) => {
   today = today || istToday();
@@ -3837,7 +3850,7 @@ const printSalarySlip = (r, emp, hostelName, prof) => {
   const phone = String(emp && emp.mobile || "").replace(/\D/g, "").slice(-10);
   const msg = "Salary slip " + (r.slip_no || "") + " — " + (emp && emp.full_name || "") + ", " + monthName(r.month) + ": Net paid " + money(r.net) + " on " + dmy(r.paid_date) + " (" + String(r.mode || "").toUpperCase() + "). - DDD Hostel";
   const wa = "https://wa.me/" + (phone ? "91" + phone : "") + "?text=" + encodeURIComponent(msg);
-  w.document.write("<html><head><title>Salary Slip " + esc(r.slip_no || "") + "</title><style>" + "@page{size:A4;margin:14mm}body{font-family:Georgia,serif;color:#1f2630;max-width:760px;margin:0 auto;padding:18px}" + ".hd{display:flex;align-items:center;gap:14px;border-bottom:2px solid #1f2630;padding-bottom:10px}.logo{width:56px;height:56px;border-radius:12px;background:#2c3e57;color:#fff;display:grid;place-items:center;font-weight:800;font-size:18px}" + "h1{margin:0;font-size:22px}.sub{color:#666;font-size:12px}.meta{display:grid;grid-template-columns:1fr 1fr;gap:4px 24px;margin:14px 0;font-size:13.5px}.meta b{display:inline-block;min-width:120px;color:#555;font-weight:600}" + "table{width:100%;border-collapse:collapse;margin-top:8px;font-size:14px}td,th{border:1px solid #ccc;padding:7px 10px;text-align:left}th{background:#f3f1ec}.n{text-align:right}" + ".net{font-size:18px;font-weight:800;margin-top:12px;display:flex;justify-content:space-between;border:2px solid #1f2630;padding:10px 12px}.words{font-size:13px;margin-top:6px;color:#333}" + ".note{font-size:12px;color:#666;margin-top:10px}.sign{display:flex;justify-content:space-between;margin-top:60px;font-size:13px}.sign div{border-top:1px solid #333;padding-top:6px;width:40%;text-align:center}" + ".btns{margin:18px 0;display:flex;gap:10px}.btns a,.btns button{padding:10px 16px;border-radius:8px;border:none;font-weight:700;cursor:pointer;text-decoration:none;font-size:14px}" + "@media print{.btns{display:none}}</style></head><body>" + "<div class='btns'><button onclick='window.print()' style='background:#2c3e57;color:#fff'>Download PDF</button><a href='" + esc(wa) + "' target='_blank' style='background:#25D366;color:#fff'>Share on WhatsApp</a></div>" + "<div class='hd'><div class='logo'>DDD</div><div><h1>DDD Hostel</h1><div class='sub'>Salary Slip · " + esc(monthName(r.month)) + "</div></div><div style='margin-left:auto;text-align:right;font-size:13px'><b>Slip No.</b><br>" + esc(r.slip_no || "-") + "</div></div>" + "<div class='meta'><div><b>Staff</b>" + esc(emp && emp.full_name || "-") + "</div><div><b>Role</b>" + esc(emp && emp.role || "-") + "</div>" + "<div><b>Hostel</b>" + esc(hostelName || "-") + "</div><div><b>Month</b>" + esc(monthName(r.month)) + "</div>" + "<div><b>Period</b>" + esc(dmy(r.period_from) + " to " + dmy(r.period_to)) + "</div><div><b>Attendance days</b>" + esc(String(r.attendance_days || 0)) + "</div>" + "<div><b>UAN</b>" + esc(prof && prof.uan || "-") + "</div><div><b>PF No.</b>" + esc(prof && prof.pf_number || "-") + "</div></div>" + "<table><tr><th>Earnings</th><th class='n'>Amount</th></tr>" + row("Gross salary", money(r.gross)) + (num0(r.bonus) > 0 ? row("Bonus", money(r.bonus)) : "") + "</table>" + "<table><tr><th>Deductions</th><th class='n'>Amount</th></tr>" + row("Employee PF", money(r.employee_pf)) + row("Advance recovery", money(r.advance_deduction)) + row("Other deduction", money(r.other_deduction)) + "</table>" + "<div class='net'><span>Net Paid</span><span>" + money(r.net) + "</span></div><div class='words'>" + esc(amountInWords(r.net)) + "</div>" + "<div class='note'>Employer PF contribution: " + money(r.employer_pf) + " (paid by employer — not deducted from salary)</div>" + "<div class='meta' style='margin-top:14px'><div><b>Paid date</b>" + esc(dmy(r.paid_date)) + "</div><div><b>Mode</b>" + esc(String(r.mode || "-").toUpperCase() + (r.txn_ref ? " · " + r.txn_ref : "")) + "</div></div>" + (r.remarks ? "<div class='note'>Remarks: " + esc(r.remarks) + "</div>" : "") + "<div class='sign'><div>Employee signature</div><div>For DDD Hostel (Director)</div></div>" + "</body></html>");
+  w.document.write("<html><head><title>Salary Slip " + esc(r.slip_no || "") + "</title><style>" + "@page{size:A4;margin:14mm}body{font-family:Georgia,serif;color:#1f2630;max-width:760px;margin:0 auto;padding:18px}" + ".hd{display:flex;align-items:center;gap:14px;border-bottom:2px solid #1f2630;padding-bottom:10px}.logo{width:56px;height:56px;border-radius:12px;background:#2c3e57;color:#fff;display:grid;place-items:center;font-weight:800;font-size:18px}" + "h1{margin:0;font-size:22px}.sub{color:#666;font-size:12px}.meta{display:grid;grid-template-columns:1fr 1fr;gap:4px 24px;margin:14px 0;font-size:13.5px}.meta b{display:inline-block;min-width:120px;color:#555;font-weight:600}" + "table{width:100%;border-collapse:collapse;margin-top:8px;font-size:14px}td,th{border:1px solid #ccc;padding:7px 10px;text-align:left}th{background:#f3f1ec}.n{text-align:right}" + ".net{font-size:18px;font-weight:800;margin-top:12px;display:flex;justify-content:space-between;border:2px solid #1f2630;padding:10px 12px}.words{font-size:13px;margin-top:6px;color:#333}" + ".note{font-size:12px;color:#666;margin-top:10px}.sign{display:flex;justify-content:space-between;margin-top:60px;font-size:13px}.sign div{border-top:1px solid #333;padding-top:6px;width:40%;text-align:center}" + ".btns{margin:18px 0;display:flex;gap:10px}.btns a,.btns button{padding:10px 16px;border-radius:8px;border:none;font-weight:700;cursor:pointer;text-decoration:none;font-size:14px}" + "@media print{.btns{display:none}}</style></head><body>" + "<div class='btns'><button onclick='window.print()' style='background:#2c3e57;color:#fff'>Download PDF</button><a href='" + esc(wa) + "' target='_blank' style='background:#25D366;color:#fff'>Share on WhatsApp</a></div>" + "<div class='hd'><div class='logo'>DDD</div><div><h1>DDD Hostel</h1><div class='sub'>Salary Slip · " + esc(monthName(r.month)) + "</div></div><div style='margin-left:auto;text-align:right;font-size:13px'><b>Slip No.</b><br>" + esc(r.slip_no || "-") + "</div></div>" + "<div class='meta'><div><b>Staff</b>" + esc(emp && emp.full_name || "-") + "</div><div><b>Role</b>" + esc(emp && emp.role || "-") + "</div>" + "<div><b>Hostel</b>" + esc(hostelName || "-") + "</div><div><b>Month</b>" + esc(monthName(r.month)) + "</div>" + "<div><b>Period</b>" + esc(dmy(r.period_from) + " to " + dmy(r.period_to)) + "</div><div><b>Present / Absent</b>" + esc(String(r.attendance_days || 0) + " present · " + String(r.absent_days || 0) + " absent") + "</div>" + "<div><b>UAN</b>" + esc(prof && prof.uan || "-") + "</div><div><b>PF No.</b>" + esc(prof && prof.pf_number || "-") + "</div></div>" + "<table><tr><th>Earnings</th><th class='n'>Amount</th></tr>" + row("Gross salary", money(r.gross)) + (num0(r.bonus) > 0 ? row("Bonus", money(r.bonus)) : "") + "</table>" + "<table><tr><th>Deductions</th><th class='n'>Amount</th></tr>" + row("Employee PF", money(r.employee_pf)) + row("Advance recovery", money(r.advance_deduction)) + row("Other deduction", money(r.other_deduction)) + "</table>" + "<div class='net'><span>Net Paid</span><span>" + money(r.net) + "</span></div><div class='words'>" + esc(amountInWords(r.net)) + "</div>" + "<div class='note'>Employer PF contribution: " + money(r.employer_pf) + " (paid by employer — not deducted from salary)</div>" + "<div class='meta' style='margin-top:14px'><div><b>Paid date</b>" + esc(dmy(r.paid_date)) + "</div><div><b>Mode</b>" + esc(String(r.mode || "-").toUpperCase() + (r.txn_ref ? " · " + r.txn_ref : "")) + "</div></div>" + (r.remarks ? "<div class='note'>Remarks: " + esc(r.remarks) + "</div>" : "") + "<div class='sign'><div>Employee signature</div><div>For DDD Hostel (Director)</div></div>" + "</body></html>");
   w.document.close();
   w.focus();
 };
@@ -3984,9 +3997,10 @@ function StaffPage({
   (data.staff_salary_profile || []).forEach(p => {
     prof[p.employee_id] = p;
   });
+  // every day is present by default — only mark the day someone is ABSENT
   const toggle = async e => {
     if (busy) return;
-    const cur = att[e.id] && att[e.id].present;
+    const isAbsent = !!(att[e.id] && att[e.id].present === false);
     setBusy(e.id);
     const {
       error
@@ -3994,7 +4008,7 @@ function StaffPage({
       employee_id: e.id,
       hostel_id: e.hostel_id,
       date: today,
-      present: !cur,
+      present: isAbsent,
       created_by: session.user.id
     }, {
       onConflict: "employee_id,date"
@@ -4004,9 +4018,10 @@ function StaffPage({
       flash("⚠ " + error.message);
       return;
     }
-    flash(cur ? "Absent mark hua" : "Present mark hua");
+    flash(isAbsent ? e.full_name + " — absent hataya (present)" : e.full_name + " — aaj absent");
     refresh();
   };
+  const mStart = monthStartOf(today);
   const heads = ["Name", "Role", "Hostel"].concat(isDir ? ["Salary", "Advance"] : []).concat(["Today", ""]);
   return /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(Header, {
     entity: "employees"
@@ -4064,7 +4079,8 @@ function StaffPage({
   }, /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, heads.map(c => /*#__PURE__*/React.createElement("th", {
     key: c
   }, c)))), /*#__PURE__*/React.createElement("tbody", null, list.map(e => {
-    const present = att[e.id] && att[e.id].present;
+    const absent = att[e.id] && att[e.id].present === false;
+    const monthAbs = absentDays(data, e.id, mStart, today);
     const out = isDir ? advanceOutstanding(data, e.id) : 0;
     return /*#__PURE__*/React.createElement("tr", {
       key: e.id,
@@ -4095,11 +4111,19 @@ function StaffPage({
       className: "mini",
       disabled: busy === e.id,
       onClick: () => toggle(e),
-      "data-present": e.id,
+      "data-absent": e.id,
+      title: absent ? "Galti se mark hua? Click karke hataayein" : "Sirf jis din staff nahi aaya, us din dabayein",
       style: {
-        background: present ? col('green') : col('slate')
+        background: absent ? col('red') : col('slate')
       }
-    }, present ? "✓ Present" : "Mark Present")), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("span", {
+    }, absent ? "✗ Absent (undo)" : "Mark Absent"), monthAbs ? /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 10.5,
+        color: col('red'),
+        marginTop: 3
+      },
+      "data-month-absent": e.id
+    }, "Is mahine ", monthAbs, " din absent") : null), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("span", {
       style: {
         display: "inline-flex",
         gap: 6,
@@ -4580,7 +4604,18 @@ function SalaryEditModal({
       fontSize: 12,
       color: col('mut')
     }
-  }, "Advance outstanding (is row ke liye): ", inr(Math.max(avail, 0))), /*#__PURE__*/React.createElement("div", {
+  }, "Advance outstanding (is row ke liye): ", inr(Math.max(avail, 0))), (() => {
+    const dd = runDays(ctx.data, run);
+    return /*#__PURE__*/React.createElement("div", {
+      style: {
+        marginTop: 4,
+        fontSize: 12,
+        color: dd.absent ? col('red') : col('mut'),
+        fontWeight: dd.absent ? 700 : 400
+      },
+      "data-edit-absent": "1"
+    }, "Is mahine ", dd.absent, " din absent (", dd.present, "/", dd.total, " present) — salary apne aap nahi kati; chahein to \"Other deduction\" mein daalein.");
+  })(), /*#__PURE__*/React.createElement("div", {
     style: {
       marginTop: 10,
       padding: 10,
@@ -5065,7 +5100,7 @@ function SalaryPage({
     style: {
       overflowX: "auto"
     }
-  }, /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Staff", "Hostel", "Days", "Gross", "Emp PF", "Adv cut", "Other cut", "Bonus", "NET", "Status", ""].map(c => /*#__PURE__*/React.createElement("th", {
+  }, /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Staff", "Hostel", "Absent / Present", "Gross", "Emp PF", "Adv cut", "Other cut", "Bonus", "NET", "Status", ""].map(c => /*#__PURE__*/React.createElement("th", {
     key: c
   }, c)))), /*#__PURE__*/React.createElement("tbody", null, rows.map(r => {
     const e = empOf(r.employee_id),
@@ -5080,7 +5115,21 @@ function SalaryPage({
         fontSize: 10.5,
         color: col('mut')
       }
-    }, e.role)), /*#__PURE__*/React.createElement("td", null, hName(r.hostel_id)), /*#__PURE__*/React.createElement("td", null, r.attendance_days, pr ? /*#__PURE__*/React.createElement("div", {
+    }, e.role)), /*#__PURE__*/React.createElement("td", null, hName(r.hostel_id)), /*#__PURE__*/React.createElement("td", {
+      "data-sal-days": r.id
+    }, (() => {
+      const dd = runDays(data, r);
+      return /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("b", {
+        style: {
+          color: dd.absent ? col('red') : col('green')
+        }
+      }, dd.absent, " absent"), /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontSize: 10.5,
+          color: col('mut')
+        }
+      }, dd.present, "/", dd.total, " present"));
+    })(), pr ? /*#__PURE__*/React.createElement("div", {
       style: {
         fontSize: 10.5,
         color: col('mut')
