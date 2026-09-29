@@ -6,11 +6,11 @@
 -- ---------- STEP 1: CONFIRM (read-only) — pehli 4 rows true ----------
 select '022 live (anon cannot generate dues)' chk, (not has_function_privilege('anon', 'public.generate_monthly_dues(date)', 'execute'))::text ok
 union all select 'record_fee_payment = repo 017',
-  ((select md5(prosrc) from pg_proc where oid = to_regprocedure('public.record_fee_payment(uuid,int,numeric,numeric,text,date,text,text,uuid)')) = 'f7b0b29c4d08c6dbf0c03bb7889cdcf1')::text
+  ((select md5(regexp_replace(regexp_replace(prosrc, '--[^\n]*', '', 'g'), '\s+', '', 'g')) from pg_proc where oid = to_regprocedure('public.record_fee_payment(uuid,int,numeric,numeric,text,date,text,text,uuid)')) = '35422694e51971f79ef6aa415f67af65')::text
 union all select 'record_partial_payment = repo 017',
-  ((select md5(prosrc) from pg_proc where oid = to_regprocedure('public.record_partial_payment(uuid,numeric,text,date,text,text,uuid)')) = 'a03f7b49c697ae6adb99aad8daff0a00')::text
+  ((select md5(regexp_replace(regexp_replace(prosrc, '--[^\n]*', '', 'g'), '\s+', '', 'g')) from pg_proc where oid = to_regprocedure('public.record_partial_payment(uuid,numeric,text,date,text,text,uuid)')) = 'c778c5ffd054b7b62d2ed3524e0318f3')::text
 union all select 'compute_paid_till = repo 017',
-  ((select md5(prosrc) from pg_proc where oid = to_regprocedure('public.compute_paid_till(uuid,date,numeric)')) = 'bd73404c4cea2c0f1568d84fdbb3728a')::text
+  ((select md5(regexp_replace(regexp_replace(prosrc, '--[^\n]*', '', 'g'), '\s+', '', 'g')) from pg_proc where oid = to_regprocedure('public.compute_paid_till(uuid,date,numeric)')) = '3a7fe7e6126470441ebb723142fa4ce7')::text
 union all select 'info: dues rows', (select count(*) from public.monthly_dues)::text
 union all select 'info: partly paid dues (paid > 0, pending > 0)',
   (select count(*) from public.monthly_dues where coalesce(pending, 0) > 0 and coalesce(paid_amount, 0) + coalesce(discount, 0) > 0)::text

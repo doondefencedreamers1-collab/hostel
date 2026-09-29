@@ -31,17 +31,17 @@ begin
     raise exception '024 aborted: 022 (security hotfix) pehle live hona chahiye.';
   end if;
   if to_regprocedure('public.record_fee_payment_range(uuid,date,date,numeric,numeric,text,date,text,text,uuid,boolean)') is null then
-    -- first run: live code must be exactly the repo 017 version we rewrite
-    h := (select md5(prosrc) from pg_proc where oid = to_regprocedure('public.record_fee_payment(uuid,int,numeric,numeric,text,date,text,text,uuid)'));
-    if h is distinct from 'f7b0b29c4d08c6dbf0c03bb7889cdcf1' then
+    -- first run: live code must be the repo 017 version we rewrite (comments / spaces / line endings ignored)
+    h := (select md5(regexp_replace(regexp_replace(prosrc, '--[^\n]*', '', 'g'), '\s+', '', 'g')) from pg_proc where oid = to_regprocedure('public.record_fee_payment(uuid,int,numeric,numeric,text,date,text,text,uuid)'));
+    if h is distinct from '35422694e51971f79ef6aa415f67af65' then
       raise exception '024 aborted: live record_fee_payment repo (017) se alag hai (%). Mujhe batayein.', h;
     end if;
-    h := (select md5(prosrc) from pg_proc where oid = to_regprocedure('public.record_partial_payment(uuid,numeric,text,date,text,text,uuid)'));
-    if h is distinct from 'a03f7b49c697ae6adb99aad8daff0a00' then
+    h := (select md5(regexp_replace(regexp_replace(prosrc, '--[^\n]*', '', 'g'), '\s+', '', 'g')) from pg_proc where oid = to_regprocedure('public.record_partial_payment(uuid,numeric,text,date,text,text,uuid)'));
+    if h is distinct from 'c778c5ffd054b7b62d2ed3524e0318f3' then
       raise exception '024 aborted: live record_partial_payment repo (017) se alag hai (%). Mujhe batayein.', h;
     end if;
-    h := (select md5(prosrc) from pg_proc where oid = to_regprocedure('public.compute_paid_till(uuid,date,numeric)'));
-    if h is distinct from 'bd73404c4cea2c0f1568d84fdbb3728a' then
+    h := (select md5(regexp_replace(regexp_replace(prosrc, '--[^\n]*', '', 'g'), '\s+', '', 'g')) from pg_proc where oid = to_regprocedure('public.compute_paid_till(uuid,date,numeric)'));
+    if h is distinct from '3a7fe7e6126470441ebb723142fa4ce7' then
       raise exception '024 aborted: live compute_paid_till repo (017) se alag hai (%). Mujhe batayein.', h;
     end if;
   end if;
@@ -147,7 +147,7 @@ declare
   dim  int;
   owed numeric;
   ptd  date;
-  out  jsonb := '[]';
+  v_out jsonb := '[]';
 begin
   s := (select x from public.students x where x.id = p_sid);
   if s.id is null then raise exception 'Student not found'; end if;
@@ -197,11 +197,11 @@ begin
       owed := least(coalesce(d.pending, 0),
                     public.ddd_cum_fee(f, dim, extract(day from b)::int) - public.ddd_cum_fee(f, dim, extract(day from a)::int - 1));
     end if;
-    out := out || jsonb_build_object('due_id', d.id, 'month', m, 'from', a, 'to', b, 'owed', owed,
+    v_out := v_out || jsonb_build_object('due_id', d.id, 'month', m, 'from', a, 'to', b, 'owed', owed,
                                      'whole', (a = coalesce(d.period_from, m) and b = coalesce(d.period_to, me)));
     m := (m + interval '1 month')::date;
   end loop;
-  return out;
+  return v_out;
 end $$;
 
 -- ---------------------------------------------------------------------
