@@ -553,7 +553,9 @@ function FormModal({
   initial,
   onClose,
   onSave,
-  validate
+  validate,
+  dupCheck,
+  onOpenDup
 }) {
   const [v, setV] = useState(() => {
     const o = {
@@ -570,7 +572,9 @@ function FormModal({
   }));
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
-  const submit = async () => {
+  const [dups, setDups] = useState(null);
+  const [dupOk, setDupOk] = useState(false);
+  const submit = async force => {
     if (busy) return; // double-submit guard
     const miss = [],
       bad = [];
@@ -599,6 +603,14 @@ function FormModal({
       const ve = validate(v);
       if (ve) {
         setErr(ve);
+        return;
+      }
+    }
+    if (dupCheck && force !== true && !dupOk) {
+      const d = dupCheck(v);
+      if (d && d.length) {
+        setErr("");
+        setDups(d);
         return;
       }
     }
@@ -697,7 +709,15 @@ function FormModal({
     step: f.type === "number" && f.int ? 1 : undefined,
     value: v[f.k] ?? "",
     onChange: e => set(f.k, f.type === "number" ? e.target.value === "" ? "" : Number(e.target.value) : e.target.value)
-  })))), err ? /*#__PURE__*/React.createElement("div", {
+  })))), dups ? /*#__PURE__*/React.createElement(DupPanel, {
+    dups: dups,
+    onOpen: d => onOpenDup && onOpenDup(d),
+    onAdd: () => {
+      setDupOk(true);
+      setDups(null);
+      submit(true);
+    }
+  }) : null, err ? /*#__PURE__*/React.createElement("div", {
     style: {
       padding: "0 20px",
       fontSize: 12.5,
@@ -729,7 +749,8 @@ function FormModal({
       flex: 2,
       justifyContent: "center"
     },
-    onClick: submit
+    onClick: () => submit(false),
+    "data-form-save": "1"
   }, busy ? "Saving…" : "Save"))));
 }
 
@@ -6853,6 +6874,113 @@ function ReportsPage({
   }, "No hostels.")) : null))));
 }
 
+/* =====================================================================
+   021 HOTFIX — Edit must UPDATE the same record, Add must INSERT one row.
+   Duplicate warning on Add (students: name + father / mobile / adm. no.;
+   staff: name + phone).
+   ===================================================================== */
+const dupNorm = s => String(s == null ? "" : s).toLowerCase().replace(/\s+/g, " ").trim();
+const dupPhone = s => String(s == null ? "" : s).replace(/[^0-9]/g, "").slice(-10);
+const findDuplicates = (entity, v, data, hName) => {
+  const out = [];
+  if (entity === "students") {
+    const nm = dupNorm(v.full_name),
+      fa = dupNorm(v.father_name),
+      mob = dupPhone(v.mobile),
+      adm = dupNorm(v.admission_number);
+    (data.students || []).forEach(s => {
+      if (v.id && s.id === v.id) return;
+      const why = [];
+      if (nm && fa && nm === dupNorm(s.full_name) && fa === dupNorm(s.father_name)) why.push("same name + father");
+      if (mob.length === 10 && mob === dupPhone(s.mobile)) why.push("same mobile");
+      if (adm && adm === dupNorm(s.admission_number)) why.push("same admission no.");
+      if (why.length) out.push({
+        entity,
+        id: s.id,
+        row: s,
+        title: s.full_name + (s.father_name ? " s/o " + s.father_name : ""),
+        sub: [hName(s.hostel_id), s.admission_number, s.mobile, s.status].filter(Boolean).join(" · "),
+        why: why.join(", ")
+      });
+    });
+  } else if (entity === "employees") {
+    const nm = dupNorm(v.full_name),
+      mob = dupPhone(v.mobile);
+    (data.employees || []).forEach(e => {
+      if (v.id && e.id === v.id) return;
+      if (nm && mob.length === 10 && nm === dupNorm(e.full_name) && mob === dupPhone(e.mobile)) out.push({
+        entity,
+        id: e.id,
+        row: e,
+        title: e.full_name,
+        sub: [hName(e.hostel_id), e.role, e.mobile, e.status].filter(Boolean).join(" · "),
+        why: "same name + phone"
+      });
+    });
+  }
+  return out;
+};
+function DupPanel({
+  dups,
+  onOpen,
+  onAdd
+}) {
+  const staff = dups[0] && dups[0].entity === "employees";
+  return /*#__PURE__*/React.createElement("div", {
+    "data-dup-panel": "1",
+    style: {
+      margin: "0 20px 10px",
+      padding: 12,
+      borderRadius: 10,
+      border: "1px solid " + col('amber'),
+      background: "#fdf4e0"
+    }
+  }, /*#__PURE__*/React.createElement("b", {
+    style: {
+      color: col('ink'),
+      fontSize: 13.5
+    }
+  }, "⚠ ", staff ? "Yeh staff pehle se hai" : "Yeh student pehle se hai", " — kholen?"), dups.slice(0, 5).map(d => /*#__PURE__*/React.createElement("div", {
+    key: d.id,
+    style: {
+      display: "flex",
+      gap: 8,
+      alignItems: "center",
+      marginTop: 8,
+      fontSize: 12.5
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: 1
+    }
+  }, /*#__PURE__*/React.createElement("b", null, d.title), /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: col('mut'),
+      fontSize: 11.5
+    }
+  }, d.sub, " · ", /*#__PURE__*/React.createElement("i", null, d.why))), /*#__PURE__*/React.createElement("button", {
+    className: "mini",
+    style: {
+      background: col('slate')
+    },
+    onClick: () => onOpen(d),
+    "data-dup-open": d.id
+  }, "Kholen →"))), /*#__PURE__*/React.createElement("button", {
+    onClick: onAdd,
+    "data-dup-add": "1",
+    style: {
+      marginTop: 10,
+      border: "none",
+      background: "none",
+      color: col('red'),
+      fontWeight: 700,
+      cursor: "pointer",
+      fontSize: 12.5,
+      padding: 0
+    }
+  }, "Nahi, yeh alag ", staff ? "staff" : "student", " hai — phir bhi naya add karein"));
+}
+
 function App() {
   const [session, setSession] = useState(null);
   const [profile, setProfile] = useState(null);
@@ -6905,14 +7033,19 @@ function App() {
     setOpen(false);
     try { window.scrollTo(0, 0); } catch (e) {}
   };
-  // staff save: employee row + Director-only salary profile
-  const saveStaff = async v => {
+  // staff save: employee row + Director-only salary profile.
+  // Edit = UPDATE the record the form was opened for (exactly 1 row); Add = INSERT with a new uuid.
+  const saveStaff = async (v, editId) => {
     const sal = v._sal ? normSalProfile(v._sal) : null;
     const row = clean(v);
     delete row.id;
-    let id = v.id, error;
-    if (id) ({ error } = await SB.from("employees").update(row).eq("id", id));
-    else {
+    if (editId && v.id && v.id !== editId) throw new Error("Save roka gaya: form ka record badal gaya. Page refresh karke dobara Edit karein.");
+    let id = editId, error;
+    if (id) {
+      const res = await SB.from("employees").update(row).eq("id", id).select("id");
+      error = res.error;
+      if (!error && (!res.data || res.data.length !== 1)) throw new Error("Staff update nahi hua (0 rows) — permission nahi hai ya record delete ho chuka hai. Koi naya staff NAHI bana.");
+    } else {
       id = crypto.randomUUID();
       ({ error } = await SB.from("employees").insert({ ...row, id, created_by: session.user.id }));
     }
@@ -6921,7 +7054,7 @@ function App() {
       const { error: pe } = await SB.from("staff_salary_profile").upsert({ employee_id: id, ...sal, updated_by: session.user.id, updated_at: new Date().toISOString() }, { onConflict: "employee_id" });
       if (pe) throw new Error("Staff save hua, salary save nahi hui: " + pe.message);
     }
-    flash("Saved");
+    flash(editId ? "Updated \u2713" : "Added \u2713");
     refresh();
   };
   const saveFeeGrace = async n => {
@@ -7152,33 +7285,39 @@ function App() {
   const uName = id => { const u = (data.users || []).find(x => x.id === id); return u ? (u.full_name || u.email) : (id ? id.slice(0, 8) : "—"); };
 
   // generic db ops
-  const save = async (table, row) => {
-    let e, inserted;
-    if (row.id) {
-      const {
-        id,
-        ...rest
-      } = row;
-      ({
-        error: e
-      } = await SB.from(table).update(clean(rest)).eq("id", id));
+  // Edit = UPDATE the record the form was opened for (exactly one row); Add = INSERT with a new uuid.
+  // opts.editId: id captured when the Edit form opened. opts.throwErr: throw (form stays open) instead of alert.
+  const save = async (table, row, opts) => {
+    opts = opts || {};
+    const editId = opts.editId || row.id || null;
+    const fail = m => { if (opts.throwErr) throw new Error(m); alert(m); return false; };
+    let e = null;
+    let newId = null;
+    if (editId) {
+      const { id, ...rest } = row;
+      if (id && id !== editId) return fail("Save roka gaya: form ka record badal gaya. Page refresh karke dobara Edit karein.");
+      const res = await SB.from(table).update(clean(rest)).eq("id", editId).select("id");
+      e = res.error;
+      if (!e && (!res.data || res.data.length !== 1)) return fail("Update nahi hua (0 rows) — is record ko badalne ki permission nahi hai ya record delete ho chuka hai. Koi naya record NAHI bana.");
     } else {
-      const stamped = { ...clean(row), created_by: session.user.id };
+      newId = crypto.randomUUID();
+      const stamped = { ...clean(row), id: newId, created_by: session.user.id };
       if (table === "expenses") stamped.added_by = session.user.id;
-      const res = await SB.from(table).insert(stamped).select().maybeSingle();
-      e = res.error; inserted = res.data;
+      ({ error: e } = await SB.from(table).insert(stamped));
     }
-    if (e) { alert("Save nahi hua:\n\n" + e.message); return; }
-    // jab hostel ka warden likho, wo Staff mein bhi aa jaye
+    if (e) return fail("Save nahi hua:\n\n" + e.message);
+    // hostel ka warden Staff mein bhi aa jaye — sirf naye hostel par ya warden ka naam badalne par, aur agar pehle se na ho
     if (table === "hostels" && row.manager_name) {
-      const hid = row.id || (inserted && inserted.id);
-      if (hid) {
-        const exists = (data.employees || []).some(emp => emp.hostel_id === hid && emp.role === "Warden");
-        if (!exists) await SB.from("employees").insert({ full_name: row.manager_name, role: "Warden", hostel_id: hid, mobile: row.contact_number || null, created_by: session.user.id });
-      }
+      const hid = editId || newId;
+      const old = editId ? (data.hostels || []).find(h => h.id === editId) : null;
+      const nm = String(row.manager_name).trim().toLowerCase();
+      const changed = !old || String(old.manager_name || "").trim().toLowerCase() !== nm;
+      const exists = (data.employees || []).some(emp => emp.hostel_id === hid && (/warden/i.test(emp.role || "") && String(emp.full_name || "").trim().toLowerCase() === nm || String(emp.full_name || "").trim().toLowerCase() === nm));
+      if (hid && changed && !exists) await SB.from("employees").insert({ id: crypto.randomUUID(), full_name: row.manager_name, role: "Warden", hostel_id: hid, mobile: row.contact_number || null, created_by: session.user.id });
     }
-    flash("Saved");
+    flash(editId ? "Updated \u2713" : "Added \u2713");
     refresh();
+    return true;
   };
   const del = async (table, id) => {
     const _heavy = (table === "hostels" || table === "students");
@@ -8620,9 +8759,12 @@ function App() {
     title: modal.title || (modal.item.id ? "Edit " : "Add ") + modal.entity,
     fields: modal.fields || FIELDS[modal.entity],
     validate: modal.validate || VALIDATE[modal.entity],
+    key: (modal.entity || "") + ":" + (modal.item && modal.item.id || "new"),
     initial: modal.item,
+    dupCheck: !(modal.item && modal.item.id) && (modal.entity === "students" || modal.entity === "employees") ? v => findDuplicates(modal.entity, v, data, hName) : null,
+    onOpenDup: d => d.entity === "students" ? (setModal(null), setProfId(d.id)) : setModal({ entity: "employees", item: d.row }),
     onClose: () => setModal(null),
-    onSave: v => modal.onSave ? modal.onSave(v) : modal.entity === "employees" && role === "director" ? saveStaff(v) : save(modal.entity, v)
+    onSave: v => modal.onSave ? modal.onSave(v) : modal.entity === "employees" && role === "director" ? saveStaff(v, modal.item && modal.item.id) : save(modal.entity, v, { editId: modal.item && modal.item.id, throwErr: true })
   }), contact && /*#__PURE__*/React.createElement(Contact, {
     c: contact,
     onClose: () => setContact(null)
