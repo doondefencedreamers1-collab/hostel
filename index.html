@@ -379,7 +379,7 @@ const {
 const SUPABASE_URL = "https://sttwoctnxfdemmltxijd.supabase.co";
 const SUPABASE_ANON = "sb_publishable_9KhrvINU5ERCWgcr3l970w_HGChNO0J";
 // P1: app ka version — har deploy par badlein. Top bar mein dikhta hai (phone par purana version chal raha hai ya naya).
-const APP_VERSION = "2026-10-09-p1";
+const APP_VERSION = "2026-10-09-p2b";
 try {
   console.info("DDD Hostel app v" + APP_VERSION);
 } catch (e) {}
@@ -1314,6 +1314,10 @@ const monLabel = s => {
   return ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][m - 1] + " " + String(y).slice(2);
 };
 const dueStart = d => String(d.period_from || d.month || "").slice(0, 10);
+/* P2 (026): Cancelled (void) bill = fee 0, pending 0. Kabhi unpaid / overdue / billed nahi gina jaata, Receive nahi. */
+const isVoidDue = d => !!d && d.status === "void";
+/* P2 (026): purana duplicate jo naye record mein merge hua (merged_into + Left). 026 na chala ho to merged_into hai hi nahi = false. */
+const isMergedOld = s => !!s && !!s.merged_into && s.status === "left";
 
 /* "₹9,000/mo" · "₹54,000/6 mo" · "₹1,08,000/yr" · "₹2,16,000/2 yr" */
 const planLabel = s => {
@@ -1396,7 +1400,7 @@ const feeState = (s, today, grace) => {
 /* Pending amount that is actually due (period already started) */
 const startedPending = (dues, today) => {
   today = today || istToday();
-  return (dues || []).filter(d => num0(d.pending) > 0 && dueStart(d) && dueStart(d) <= today);
+  return (dues || []).filter(d => num0(d.pending) > 0 && !isVoidDue(d) && dueStart(d) && dueStart(d) <= today);
 };
 
 /* Pending Fees card rule: pending on due + overdue months, billable students only */
@@ -1422,7 +1426,7 @@ const remainingAfterLeave = (s, data) => {
   if (!s || s.status !== "left" || !s.paid_till) return null;
   const from = String(s.exit_date || istToday()).slice(0, 10);
   if (String(s.paid_till).slice(0, 10) <= from) return null;
-  const rows = (data.monthly_dues || []).filter(d => d.student_id === s.id && num0(d.pending) <= 0 && dueStart(d) > from);
+  const rows = (data.monthly_dues || []).filter(d => d.student_id === s.id && num0(d.pending) <= 0 && !isVoidDue(d) && dueStart(d) > from);
   if (!rows.length) return null;
   return {
     months: rows.length,
@@ -1571,6 +1575,8 @@ const cumFee = (F, dim, k) => Math.round(num0(F) * Math.max(0, k) / dim);
 const dueFullFee = (d, s) => {
   const ms = monthStartOf(d.month);
   const pf = String(d.period_from || ms).slice(0, 10);
+  // P2 (026): exit par kata bill (1 tareekh se, mahine ke end se pehle) = poore mahine ka rate, DB ddd_due_paid_to / ddd_fee_range_plan jaisa
+  if (pf <= ms && String(d.period_to || monthEndOf(d.month)).slice(0, 10) < monthEndOf(d.month) && num0(s && s.monthly_fee) > 0) return num0(s.monthly_fee);
   return pf <= ms ? num0(d.fee_amount) : num0(s && s.monthly_fee);
 };
 const derivePaidTo = (d, s) => {
@@ -1649,6 +1655,10 @@ const rangePreview = (s, dues, from, to, opt) => {
     const a = from > m ? from : m;
     const b = to < me ? to : me;
     const d0 = byMonth[m];
+    // P2 (026): Cancelled bill wale mahine ki fee nahi li ja sakti (DB is mahine ko "paid" bana deta)
+    if (isVoidDue(d0)) return {
+      err: monLabel(m) + " ka bill Cancelled hai — is mahine ki fee nahi le sakte. Dates badlein."
+    };
     const fee0 = monthFee(s.monthly_fee, s.joining_date, m);
     const d = d0 || {
       month: m,
@@ -1701,7 +1711,7 @@ const rangePreview = (s, dues, from, to, opt) => {
   const planDisc = rows.every(r => r.whole) && rows.length === pm && s.plan_amount != null && s.plan_amount !== "" && num0(s.plan_amount) < std ? Math.min(gross, std - num0(s.plan_amount)) : 0;
   // paid till after this payment = paid_to of the first due still pending
   const after = {};
-  mine.forEach(d => {
+  mine.filter(d => !isVoidDue(d)).forEach(d => { // P2: Cancelled bill Paid Till mein nahi gina jaata (DB 026 jaisa)
     after[d.id] = {
       pf: String(d.period_from || monthStartOf(d.month)).slice(0, 10),
       pt: String(d.period_to || monthEndOf(d.month)).slice(0, 10),
@@ -1996,7 +2006,241 @@ const STU_STATUS_OPTS = [{
   value: "left",
   label: "Left"
 }];
-const validateStudent = (v, init) => {
+/* P2b (026 D-a, AUTH-5): Exit Date ki seema, DB (026) jaisi. Sirf NAYI / BADLI Exit Date par (saved tareekh na badli = koi rok nahi).
+   Warden / Manager (Director nahi): sirf Left ke saath, aaj se 10 din pehle tak (aage aaj + 31 tak).
+   Director: joining date ke baad koi bhi tareekh (P1 wala aaj + 31 ka rule Left par pehle jaisa). */
+const P2B_EXIT_DAYS = 10;
+const p2bExitErr = (v, init, role) => {
+  const ex = String(v.exit_date || "").slice(0, 10);
+  if (!ex || ex === String(init && init.exit_date || "").slice(0, 10)) return "";
+  if (v.joining_date && ex < String(v.joining_date).slice(0, 10)) return "Exit date joining date se pehle nahi ho sakti.";
+  if (ex > addDaysYmd(istToday(), 31)) return "Exit date aaj se 31 din se zyada aage nahi ho sakti.";
+  if (role === "director") return "";
+  if ((v.status || "active") !== "left") return "Active / Temp Leave student ki Exit Date sirf Director laga sakte hain.";
+  if (ex < addDaysYmd(istToday(), -P2B_EXIT_DAYS)) return "Itni purani Exit Date sirf Director laga sakte hain (warden: pichhle 10 din tak)";
+  return "";
+};
+/* P2b (026 D-b, STUD-M2): Left student wapas Active / Temp Leave = sawaal (galti se Left / wapas aaya + wapsi ki tareekh).
+   Sirf tab jab 026 chal chuka ho (students.rejoined_on column hai). 026 na chala ho to app pehle (P2) jaisa. */
+const p2bHasRejoin = s => !!s && Object.prototype.hasOwnProperty.call(s, "rejoined_on");
+const p2bRejoinAsk = init => !!init && !!init.id && init.status === "left" && !init.merged_into && p2bHasRejoin(init);
+const p2bRejoinDateErr = (d, init, joining) => {
+  d = String(d || "").slice(0, 10);
+  if (!d) return "Wapsi ki tareekh daalein.";
+  const ex = String(init && init.exit_date || "").slice(0, 10);
+  if (ex && d < ex) return "Wapsi ki tareekh Exit Date (" + dmy(ex) + ") se pehle nahi ho sakti.";
+  const jd = String(joining || "").slice(0, 10);
+  if (jd && d < jd) return "Wapsi ki tareekh joining date se pehle nahi ho sakti.";
+  if (d > addDaysYmd(istToday(), 31)) return "Wapsi ki tareekh aaj se 31 din se zyada aage nahi ho sakti.";
+  return "";
+};
+const p2bRejoinErr = (v, init) => {
+  if (!p2bRejoinAsk(init) || (v.status || "active") === "left") return "";
+  if (v._rejoin === "mistake") return "";
+  if (v._rejoin === "back") return p2bRejoinDateErr(v.rejoined_on, init, v.joining_date || init.joining_date);
+  return "Pehle batayein: galti se Left hua tha, ya wapas aaya hai? (Status dobara chunein)";
+};
+const RejoinAsk = ({
+  s0,
+  joining,
+  onPick,
+  onCancel
+}) => {
+  // P2b (026, STUD-M2): Left student wapas Active / Temp Leave. Ek sawaal, do jawab. "Wapas aaya hai" = wapsi ki tareekh zaroori.
+  const [step, setStep] = useState(1);
+  const [d, setD] = useState("");
+  const [err, setErr] = useState("");
+  const t0 = istToday();
+  const ok = () => {
+    const e = p2bRejoinDateErr(d, s0, joining);
+    if (e) {
+      setErr(e);
+      return;
+    }
+    onPick("back", d);
+  };
+  const choice = {
+    display: "block",
+    width: "100%",
+    textAlign: "left",
+    padding: "10px 12px",
+    marginTop: 10,
+    borderRadius: 10,
+    border: "1px solid " + col('line'),
+    background: col('card'),
+    color: col('ink'),
+    cursor: "pointer",
+    font: "inherit"
+  };
+  const sub = {
+    fontSize: 11.5,
+    color: col('mut'),
+    marginTop: 3,
+    fontWeight: 400
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    className: "ovl",
+    style: {
+      zIndex: 70
+    },
+    onClick: e => {
+      if (e.target === e.currentTarget) onCancel();
+    },
+    "data-rejoin-ask": "1"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "card",
+    style: {
+      maxWidth: 420,
+      width: "100%",
+      padding: 18
+    },
+    onClick: e => e.stopPropagation()
+  }, /*#__PURE__*/React.createElement("b", {
+    className: "serif",
+    style: {
+      fontSize: 16
+    }
+  }, "Ye student Left tha — kya hua?"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12.5,
+      color: col('mut'),
+      marginTop: 4
+    }
+  }, (s0.full_name || "") + (s0.exit_date ? " · Exit Date " + dmy(s0.exit_date) : "")), step === 1 ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    style: choice,
+    onClick: () => onPick("mistake", ""),
+    "data-rejoin-choice": "mistake"
+  }, /*#__PURE__*/React.createElement("b", null, "Galti se Left hua tha (purane bill wapas)"), /*#__PURE__*/React.createElement("div", {
+    style: sub
+  }, "Exit Date hat jayegi. Left ki wajah se Cancel hue saare bill wapas aa jayenge, jaise student gaya hi nahi tha.")), /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    style: choice,
+    onClick: () => {
+      setStep(2);
+      setErr("");
+    },
+    "data-rejoin-choice": "back"
+  }, /*#__PURE__*/React.createElement("b", null, "Wapas aaya hai (nayi tareekh se)"), /*#__PURE__*/React.createElement("div", {
+    style: sub
+  }, "Beech ke mahine (jab student hostel mein nahi tha) Cancelled hi rahenge. Fee wapsi ki tareekh se lagegi."))) : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("label", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      gap: 5,
+      marginTop: 12
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11.5,
+      color: col('mut'),
+      fontWeight: 700
+    }
+  }, "Wapsi ki tareekh"), /*#__PURE__*/React.createElement("input", {
+    className: "inp",
+    type: "date",
+    value: d,
+    min: s0.exit_date ? String(s0.exit_date).slice(0, 10) : undefined,
+    max: addDaysYmd(t0, 31),
+    onChange: e => {
+      setD(e.target.value);
+      setErr("");
+    },
+    "data-rejoin-date": "1"
+  })), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 6,
+      marginTop: 6
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    className: "mini",
+    style: {
+      background: col('slate')
+    },
+    onClick: () => {
+      setD(t0);
+      setErr("");
+    },
+    "data-rejoin-quick": "today"
+  }, "Aaj")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11.5,
+      color: col('mut'),
+      marginTop: 6
+    }
+  }, "Is tareekh se pehle ke mahine Cancelled rahenge. Wapsi wale mahine ki fee sirf wapsi ki tareekh se."), err ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: col('red'),
+      fontSize: 12.5,
+      fontWeight: 700,
+      marginTop: 8
+    },
+    "data-rejoin-err": "1"
+  }, err) : null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 8,
+      justifyContent: "flex-end",
+      marginTop: 14
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    className: "mini",
+    style: {
+      background: col('mut')
+    },
+    onClick: () => {
+      setStep(1);
+      setErr("");
+    },
+    "data-rejoin-backstep": "1"
+  }, "Peeche"), /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    className: "mini",
+    style: {
+      background: col('green')
+    },
+    onClick: ok,
+    "data-rejoin-ok": "1"
+  }, "Theek hai"))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "right",
+      marginTop: 14
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    onClick: onCancel,
+    "data-rejoin-cancel": "1",
+    style: {
+      border: "none",
+      background: "none",
+      color: col('mut'),
+      cursor: "pointer",
+      fontWeight: 700,
+      fontSize: 12.5
+    }
+  }, "Rehne dein (Left hi rahe)"))));
+};
+/* P2b review (F4): "Wapas aaya hai" save hone ke baad is IST mahine ki dues turant generate (wapsi wala mahina wapsi ki
+   tareekh se bill hota hai). Warna is mahine ka bill na ho to Paid Till purani exit par rehta aur Receive "1 Month"
+   1 tareekh se maangta, jise DB mana karta. DB function idempotent hai; error par kuch nahi dikhana. */
+const p2bRejoinGen = async (v, refresh) => {
+  const pm = monthStartOf(istToday());
+  if (String(v && v.rejoined_on || "").slice(0, 7) > pm.slice(0, 7)) return; // wapsi agle mahine = abhi kuch nahi
+  try {
+    const {
+      error
+    } = await SB.rpc("generate_monthly_dues", {
+      p_month: pm
+    });
+    if (!error) refresh();
+  } catch (e) {/* chup-chaap */}
+};
+const validateStudent = (v, init, role) => {
+  // P2 (026): merged purana duplicate hamesha Left rahe (DB bhi rokta hai). Fee / edit naye record mein.
+  if (init && init.merged_into && v.status !== "left") return "Ye merged purana record hai — ise Active nahi kar sakte. Naya record kholen.";
   const plan = v.fee_plan || "monthly";
   const m = plan === "custom" ? Number(v.plan_months) : planMonthsOf(plan, v.plan_months);
   if (!Number.isInteger(m) || m < 1 || m > 36) return "Plan months 1 se 36 ke beech hone chahiye.";
@@ -2008,6 +2252,12 @@ const validateStudent = (v, init) => {
   if (v.exit_date && v.joining_date && String(v.exit_date) < String(v.joining_date)) return "Exit date joining date se pehle nahi ho sakti.";
   // P1: galti se saal / mahina galat na ho (exit date sirf Left par dikhti hai)
   if (v.status === "left" && v.exit_date && String(v.exit_date).slice(0, 10) > addDaysYmd(istToday(), 31)) return "Exit date aaj se 31 din se zyada aage nahi ho sakti.";
+  // P2b (026, AUTH-5): warden nayi / badli Exit Date sirf Left ke saath aur pichhle 10 din tak (DB bhi rokta hai). Director: joining ke baad koi bhi.
+  const exErr = p2bExitErr(v, init, role);
+  if (exErr) return exErr;
+  // P2b (026, STUD-M2): Left -> Active / Temp Leave par pehle sawaal ka jawab, aur "Wapas aaya hai" ki tareekh sahi ho
+  const rjErr = p2bRejoinErr(v, init);
+  if (rjErr) return rjErr;
   return "";
 };
 const VALIDATE = {
@@ -2880,6 +3130,7 @@ function FeeHistoryModal({
   const groups = paymentGroups(data.fee_payments, s.id);
   const st = feeState(s);
   const rem = remainingAfterLeave(s, data);
+  const voidMonths = (data.monthly_dues || []).filter(d => d.student_id === s.id && isVoidDue(d)).sort((a, b) => String(a.month).localeCompare(String(b.month))).map(d => monLabel(d.month)); // P2 (026)
   const delGroup = async g => {
     if (busy) return;
     const msg = g.isGroup ? "Ye advance payment (" + g.months + " months, " + inr(g.net) + ") poora delete hoga.\n\nJo months abhi shuru nahi hue wo hat jayenge, baaki months wapas PENDING ho jayenge.\n\nPakka delete karein?" : "Ye payment (" + inr(g.net) + ") delete hoga aur uska month wapas pending ho jayega.\n\nPakka delete karein?";
@@ -2949,7 +3200,13 @@ function FeeHistoryModal({
     style: {
       color: col('amber')
     }
-  }, rem.months, " months remaining (", inr(rem.value), ")") : null), /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Date", "Period", "Months", "Paid", ""].map(c => /*#__PURE__*/React.createElement("th", {
+  }, rem.months, " months remaining (", inr(rem.value), ")") : null, voidMonths.length ? /*#__PURE__*/React.createElement("span", {
+    "data-cancelled-note": "1",
+    style: {
+      fontSize: 11.5,
+      color: col('mut')
+    }
+  }, "Cancelled bill: " + voidMonths.join(", ")) : null), /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Date", "Period", "Months", "Paid", ""].map(c => /*#__PURE__*/React.createElement("th", {
     key: c
   }, c)))), /*#__PURE__*/React.createElement("tbody", null, groups.map(g => /*#__PURE__*/React.createElement("tr", {
     key: g.key
@@ -3081,12 +3338,16 @@ function StudentsPage({
   }));
   const bedRoom = bedId => data.beds.find(b => b.id === bedId)?.room_id;
   const pr = stuF.pj ? periodRange(ctx.per, today) : null; // from Dashboard: joined / left in period
+  const anyMerged = data.students.some(isMergedOld); // P2 (026): "Merged" filter sirf tab dikhe jab aise record hon
   const list = data.students.filter(s => {
     if (pr && stuF.pj === "join" && !inPeriod(s.joining_date, pr)) return false;
     if (pr && stuF.pj === "left" && !inPeriod(s.exit_date, pr)) return false;
     if (hsel.length && !hsel.includes(s.hostel_id)) return false;
-    if (rsel && bedRoom(s.current_bed_id) !== rsel) return false;
-    if (stuF.st === "missing") {
+    if (rsel && bedRoom(s.status === "left" ? null : s.current_bed_id) !== rsel) return false; // P2: Left = kisi room mein nahi
+    if (stuF.st === "merged") {
+      if (!isMergedOld(s)) return false; // P2 (026): sirf merged purane duplicate
+    } else if (isMergedOld(s)) return false; // P2 (026): merged purana duplicate default chhupa
+    else if (stuF.st === "missing") {
       if (s.status === "left" || isBillable(s)) return false;
     } else if (stuF.st && (s.status || "active") !== stuF.st) return false;
     if (stuF.q && !studentMatches(s, stuF.q)) return false;
@@ -3177,7 +3438,9 @@ function StudentsPage({
     value: "left"
   }, "Left"), /*#__PURE__*/React.createElement("option", {
     value: "missing"
-  }, "Missing data (joining date / fee)")), /*#__PURE__*/React.createElement("input", {
+  }, "Missing data (joining date / fee)"), anyMerged ? /*#__PURE__*/React.createElement("option", {
+    value: "merged"
+  }, "Merged (purane duplicate)") : null), /*#__PURE__*/React.createElement("input", {
     className: "inp",
     style: {
       width: 190
@@ -3211,7 +3474,7 @@ function StudentsPage({
   }, /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Student", "Father", "Mobile", "Course", "Hostel", "Room/Bed", "Fee", "Status", ""].map(c => /*#__PURE__*/React.createElement("th", {
     key: c
   }, c)))), /*#__PURE__*/React.createElement("tbody", null, list.map(s => {
-    const bed = data.beds.find(b => b.id === s.current_bed_id);
+    const bed = s.status === "left" ? null : data.beds.find(b => b.id === s.current_bed_id); // P2: Left = Room/Bed "—"
     const room = bed ? data.rooms.find(r => r.id === bed.room_id) : null;
     const st = feeState(s, today);
     const rem = remainingAfterLeave(s, data);
@@ -3256,7 +3519,7 @@ function StudentsPage({
     }, rem.months, " months remaining (", inr(rem.value), ")") : null), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement(Badge, {
       c: col(tn[0]),
       bg: tn[1]
-    }, (s.status || "").replace("_", " "))), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement(EditDel, {
+    }, (s.status || "").replace("_", " "))), /*#__PURE__*/React.createElement("td", null, s.merged_into ? null : /*#__PURE__*/React.createElement(EditDel, {
       entity: "students",
       item: s
     })));
@@ -3339,8 +3602,13 @@ function FeesPage({
 
   // ledger (old month-wise view)
   const months = [...new Set(data.monthly_dues.map(d => String(d.month).slice(0, 7)))].sort().reverse();
+  // P2 (026): Cancelled (void) bills default chhupe; "Cancelled bills dikhayein" tick karne par dikhte hain
+  const [showVoid, setShowVoid] = useState(false);
   let dues = data.monthly_dues.filter(inHostel);
   if (mf) dues = dues.filter(d => String(d.month).slice(0, 7) === mf);
+  const anyVoid = data.monthly_dues.some(isVoidDue);
+  const voidCount = dues.filter(isVoidDue).length;
+  if (!showVoid) dues = dues.filter(d => !isVoidDue(d));
   dues = dues.slice().sort((a, b) => String(b.month).localeCompare(String(a.month)) || String(sName(a.student_id)).localeCompare(String(sName(b.student_id))));
   const genDues = async () => {
     const {
@@ -3618,7 +3886,23 @@ function FeesPage({
       setHf("");
       setMf("");
     }
-  }, "Clear") : null), /*#__PURE__*/React.createElement("div", {
+  }, "Clear") : null, anyVoid ? /*#__PURE__*/React.createElement("label", {
+    "data-void-toggle": "1",
+    style: {
+      display: "inline-flex",
+      alignItems: "center",
+      gap: 6,
+      fontSize: 12,
+      fontWeight: 700,
+      color: col('mut'),
+      cursor: "pointer"
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "checkbox",
+    checked: showVoid,
+    onChange: e => setShowVoid(e.target.checked),
+    "data-void-toggle-input": "1"
+  }), "Cancelled bills dikhayein (" + voidCount + ")") : null), /*#__PURE__*/React.createElement("div", {
     className: "card",
     style: {
       overflowX: "auto"
@@ -3626,7 +3910,11 @@ function FeesPage({
   }, /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Student", "Hostel", "Month", "Period", "Payable", "Paid", "Pending", "Action"].map(c => /*#__PURE__*/React.createElement("th", {
     key: c
   }, c)))), /*#__PURE__*/React.createElement("tbody", null, dues.map(d => /*#__PURE__*/React.createElement("tr", {
-    key: d.id
+    key: d.id,
+    "data-due-void": isVoidDue(d) ? d.id : undefined,
+    style: isVoidDue(d) ? {
+      color: col('mut')
+    } : undefined
   }, /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("b", null, sName(d.student_id))), /*#__PURE__*/React.createElement("td", null, hName(d.hostel_id)), /*#__PURE__*/React.createElement("td", null, String(d.month).slice(0, 7)), /*#__PURE__*/React.createElement("td", {
     style: {
       fontSize: 11.5
@@ -3642,7 +3930,10 @@ function FeesPage({
       fontSize: 10.5,
       color: col('green')
     }
-  }, "disc ", inr(d.discount)) : null), /*#__PURE__*/React.createElement("td", null, inr(d.paid_amount)), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("span", {
+  }, "disc ", inr(d.discount)) : null), /*#__PURE__*/React.createElement("td", null, inr(d.paid_amount)), /*#__PURE__*/React.createElement("td", null, isVoidDue(d) ? /*#__PURE__*/React.createElement(Badge, {
+    c: col('mut'),
+    bg: "#eceef1"
+  }, "Cancelled") : /*#__PURE__*/React.createElement("span", {
     style: {
       color: num0(d.pending) > 0 ? col('red') : col('green'),
       fontWeight: 700
@@ -3652,7 +3943,7 @@ function FeesPage({
       display: "inline-flex",
       gap: 6
     }
-  }, num0(d.pending) > 0 ? /*#__PURE__*/React.createElement("button", {
+  }, num0(d.pending) > 0 && !isVoidDue(d) ? /*#__PURE__*/React.createElement("button", {
     className: "mini",
     style: {
       background: col('green')
@@ -3829,7 +4120,7 @@ function StudentSearch({
   }, s.father_name ? "S/o " + s.father_name + " · " : "", hName(s.hostel_id), " · ", roomBed(s))), /*#__PURE__*/React.createElement(Badge, {
     c: col(tone[s.status] || 'green'),
     bg: col(tone[s.status] || 'green') + "1c"
-  }, String(s.status || "active").replace("_", " "))))) : null);
+  }, String(s.status || "active").replace("_", " ") + (isMergedOld(s) ? " · merged" : ""))))) : null);
 }
 
 /* =====================================================================
@@ -3885,6 +4176,7 @@ function StudentProfile({
   if (!s) return null;
   const bed = data.beds.find(b => b.id === s.current_bed_id);
   const room = bed ? data.rooms.find(r => r.id === bed.room_id) : null;
+  const mergedTo = s.merged_into ? data.students.find(x => x.id === s.merged_into) || null : null; // P2 (026): naya record (merge ke baad)
   const has014 = Object.prototype.hasOwnProperty.call(s, "paid_till") || Object.prototype.hasOwnProperty.call(s, "fee_plan");
   const st = has014 ? feeState(s) : null;
   const totalPaid = (pays || []).reduce((a, f) => a + num0(f.amount), 0);
@@ -4029,7 +4321,7 @@ function StudentProfile({
       flexWrap: "wrap",
       marginBottom: 12
     }
-  }, /*#__PURE__*/React.createElement("button", {
+  }, s.merged_into ? null : /*#__PURE__*/React.createElement("button", {
     className: "mini",
     style: act(col('slate')),
     onClick: () => setModal({
@@ -4037,7 +4329,7 @@ function StudentProfile({
       item: s
     }),
     "data-profile-edit": "1"
-  }, "✎ Edit student"), s.status !== "left" ? /*#__PURE__*/React.createElement("button", {
+  }, "✎ Edit student"), s.status !== "left" && !s.merged_into ? /*#__PURE__*/React.createElement("button", {
     className: "mini",
     style: act(col('green')),
     onClick: () => setPayOpen(true),
@@ -4064,7 +4356,25 @@ function StudentProfile({
     className: "mini",
     style: act(col('red')),
     onClick: () => del("students", s.id)
-  }, "🗑 Delete") : null), sec("Fee summary", /*#__PURE__*/React.createElement("div", {
+  }, "🗑 Delete") : null), s.merged_into ? /*#__PURE__*/React.createElement("div", {
+    className: "card",
+    "data-merged-note": s.merged_into,
+    style: {
+      padding: "10px 14px",
+      marginBottom: 12,
+      borderLeft: "4px solid " + col('mut'),
+      fontSize: 12.5,
+      color: col('mut')
+    }
+  }, /*#__PURE__*/React.createElement("b", null, "merged"), " · Ye purana duplicate record hai. Iske bills aur payments naye record mein jod diye gaye" + (mergedTo ? ": " + mergedTo.full_name + " (" + hName(mergedTo.hostel_id) + ")" : "") + ". Fee aur edit naye record mein hi karein.", mergedTo ? /*#__PURE__*/React.createElement("button", {
+    className: "mini",
+    style: {
+      background: col('slate'),
+      marginLeft: 8
+    },
+    onClick: () => ctx.openProfile && ctx.openProfile(mergedTo.id),
+    "data-merged-open": mergedTo.id
+  }, "Naya record kholen") : null) : null, sec("Fee summary", /*#__PURE__*/React.createElement("div", {
     style: grid
   }, I("Monthly fee", inr(s.monthly_fee)), has014 ? I("Fee plan", planName(s)) : null, has014 ? I("Plan amount", planLabel(s)) : null, has014 ? I("Paid till", s.paid_till ? dmy(s.paid_till) : "—") : null, has014 ? /*#__PURE__*/React.createElement("div", null, I("Status", ""), /*#__PURE__*/React.createElement(Badge, {
     c: st.c,
@@ -4139,13 +4449,20 @@ function StudentProfile({
   }, /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Month", "Fee", "Discount", "Paid", "Pending", "Status"].map(c => /*#__PURE__*/React.createElement("th", {
     key: c
   }, c)))), /*#__PURE__*/React.createElement("tbody", null, duesSorted.map(d => /*#__PURE__*/React.createElement("tr", {
-    key: d.id
+    key: d.id,
+    "data-due-void": isVoidDue(d) ? d.id : undefined,
+    style: isVoidDue(d) ? {
+      color: col('mut')
+    } : undefined
   }, /*#__PURE__*/React.createElement("td", null, monLabel(d.month)), /*#__PURE__*/React.createElement("td", null, inr(d.fee_amount != null ? d.fee_amount : d.payable)), /*#__PURE__*/React.createElement("td", null, num0(d.discount) > 0 ? inr(d.discount) : "—"), /*#__PURE__*/React.createElement("td", null, inr(d.paid_amount)), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("span", {
     style: {
       color: num0(d.pending) > 0 ? col('red') : col('green'),
       fontWeight: 700
     }
-  }, num0(d.pending) > 0 ? inr(d.pending) : "—")), /*#__PURE__*/React.createElement("td", null, d.status || "-"))), !duesSorted.length ? /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
+  }, num0(d.pending) > 0 ? inr(d.pending) : "—")), /*#__PURE__*/React.createElement("td", null, isVoidDue(d) ? /*#__PURE__*/React.createElement(Badge, {
+    c: col('mut'),
+    bg: "#eceef1"
+  }, "Cancelled") : d.status || "-"))), !duesSorted.length ? /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
     colSpan: "6"
   }, "Koi due nahi.")) : null)))) : null, sec("Personal", /*#__PURE__*/React.createElement("div", {
     style: grid
@@ -7566,6 +7883,14 @@ const findDuplicates = (entity, v, data, hName) => {
       }
       // kamzor rule: same naam + isi hostel (dono father likhe hain aur alag hain to nahi)
       if (sameName && !why.length && v.hostel_id && s.hostel_id === v.hostel_id && !(fa && sFa && fa !== sFa)) why.push("same naam isi hostel mein");
+      // P2 (026): purana merged duplicate match kare to uska NAYA (kept) record dikhao, purana nahi
+      // (warna purane naam se dobara Add karne par koi warning nahi aati aur ek aur record ban jata)
+      const keptRec = isMergedOld(s) ? (data.students || []).find(k => k.id === s.merged_into && !isMergedOld(k)) || null : null;
+      if (isMergedOld(s) && (!keptRec || (v.id && keptRec.id === v.id) || !why.length)) return;
+      if (keptRec) {
+        why.push("purana naam " + s.full_name + " (merged)");
+        s = keptRec;
+      }
       if (why.length) out.push({
         entity,
         id: s.id,
@@ -7577,6 +7902,15 @@ const findDuplicates = (entity, v, data, hName) => {
         why: why.join(", ")
       });
     });
+    // P2 (026): ek record panel mein ek hi baar (naya record khud bhi aur purane naam se bhi match ho sakta hai)
+    for (let i = out.length - 1; i > 0; i--) {
+      const j = out.findIndex(o => o.id === out[i].id);
+      if (j < i) {
+        out[j].rank = Math.min(out[j].rank, out[i].rank);
+        out[j].why = Array.from(new Set((out[j].why + ", " + out[i].why).split(", "))).join(", ");
+        out.splice(i, 1);
+      }
+    }
     out.sort((a, b) => a.rank - b.rank); // pakke match pehle
   } else if (entity === "employees") {
     const nm = dupNorm(v.full_name),
@@ -7724,7 +8058,7 @@ function DupPanel({
       fontWeight: 700
     },
     "data-dup-left": "1"
-  }, "Wapas aaya hai? Kholen → Edit → Status: Active (naya mat banayein)") : null), d.remote ? null : /*#__PURE__*/React.createElement("button", {
+  }, p2bHasRejoin(d.row) ? "Wapas aaya hai? Kholen → Edit → Status Active → 'Wapas aaya hai' chunein (naya mat banayein)" : "Wapas aaya hai? Kholen → Edit → Status: Active (naya mat banayein)") : null), d.remote ? null : /*#__PURE__*/React.createElement("button", {
     className: "mini",
     style: {
       background: col('slate')
@@ -7866,7 +8200,11 @@ function App() {
     })();
   }, [session]);
   const role = profile?.roles?.name || "manager";
+  // P2b review: sirf SABSE NAYA refresh data likhe. Load ke baad wala auto-generate refresh (D-c) der se khatam ho to woh
+  // Add ke turant baad wali local row (duplicate rokne wali) mita deta tha. Purana refresh ab chup-chaap chhod diya jaata hai.
+  const refreshSeq = useRef(0);
   const refresh = useCallback(async () => {
+    const mySeq = ++refreshSeq.current;
     const t = ["hostels", "rooms", "beds", "students", "monthly_dues", "fee_payments", "expenses", "employees", "complaints", "inventory", "audit_logs", "users", "staff_attendance", "staff_salary_profile", "salary_advances", "salary_runs", "salary_edits"];
     const out = {};
     try {
@@ -7878,8 +8216,10 @@ function App() {
         if (error) throw new Error(x + ": " + error.message);
         out[x] = d || [];
       }
+      if (mySeq !== refreshSeq.current) return; // naya refresh chal raha hai = yeh purana data mat likho
       setData(out);
     } catch (e) {
+      if (mySeq !== refreshSeq.current) return;
       setLoadErr(e && e.message || String(e));
       t.forEach(x => {
         if (!out[x]) out[x] = [];
@@ -7929,23 +8269,34 @@ function App() {
     if (role !== "director" && role !== "manager") return;
     // Joining-date cycle removed: calendar billing only (Director rule)
     // calendar mode (default)
-    const cm = today().slice(0, 7); // current YYYY-MM
-    const hasCM = (data.monthly_dues || []).some(d => String(d.month).slice(0, 7) === cm);
-    if (hasCM) {
-      autoGenRef.current = "";
-      return;
-    }
-    if (autoGenRef.current === cm) return; // is mahine ke liye ek hi baar try
+    // P2b (FEES-2): "is mahine ka koi bill dikhta hai?" wala check hataya. Advance / yearly bill pehle se ho to 1 tareekh
+    // ka auto-bill kabhi chalta hi nahi tha. Ab poora data load hone ke baad har browser session mein har mahine EK baar
+    // (Director / Manager). DB function idempotent hai (bill pehle se ho to kuch nahi). Error par kuch nahi dikhana.
+    if (loadErr) return;
+    const pm = monthStartOf(istToday()); // IST mahina (P2)
+    const cm = pm.slice(0, 7);
+    const sk = "ddd_autogen_" + (profile.id || "");
+    let doneM = "";
+    try {
+      doneM = window.sessionStorage.getItem(sk) || "";
+    } catch (e) {/* storage band = sirf is page ke liye ek baar */}
+    if (doneM === cm || autoGenRef.current === cm) return; // is session mein is mahine ke liye ho chuka / chal raha hai
     autoGenRef.current = cm;
     (async () => {
-      const {
-        error
-      } = await SB.rpc("generate_monthly_dues", {
-        p_month: monthStart()
-      });
-      if (!error) refresh();
+      try {
+        const {
+          error
+        } = await SB.rpc("generate_monthly_dues", {
+          p_month: pm
+        });
+        if (error) return;
+        try {
+          window.sessionStorage.setItem(sk, cm);
+        } catch (e) {/* ignore */}
+        refresh();
+      } catch (e) {/* chup-chaap */}
     })();
-  }, [profile, data, role, refresh, billingMode]);
+  }, [profile, data, role, refresh, billingMode, loadErr]);
   const D = useMemo(() => {
     if (!data) return { overdue:0, dueSoon:0, dueCount:0, missing:0, occupied:0, beds:0, income:0, expense:0, pending:0, salaryPay:0, perHostel:[], catData:[], students:0, hostels:0, complaintsOpen:0 };
     const occupied = data.beds.filter(b => b.bed_status === "occupied").length;
@@ -8347,48 +8698,170 @@ function App() {
       label: "Medical Note",
       full: true
     }, {
-      // P1: Left chunne par Exit Date apne aap aaj ki (badal sakte hain); Active / Temp Leave par Exit Date khali.
-      // Left se hata ke wapas Left = pehle wali exit date wapas (_exitPrev kabhi save nahi hota, "_" key)
+      // P1: Active / Temp Leave par Exit Date khali. Left se hata ke wapas Left = pehle wali exit date wapas (_exitPrev kabhi save nahi hota, "_" key)
+      // P2b (026, AUTH-5): Left chunne par Exit Date ab apne aap NAHI bharti (warden khud chune: "Aaj" / "Pichhle mahine ki aakhri tareekh").
+      // P2b (026, STUD-M2): saved Left student ko Active / Temp Leave karne par sawaal: galti se Left (bill wapas) ya wapas aaya (wapsi ki tareekh).
+      // _rejoin kabhi save nahi hota ("_" key); rejoined_on sirf "Wapas aaya hai" par aur sirf jab column hai (026).
       k: "status",
       label: "Status",
       type: "custom",
       opts: STU_STATUS_OPTS,
-      render: (v, set) => /*#__PURE__*/React.createElement("label", {
-        style: {
-          display: "flex",
-          flexDirection: "column",
-          gap: 5,
-          gridColumn: "auto"
-        }
-      }, /*#__PURE__*/React.createElement("span", {
-        style: {
-          fontSize: 11.5,
-          color: col('mut'),
-          fontWeight: 700
-        }
-      }, "Status"), /*#__PURE__*/React.createElement("select", {
-        className: "inp",
-        value: v.status || "active",
-        onChange: e => {
-          const x = e.target.value;
-          set("status", x);
-          if (x === "left") {
-            set("exit_date", v._exitPrev !== undefined ? v._exitPrev : v.exit_date || istToday());
-          } else {
-            if (v.status === "left") set("_exitPrev", v.exit_date || "");
-            set("exit_date", "");
+      render: (v, set) => {
+        const s0 = modal && modal.item || {};
+        const ask = p2bRejoinAsk(s0);
+        const back = v.status !== "left" && ask;
+        return /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("label", {
+          style: {
+            display: "flex",
+            flexDirection: "column",
+            gap: 5,
+            gridColumn: "auto"
           }
-        },
-        "data-student-status": "1"
-      }, STU_STATUS_OPTS.map(o => /*#__PURE__*/React.createElement("option", {
-        key: o.value,
-        value: o.value
-      }, o.label))))
+        }, /*#__PURE__*/React.createElement("span", {
+          style: {
+            fontSize: 11.5,
+            color: col('mut'),
+            fontWeight: 700
+          }
+        }, "Status"), /*#__PURE__*/React.createElement("select", {
+          className: "inp",
+          value: v.status || "active",
+          onChange: e => {
+            const x = e.target.value;
+            set("status", x);
+            if (x === "left") {
+              set("exit_date", v._exitPrev !== undefined ? v._exitPrev : v.exit_date || "");
+              if (v._rejoin) {
+                set("_rejoin", "");
+                set("rejoined_on", s0.rejoined_on || "");
+              }
+            } else {
+              if (v.status === "left") set("_exitPrev", v.exit_date || "");
+              set("exit_date", "");
+              if (ask && !v._rejoin) set("_rejoin", "ask");
+            }
+          },
+          "data-student-status": "1"
+        }, STU_STATUS_OPTS.map(o => /*#__PURE__*/React.createElement("option", {
+          key: o.value,
+          value: o.value
+        }, o.label)))), back && (v._rejoin === "mistake" || v._rejoin === "back") ? /*#__PURE__*/React.createElement("div", {
+          style: {
+            gridColumn: "1/-1",
+            fontSize: 12,
+            padding: "8px 10px",
+            borderRadius: 8,
+            border: "1px solid " + col('line'),
+            color: col('ink')
+          },
+          "data-rejoin-note": v._rejoin
+        }, /*#__PURE__*/React.createElement("b", null, v._rejoin === "back" ? "Wapas aaya hai" : "Galti se Left hua tha"), v._rejoin === "back" ? " · wapsi " + dmy(v.rejoined_on) + ". Isse pehle ke mahine Cancelled hi rahenge." : " · Exit Date hategi, Left ki wajah se Cancel hue bill wapas aayenge.", /*#__PURE__*/React.createElement("button", {
+          type: "button",
+          className: "mini",
+          style: {
+            background: col('slate'),
+            marginLeft: 8
+          },
+          onClick: () => set("_rejoin", "ask"),
+          "data-rejoin-change": "1"
+        }, "Badlein")) : null, back && v._rejoin === "ask" ? /*#__PURE__*/React.createElement(RejoinAsk, {
+          s0: s0,
+          joining: v.joining_date || s0.joining_date,
+          onPick: (kind, d) => {
+            set("_rejoin", kind);
+            set("rejoined_on", kind === "back" ? d : s0.rejoined_on || "");
+          },
+          onCancel: () => {
+            set("status", "left");
+            set("exit_date", v._exitPrev !== undefined ? v._exitPrev : s0.exit_date || "");
+            set("_rejoin", "");
+            set("rejoined_on", s0.rejoined_on || "");
+          }
+        }) : null);
+      }
     }, {
+      // P2b (026, AUTH-5): Exit Date khali se shuru, do quick button. Warden: aaj se pichhle 10 din tak (DB bhi rokta hai). Director: joining ke baad koi bhi.
       k: "exit_date",
       label: "Exit Date (chhodne ki tareekh)",
-      type: "date",
-      hide: v => v.status !== "left"
+      type: "custom",
+      hide: v => v.status !== "left",
+      render: (v, set) => {
+        const s0 = modal && modal.item || {};
+        const t0 = istToday();
+        const pm = addDaysYmd(monthStartOf(t0), -1);
+        const isD = role === "director";
+        const jd = String(v.joining_date || "").slice(0, 10);
+        const w10 = addDaysYmd(t0, -P2B_EXIT_DAYS);
+        const lo = isD ? jd : jd > w10 ? jd : w10;
+        const pmOk = !(lo && pm < lo);
+        const er = p2bExitErr(v, s0, role);
+        return /*#__PURE__*/React.createElement("div", {
+          style: {
+            display: "flex",
+            flexDirection: "column",
+            gap: 5,
+            gridColumn: "1/-1"
+          },
+          "data-exit-field": "1"
+        }, /*#__PURE__*/React.createElement("label", {
+          style: {
+            display: "flex",
+            flexDirection: "column",
+            gap: 5
+          }
+        }, /*#__PURE__*/React.createElement("span", {
+          style: {
+            fontSize: 11.5,
+            color: col('mut'),
+            fontWeight: 700
+          }
+        }, "Exit Date (chhodne ki tareekh)"), /*#__PURE__*/React.createElement("input", {
+          className: "inp",
+          type: "date",
+          value: v.exit_date ?? "",
+          min: lo || undefined,
+          max: addDaysYmd(t0, 31),
+          onChange: e => set("exit_date", e.target.value),
+          "data-exit-date": "1"
+        })), /*#__PURE__*/React.createElement("div", {
+          style: {
+            display: "flex",
+            gap: 6,
+            flexWrap: "wrap"
+          }
+        }, /*#__PURE__*/React.createElement("button", {
+          type: "button",
+          className: "mini",
+          style: {
+            background: col('slate')
+          },
+          onClick: () => set("exit_date", t0),
+          "data-exit-quick": "today"
+        }, "Aaj"), /*#__PURE__*/React.createElement("button", {
+          type: "button",
+          className: "mini",
+          style: {
+            background: col('slate'),
+            opacity: pmOk ? 1 : 0.45,
+            cursor: pmOk ? "pointer" : "not-allowed"
+          },
+          disabled: !pmOk,
+          onClick: () => set("exit_date", pm),
+          "data-exit-quick": "prev-month-end"
+        }, "Pichhle mahine ki aakhri tareekh (" + dmy(pm) + ")")), er ? /*#__PURE__*/React.createElement("span", {
+          style: {
+            fontSize: 11.5,
+            color: col('red'),
+            fontWeight: 700
+          },
+          "data-exit-err": "1"
+        }, er) : /*#__PURE__*/React.createElement("span", {
+          style: {
+            fontSize: 11,
+            color: col('mut')
+          }
+        }, isD ? "Director: joining date ke baad koi bhi tareekh." : "Warden: aaj se pichhle 10 din tak. Isse purani tareekh Director lagayenge."));
+      }
     }],
     expenses: [{
       k: "hostel_id",
@@ -9596,13 +10069,13 @@ function App() {
   }), modal && /*#__PURE__*/React.createElement(FormModal, {
     title: modal.title || (modal.item.id ? "Edit " : "Add ") + modal.entity,
     fields: modal.fields || FIELDS[modal.entity],
-    validate: modal.validate || VALIDATE[modal.entity],
+    validate: modal.validate || (modal.entity === "students" ? (x, i) => validateStudent(x, i, role) : VALIDATE[modal.entity]), // P2b: Exit Date rule Director / warden alag
     key: (modal.entity || "") + ":" + (modal.item && modal.item.id || "new"),
     initial: modal.item,
     dupCheck: !(modal.item && modal.item.id) && (modal.entity === "students" || modal.entity === "employees") ? async v => { const loc = findDuplicates(modal.entity, v, data, hName); if (modal.entity !== "students" || role === "director" || role === "accountant") return loc; return loc.concat(await findRemoteDups(v)); } : null, // P1: Manager ko doosre hostel ka same student bhi dikhe (025)
     onOpenDup: d => d.entity === "students" ? (setModal(null), setProfId(d.id)) : setModal({ entity: "employees", item: d.row }),
     onClose: () => setModal(null),
-    onSave: (v, meta) => modal.onSave ? modal.onSave(v) : modal.entity === "employees" && role === "director" ? saveStaff(v, modal.item && modal.item.id) : save(modal.entity, v, { editId: modal.item && modal.item.id, throwErr: true, initial: modal.item, newId: meta && meta.newId })
+    onSave: (v, meta) => modal.onSave ? modal.onSave(v) : modal.entity === "employees" && role === "director" ? saveStaff(v, modal.item && modal.item.id) : save(modal.entity, v, { editId: modal.item && modal.item.id, throwErr: true, initial: modal.item, newId: meta && meta.newId }).then(ok => { if (ok && modal.entity === "students" && v._rejoin === "back") p2bRejoinGen(v, refresh); return ok; }) // P2b review: wapas aaya = is mahine ka bill turant
   }), contact && /*#__PURE__*/React.createElement(Contact, {
     c: contact,
     onClose: () => setContact(null)
