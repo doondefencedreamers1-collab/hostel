@@ -378,6 +378,11 @@ const {
    ===================================================================== */
 const SUPABASE_URL = "https://sttwoctnxfdemmltxijd.supabase.co";
 const SUPABASE_ANON = "sb_publishable_9KhrvINU5ERCWgcr3l970w_HGChNO0J";
+// P1: app ka version — har deploy par badlein. Top bar mein dikhta hai (phone par purana version chal raha hai ya naya).
+const APP_VERSION = "2026-10-09-p1";
+try {
+  console.info("DDD Hostel app v" + APP_VERSION);
+} catch (e) {}
 const SB = supabase.createClient(SUPABASE_URL, SUPABASE_ANON);
 
 /* ---------- constants ---------- */
@@ -571,62 +576,89 @@ function FormModal({
     [k]: x
   }));
   const [busy, setBusy] = useState(false);
+  // P1: ref = turant lock (state agle render tak purani rehti hai) — double tap se 2 save nahi
+  const busyRef = useRef(false);
+  // P1: Add ke liye poore form ki EK id — network error ke baad dobara Save = wahi id (naya record nahi banega)
+  const idRef = useRef(undefined);
+  if (idRef.current === undefined) idRef.current = typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : null;
   const [err, setErr] = useState("");
   const [dups, setDups] = useState(null);
   const [dupOk, setDupOk] = useState(false);
+  const unlock = () => {
+    busyRef.current = false;
+    setBusy(false);
+  };
+  // P1: save chalte waqt form band nahi hoga (overlay / X / Cancel)
+  const close = () => {
+    if (busyRef.current) return;
+    onClose();
+  };
   const submit = async force => {
-    if (busy) return; // double-submit guard
-    const miss = [],
-      bad = [];
-    fields.forEach(f => {
-      const val = v[f.k];
-      const empty = val === "" || val === undefined || val === null;
-      if (f.req && empty) {
-        miss.push(f.label);
-        return;
-      }
-      if (f.type === "number" && !empty) {
-        const n = Number(val);
-        const mn = f.min != null ? f.min : 0;
-        if (!isFinite(n) || n < mn || f.int && !Number.isInteger(n) || f.req && n <= 0) bad.push(f.label);
-      }
-    });
-    if (miss.length) {
-      setErr("Ye zaroori hai: " + miss.join(", "));
-      return;
-    }
-    if (bad.length) {
-      setErr("Sahi value daalein: " + bad.join(", "));
-      return;
-    }
-    if (validate) {
-      const ve = validate(v);
-      if (ve) {
-        setErr(ve);
-        return;
-      }
-    }
-    if (dupCheck && force !== true && !dupOk) {
-      const d = dupCheck(v);
-      if (d && d.length) {
-        setErr("");
-        setDups(d);
-        return;
-      }
-    }
-    setErr("");
+    if (busyRef.current) return; // double-submit guard
+    busyRef.current = true; // kisi bhi await se pehle lock
     setBusy(true);
+    setErr("");
     try {
-      await onSave(v);
+      const miss = [],
+        bad = [];
+      fields.forEach(f => {
+        const val = v[f.k];
+        const empty = val === "" || val === undefined || val === null;
+        if (f.req && empty) {
+          miss.push(f.label);
+          return;
+        }
+        if (f.type === "number" && !empty) {
+          const n = Number(val);
+          const mn = f.min != null ? f.min : 0;
+          if (!isFinite(n) || n < mn || f.int && !Number.isInteger(n) || f.req && n <= 0) bad.push(f.label);
+        }
+      });
+      if (miss.length) {
+        unlock();
+        setErr("Ye zaroori hai: " + miss.join(", "));
+        return;
+      }
+      if (bad.length) {
+        unlock();
+        setErr("Sahi value daalein: " + bad.join(", "));
+        return;
+      }
+      if (validate) {
+        const ve = validate(v, initial); // P1: form khulte waqt ka record bhi (purane Left student ke liye)
+        if (ve) {
+          unlock();
+          setErr(ve);
+          return;
+        }
+      }
+      if (dupCheck && force !== true && !dupOk) {
+        // dupCheck array ya Promise de sakta hai (doosre hostel ka check). Error = koi duplicate nahi.
+        let d = null;
+        try {
+          d = await dupCheck(v);
+        } catch (e) {
+          d = null;
+        }
+        if (d && d.length) {
+          unlock();
+          setDups(d);
+          return;
+        }
+      }
+      await onSave(v, {
+        newId: idRef.current
+      });
+      unlock();
       onClose();
     } catch (e) {
       setErr(e && e.message ? e.message : String(e));
-      setBusy(false);
+      unlock();
     }
   };
   return /*#__PURE__*/React.createElement("div", {
     className: "ovl",
-    onClick: onClose
+    onClick: close
   }, /*#__PURE__*/React.createElement("div", {
     className: "card",
     style: {
@@ -650,7 +682,7 @@ function FormModal({
       fontSize: 17
     }
   }, title), /*#__PURE__*/React.createElement("button", {
-    onClick: onClose,
+    onClick: close,
     style: {
       border: "none",
       background: "none",
@@ -732,7 +764,7 @@ function FormModal({
       gap: 10
     }
   }, /*#__PURE__*/React.createElement("button", {
-    onClick: onClose,
+    onClick: close,
     style: {
       flex: 1,
       padding: 10,
@@ -1953,12 +1985,29 @@ function PlanFields({
     }
   }, "Paid till: ", dmy(v.paid_till)) : null);
 }
-const validateStudent = v => {
+// P1: Status ke options — student form ka custom Status select inhi se banta hai
+const STU_STATUS_OPTS = [{
+  value: "active",
+  label: "Active"
+}, {
+  value: "temporary_leave",
+  label: "Temp Leave"
+}, {
+  value: "left",
+  label: "Left"
+}];
+const validateStudent = (v, init) => {
   const plan = v.fee_plan || "monthly";
   const m = plan === "custom" ? Number(v.plan_months) : planMonthsOf(plan, v.plan_months);
   if (!Number.isInteger(m) || m < 1 || m > 36) return "Plan months 1 se 36 ke beech hone chahiye.";
   if (num0(v.monthly_fee) > 0 && !(num0(v.plan_amount) > 0)) return "Plan Amount 0 se zyada hona chahiye.";
+  // P1: purana Left student jiski exit date pehle se khali hai (pehle ke form mein ye field nahi tha) —
+  // doosra field (jaise Mobile) badalne par roko mat; andaaze ki tareekh na daalni pade
+  const oldLeftNoExit = !!(init && init.id && init.status === "left" && !init.exit_date);
+  if (v.status === "left" && !v.exit_date && !oldLeftNoExit) return "Left ke liye Exit Date (chhodne ki tareekh) zaroori hai.";
   if (v.exit_date && v.joining_date && String(v.exit_date) < String(v.joining_date)) return "Exit date joining date se pehle nahi ho sakti.";
+  // P1: galti se saal / mahina galat na ho (exit date sirf Left par dikhti hai)
+  if (v.status === "left" && v.exit_date && String(v.exit_date).slice(0, 10) > addDaysYmd(istToday(), 31)) return "Exit date aaj se 31 din se zyada aage nahi ho sakti.";
   return "";
 };
 const VALIDATE = {
@@ -7472,28 +7521,63 @@ function ReportsPage({
    ===================================================================== */
 const dupNorm = s => String(s == null ? "" : s).toLowerCase().replace(/\s+/g, " ").trim();
 const dupPhone = s => String(s == null ? "" : s).replace(/[^0-9]/g, "").slice(-10);
+// P1: naam / father / phone / adm. no. ko ek jaisa banao (space, dot, Mr., S/O sab hata ke).
+// Same rules DB function ddd_find_similar_students (025) mein bhi hain — dono saath badlein.
+const DUP_FAKE_PH = ["1234567890", "0123456789", "9876543210"];
+const dupName = s => String(s == null ? "" : s).toLowerCase().replace(/[^a-z0-9]/g, "");
+const dupFather = s => {
+  // "Mr. / Shri / Late / S/O ..." sirf tab hatao jab aage "." / space / "/" ho ("Shivam" ka "Sh" nahi)
+  const t = String(s == null ? "" : s).toLowerCase().trim().replace(/^((mr|mrs|smt|shri|sri|sh|late|lt|dr|s\/o|d\/o|so|do)(\.|\s|\/)+)+/, "").replace(/[^a-z0-9]/g, "");
+  return !t || /^(na|nil|none|null|unknown|father)$/.test(t) || /^(.)\1*$/.test(t) ? "" : t;
+};
+const dupAdm = s => {
+  const t = dupName(s);
+  return !t || /^(na|nil|none|null)$/.test(t) || /^(.)\1*$/.test(t) ? "" : t;
+};
+// last 10 digit; 10 se kam digit ya 9999999999 / 1234567890 jaise number = ignore
+const dupPhone10 = s => {
+  const d = String(s == null ? "" : s).replace(/[^0-9]/g, "");
+  if (d.length < 10) return "";
+  const t = d.slice(-10);
+  return /^(\d)\1{9}$/.test(t) || DUP_FAKE_PH.includes(t) ? "" : t;
+};
+const dupPhones = r => [r.mobile, r.parent_mobile, r.whatsapp].map(dupPhone10).filter((x, i, a) => x && a.indexOf(x) === i);
 const findDuplicates = (entity, v, data, hName) => {
   const out = [];
   if (entity === "students") {
-    const nm = dupNorm(v.full_name),
-      fa = dupNorm(v.father_name),
-      mob = dupPhone(v.mobile),
-      adm = dupNorm(v.admission_number);
+    const nm = dupName(v.full_name),
+      fa = dupFather(v.father_name),
+      adm = dupAdm(v.admission_number),
+      ph = dupPhones(v);
     (data.students || []).forEach(s => {
       if (v.id && s.id === v.id) return;
+      const sameName = !!nm && nm === dupName(s.full_name);
+      const sFa = dupFather(s.father_name);
+      const phHit = ph.length > 0 && dupPhones(s).some(x => ph.includes(x));
       const why = [];
-      if (nm && fa && nm === dupNorm(s.full_name) && fa === dupNorm(s.father_name)) why.push("same name + father");
-      if (mob.length === 10 && mob === dupPhone(s.mobile)) why.push("same mobile");
-      if (adm && adm === dupNorm(s.admission_number)) why.push("same admission no.");
+      let strong = false; // pakka match (naam+father / naam+phone / adm. no.)
+      if (sameName && fa && fa === sFa) why.push("same name + father");
+      if (sameName && phHit) why.push("same name + phone");
+      if (why.length) strong = true;
+      if (!sameName && phHit) why.push("same phone (naam alag)");
+      if (adm && adm === dupAdm(s.admission_number)) {
+        why.push("same admission no.");
+        strong = true;
+      }
+      // kamzor rule: same naam + isi hostel (dono father likhe hain aur alag hain to nahi)
+      if (sameName && !why.length && v.hostel_id && s.hostel_id === v.hostel_id && !(fa && sFa && fa !== sFa)) why.push("same naam isi hostel mein");
       if (why.length) out.push({
         entity,
         id: s.id,
         row: s,
+        left: s.status === "left",
+        rank: strong ? 0 : 1,
         title: s.full_name + (s.father_name ? " s/o " + s.father_name : ""),
         sub: [hName(s.hostel_id), s.admission_number, s.mobile, s.status].filter(Boolean).join(" · "),
         why: why.join(", ")
       });
     });
+    out.sort((a, b) => a.rank - b.rank); // pakke match pehle
   } else if (entity === "employees") {
     const nm = dupNorm(v.full_name),
       mob = dupPhone(v.mobile);
@@ -7511,12 +7595,88 @@ const findDuplicates = (entity, v, data, hName) => {
   }
   return out;
 };
+// P1 (025): doosre hostel ka same student (warden ko RLS se dikhta nahi). DB function sirf chhota info deta hai.
+// Koi bhi error / 4 sec timeout / function abhi bana nahi = chup-chaap [] (sirf local check chalega).
+const findRemoteDups = async v => {
+  try {
+    const ph = dupPhones(v);
+    if (dupName(v.full_name).length < 3) return [];
+    if (!dupFather(v.father_name) && !ph.length && !dupAdm(v.admission_number)) return [];
+    const call = SB.rpc("ddd_find_similar_students", {
+      p_name: v.full_name || "",
+      p_father: v.father_name || null,
+      p_phones: ph.length ? ph : null,
+      p_admission: v.admission_number || null
+    });
+    let tm = null;
+    const late = new Promise(res => {
+      tm = setTimeout(() => res({
+        data: null,
+        error: {
+          message: "timeout (4 sec)"
+        }
+      }), 4000);
+    });
+    const res = await Promise.race([call, late]);
+    clearTimeout(tm);
+    if (!res || res.error) throw new Error(res && res.error && res.error.message || "no response");
+    return (Array.isArray(res.data) ? res.data : []).slice(0, 5).map((r, i) => ({
+      entity: "students",
+      remote: true,
+      id: "remote-" + i,
+      row: r,
+      code: r.hostel_code || "?",
+      status: r.status || "active",
+      title: r.full_name,
+      sub: [r.joining_month ? "Joining " + r.joining_month : "", r.phone_last4 ? "phone …" + r.phone_last4 : ""].filter(Boolean).join(" · "),
+      why: r.match || "same name"
+    }));
+  } catch (e) {
+    try {
+      console.warn("ddd_find_similar_students (doosre hostel ka check) nahi chala:", e && e.message || e);
+    } catch (x) {}
+    return [];
+  }
+};
+// P1: Edit par sirf BADLE hue fields bhejo — purana (stale) form doosre fields (jaise bed) wapas nahi likhega.
+// null / undefined / "" = barabar; number aur "9000" = value se; baaki String se.
+const P1_SKIP = ["id", "created_at", "created_by", "updated_at", "paid_till"];
+const p1Empty = x => x === null || x === undefined || x === "";
+const p1Same = (a, b) => {
+  if (p1Empty(a) || p1Empty(b)) return p1Empty(a) && p1Empty(b);
+  if (typeof a === "number" || typeof b === "number") {
+    const na = Number(a),
+      nb = Number(b);
+    if (isFinite(na) && isFinite(nb)) return na === nb;
+  }
+  if (typeof a === "object" || typeof b === "object") return JSON.stringify(a) === JSON.stringify(b);
+  return String(a) === String(b);
+};
+const p1Changed = (row, initial) => {
+  const out = {};
+  for (const k in row) {
+    if (k.charAt(0) === "_" || P1_SKIP.includes(k)) continue;
+    const a = row[k];
+    if (p1Same(a, initial[k])) continue;
+    out[k] = a === "" || a === undefined ? null : a; // khali kiya = null (field saaf)
+  }
+  return out;
+};
+// insert ka "same id pehle se hai" error (primary key) — matlab pehli koshish save ho chuki thi
+const p1PkeyDup = e => !!e && String(e.code || "") === "23505" && /_pkey/.test(String(e.message || "") + " " + String(e.details || ""));
+const DUP_STATUS = {
+  active: "Active",
+  temporary_leave: "Temp Leave",
+  left: "Left"
+};
 function DupPanel({
   dups,
   onOpen,
   onAdd
 }) {
   const staff = dups[0] && dups[0].entity === "employees";
+  // P1: apne (dikhne wale) max 5 + doosre hostel ke max 5
+  const list = dups.filter(d => !d.remote).slice(0, 5).concat(dups.filter(d => d.remote).slice(0, 5));
   return /*#__PURE__*/React.createElement("div", {
     "data-dup-panel": "1",
     style: {
@@ -7531,7 +7691,7 @@ function DupPanel({
       color: col('ink'),
       fontSize: 13.5
     }
-  }, "⚠ ", staff ? "Yeh staff pehle se hai" : "Yeh student pehle se hai", " — kholen?"), dups.slice(0, 5).map(d => /*#__PURE__*/React.createElement("div", {
+  }, "⚠ ", staff ? "Yeh staff pehle se hai" : "Yeh student pehle se hai", " — kholen?"), list.map(d => /*#__PURE__*/React.createElement("div", {
     key: d.id,
     style: {
       display: "flex",
@@ -7539,7 +7699,8 @@ function DupPanel({
       alignItems: "center",
       marginTop: 8,
       fontSize: 12.5
-    }
+    },
+    "data-dup-row": d.remote ? "remote" : "local"
   }, /*#__PURE__*/React.createElement("div", {
     style: {
       flex: 1
@@ -7549,7 +7710,21 @@ function DupPanel({
       color: col('mut'),
       fontSize: 11.5
     }
-  }, d.sub, " · ", /*#__PURE__*/React.createElement("i", null, d.why))), /*#__PURE__*/React.createElement("button", {
+  }, d.sub, d.sub ? " · " : "", /*#__PURE__*/React.createElement("i", null, d.why)), d.remote ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: col('red'),
+      fontSize: 11.5,
+      fontWeight: 700
+    },
+    "data-dup-remote": "1"
+  }, "Doosre hostel " + d.code + " mein hai (" + (DUP_STATUS[d.status] || d.status) + ") — naya mat banayein, Director se transfer karwayein") : d.left ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: col('ink'),
+      fontSize: 11.5,
+      fontWeight: 700
+    },
+    "data-dup-left": "1"
+  }, "Wapas aaya hai? Kholen → Edit → Status: Active (naya mat banayein)") : null), d.remote ? null : /*#__PURE__*/React.createElement("button", {
     className: "mini",
     style: {
       background: col('slate')
@@ -7884,19 +8059,56 @@ function App() {
     const fail = m => { if (opts.throwErr) throw new Error(m); alert(m); return false; };
     let e = null;
     let newId = null;
+    let saved = null; // DB mein jo row ab hai (local list turant update karne ke liye)
     if (editId) {
       const { id, ...rest } = row;
       if (id && id !== editId) return fail("Save roka gaya: form ka record badal gaya. Page refresh karke dobara Edit karein.");
-      const res = await SB.from(table).update(clean(rest)).eq("id", editId).select("id");
+      let patch;
+      if (opts.initial) {
+        // P1: sirf badle hue fields — purana form (jaise Left ke baad bed) wapas nahi likhega
+        patch = p1Changed(rest, opts.initial);
+        if (!Object.keys(patch).length) {
+          flash("Koi badlav nahi");
+          return true;
+        }
+      } else patch = clean(rest);
+      const res = await SB.from(table).update(patch).eq("id", editId).select();
       e = res.error;
       if (!e && (!res.data || res.data.length !== 1)) return fail("Update nahi hua (0 rows) — is record ko badalne ki permission nahi hai ya record delete ho chuka hai. Koi naya record NAHI bana.");
+      if (!e) saved = res.data[0];
     } else {
-      newId = crypto.randomUUID();
+      // P1: form ki apni id (retry par wahi) — Manager rule: insert ke saath select nahi
+      newId = opts.newId || crypto.randomUUID();
       const stamped = { ...clean(row), id: newId, created_by: session.user.id };
       if (table === "expenses") stamped.added_by = session.user.id;
       ({ error: e } = await SB.from(table).insert(stamped));
+      let got = null;
+      if (e && p1PkeyDup(e)) {
+        // same id pehle se hai = pehli koshish save ho gayi thi (jawab raaste mein kho gaya).
+        // Beech mein form badla ho (jaise fee) to wahi badlav ab us record par likho — warna purani value reh jaati.
+        const chk = await SB.from(table).select().eq("id", newId).maybeSingle();
+        if (chk && !chk.error && chk.data) {
+          // sirf form ke bhare hue fields (clean) — khali field DB ka default (jaise security_deposit 0) null nahi karega
+          const patch = p1Changed(clean(row), chk.data);
+          if (!Object.keys(patch).length) got = chk.data;
+          else {
+            const up = await SB.from(table).update(patch).eq("id", newId).select();
+            if (up.error || !up.data || up.data.length !== 1) return fail("Pehli koshish mein record save ho chuka tha, lekin baad ke badlav save nahi hue — record kholke Edit karein. Koi naya record NAHI bana." + (up.error ? "\n\n" + up.error.message : ""));
+            got = up.data[0];
+          }
+          e = null;
+        }
+      }
+      if (!e && table === "students") saved = got || stamped;
     }
     if (e) return fail("Save nahi hua:\n\n" + e.message);
+    // P1: list turant update (pura refresh aane se pehle) — warden dobara Edit / dobara Add na kare
+    if (saved) setData(d => {
+      if (!d || !Array.isArray(d[table])) return d;
+      if (editId) return { ...d, [table]: d[table].map(r => r.id === editId ? { ...r, ...saved } : r) };
+      if (d[table].some(r => r.id === saved.id)) return d;
+      return { ...d, [table]: d[table].concat([saved]) };
+    });
     // hostel ka warden Staff mein bhi aa jaye — sirf naye hostel par ya warden ka naam badalne par, aur agar pehle se na ho
     if (table === "hostels" && row.manager_name) {
       const hid = editId || newId;
@@ -8082,10 +8294,15 @@ function App() {
       k: "admission_number",
       label: "Admission No."
     }, {
+      // P1: ek se zyada hostel ho (Director) to Add par khud chunna padega — galat hostel mein student nahi jayega
       k: "hostel_id",
       label: "Hostel",
       type: "select",
-      opts: hostelOpts
+      opts: hostelOpts.length > 1 ? [{
+        value: "",
+        label: "— Hostel chunein —"
+      }].concat(hostelOpts) : hostelOpts,
+      req: hostelOpts.length > 1
     }, {
       k: "monthly_fee",
       label: "Monthly Fee",
@@ -8130,19 +8347,48 @@ function App() {
       label: "Medical Note",
       full: true
     }, {
+      // P1: Left chunne par Exit Date apne aap aaj ki (badal sakte hain); Active / Temp Leave par Exit Date khali.
+      // Left se hata ke wapas Left = pehle wali exit date wapas (_exitPrev kabhi save nahi hota, "_" key)
       k: "status",
       label: "Status",
-      type: "select",
-      opts: [{
-        value: "active",
-        label: "Active"
-      }, {
-        value: "temporary_leave",
-        label: "Temp Leave"
-      }, {
-        value: "left",
-        label: "Left"
-      }]
+      type: "custom",
+      opts: STU_STATUS_OPTS,
+      render: (v, set) => /*#__PURE__*/React.createElement("label", {
+        style: {
+          display: "flex",
+          flexDirection: "column",
+          gap: 5,
+          gridColumn: "auto"
+        }
+      }, /*#__PURE__*/React.createElement("span", {
+        style: {
+          fontSize: 11.5,
+          color: col('mut'),
+          fontWeight: 700
+        }
+      }, "Status"), /*#__PURE__*/React.createElement("select", {
+        className: "inp",
+        value: v.status || "active",
+        onChange: e => {
+          const x = e.target.value;
+          set("status", x);
+          if (x === "left") {
+            set("exit_date", v._exitPrev !== undefined ? v._exitPrev : v.exit_date || istToday());
+          } else {
+            if (v.status === "left") set("_exitPrev", v.exit_date || "");
+            set("exit_date", "");
+          }
+        },
+        "data-student-status": "1"
+      }, STU_STATUS_OPTS.map(o => /*#__PURE__*/React.createElement("option", {
+        key: o.value,
+        value: o.value
+      }, o.label))))
+    }, {
+      k: "exit_date",
+      label: "Exit Date (chhodne ki tareekh)",
+      type: "date",
+      hide: v => v.status !== "left"
     }],
     expenses: [{
       k: "hostel_id",
@@ -9309,8 +9555,9 @@ function App() {
     style: {
       fontSize: 12,
       color: col('mut')
-    }
-  }, "Live \xB7 Supabase")), /*#__PURE__*/React.createElement("main", {
+    },
+    "data-app-version": APP_VERSION
+  }, "Live \xB7 Supabase \xB7 v" + APP_VERSION)), /*#__PURE__*/React.createElement("main", {
     style: {
       flex: 1,
       overflow: "auto",
@@ -9352,10 +9599,10 @@ function App() {
     validate: modal.validate || VALIDATE[modal.entity],
     key: (modal.entity || "") + ":" + (modal.item && modal.item.id || "new"),
     initial: modal.item,
-    dupCheck: !(modal.item && modal.item.id) && (modal.entity === "students" || modal.entity === "employees") ? v => findDuplicates(modal.entity, v, data, hName) : null,
+    dupCheck: !(modal.item && modal.item.id) && (modal.entity === "students" || modal.entity === "employees") ? async v => { const loc = findDuplicates(modal.entity, v, data, hName); if (modal.entity !== "students" || role === "director" || role === "accountant") return loc; return loc.concat(await findRemoteDups(v)); } : null, // P1: Manager ko doosre hostel ka same student bhi dikhe (025)
     onOpenDup: d => d.entity === "students" ? (setModal(null), setProfId(d.id)) : setModal({ entity: "employees", item: d.row }),
     onClose: () => setModal(null),
-    onSave: v => modal.onSave ? modal.onSave(v) : modal.entity === "employees" && role === "director" ? saveStaff(v, modal.item && modal.item.id) : save(modal.entity, v, { editId: modal.item && modal.item.id, throwErr: true })
+    onSave: (v, meta) => modal.onSave ? modal.onSave(v) : modal.entity === "employees" && role === "director" ? saveStaff(v, modal.item && modal.item.id) : save(modal.entity, v, { editId: modal.item && modal.item.id, throwErr: true, initial: modal.item, newId: meta && meta.newId })
   }), contact && /*#__PURE__*/React.createElement(Contact, {
     c: contact,
     onClose: () => setContact(null)
