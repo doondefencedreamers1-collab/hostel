@@ -379,7 +379,7 @@ const {
 const SUPABASE_URL = "https://sttwoctnxfdemmltxijd.supabase.co";
 const SUPABASE_ANON = "sb_publishable_9KhrvINU5ERCWgcr3l970w_HGChNO0J";
 // P1: app ka version — har deploy par badlein. Top bar mein dikhta hai (phone par purana version chal raha hai ya naya).
-const APP_VERSION = "2026-10-09-p2b";
+const APP_VERSION = "2026-10-11-p5";
 try {
   console.info("DDD Hostel app v" + APP_VERSION);
 } catch (e) {}
@@ -604,14 +604,15 @@ function FormModal({
       fields.forEach(f => {
         const val = v[f.k];
         const empty = val === "" || val === undefined || val === null;
-        if (f.req && empty) {
+        const rq = typeof f.req === "function" ? !!f.req(v) : !!f.req; // P5: req function bhi (staff fee 0 sirf Director / Manager)
+        if (rq && empty) {
           miss.push(f.label);
           return;
         }
         if (f.type === "number" && !empty) {
           const n = Number(val);
           const mn = f.min != null ? f.min : 0;
-          if (!isFinite(n) || n < mn || f.int && !Number.isInteger(n) || f.req && n <= 0) bad.push(f.label);
+          if (!isFinite(n) || n < mn || f.int && !Number.isInteger(n) || rq && n <= 0) bad.push(f.label);
         }
       });
       if (miss.length) {
@@ -740,8 +741,15 @@ function FormModal({
     min: f.type === "number" ? f.min != null ? f.min : 0 : undefined,
     step: f.type === "number" && f.int ? 1 : undefined,
     value: v[f.k] ?? "",
+    disabled: typeof f.ro === "function" ? !!f.ro(v) : !!f.ro, // P5: read-only field (warden: bill ke baad Monthly Fee)
     onChange: e => set(f.k, f.type === "number" ? e.target.value === "" ? "" : Number(e.target.value) : e.target.value)
-  })))), dups ? /*#__PURE__*/React.createElement(DupPanel, {
+  }), f.hint && (typeof f.hint === "function" ? f.hint(v) : f.hint) ? /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 10.5,
+      color: col('mut')
+    },
+    "data-field-hint": f.k
+  }, typeof f.hint === "function" ? f.hint(v) : f.hint) : null))), dups ? /*#__PURE__*/React.createElement(DupPanel, {
     dups: dups,
     onOpen: d => onOpenDup && onOpenDup(d),
     onAdd: () => {
@@ -939,7 +947,7 @@ function Login() {
     const {
       error
     } = await SB.auth.signInWithPassword({
-      email,
+      email: p5LoginEmail(email), // P5 (R1): Login ID (jaise rahul01) ya email
       password: pw
     });
     if (error) setErr(error.message);
@@ -1115,14 +1123,15 @@ function Login() {
       }
     }, "\u2190 Pehle se account hai? Login")));
   } else {
-    body = /*#__PURE__*/React.createElement("div", null, lbl("Email"), /*#__PURE__*/React.createElement("input", {
+    body = /*#__PURE__*/React.createElement("div", null, lbl("Email / Login ID"), /*#__PURE__*/React.createElement("input", {
       className: "inp",
       style: {
         margin: "5px 0 12px"
       },
       value: email,
       onChange: e => setEmail(e.target.value),
-      placeholder: "director@ddd.com"
+      placeholder: "Email ya Login ID (jaise rahul01)",
+      autoCapitalize: "none"
     }), lbl("Password"), /*#__PURE__*/React.createElement("input", {
       className: "inp",
       style: {
@@ -1334,6 +1343,125 @@ const planLabel = s => {
 let FEE_GRACE = 0;
 /* not billable = Left, no joining date, or zero fee -> never due/overdue */
 const isBillable = s => !!s && s.status !== "left" && !!s.joining_date && num0(s.monthly_fee) > 0;
+/* =====================================================================
+   P5 (Phase 5, SQL 027-031): feature flags + chhote helpers.
+   Har nayi cheez tabhi dikhti hai jab uski SQL live par chal chuki ho (login ke baad chhota probe).
+   SQL na chali ho to app bilkul p2b jaisa chalta hai.
+     r027 = roles + Manager (head_manager)     f028 = fee badlav prompt + Generate dobara
+     f029 = Staff bed par (occupant_type)      f030 = Common Expense
+     f031 = Delete Duplicate
+   DB role naam -> app label: head_manager = "Manager", manager = "Warden".
+   ===================================================================== */
+let P5 = { r027: false, f028: false, f029: false, f030: false, f031: false, myRole: "", roles: {} };
+const P5_ROLE_LABEL = { director: "Director", head_manager: "Manager", manager: "Warden", accountant: "Accountant", staff: "Staff" };
+const p5RoleLabel = r => P5.r027 ? P5_ROLE_LABEL[r] || r || "" : r;
+// server ke text mein DB role naam ("Rahul (head_manager)") -> app ka naam
+const p5RoleText = t => String(t == null ? "" : t).split("(head_manager)").join("(Manager)").split("(manager)").join("(Warden)");
+const p5IsStaff = s => !!s && P5.f029 && s.occupant_type === "staff";
+// fee 0 wala staff: kabhi bill nahi, kabhi due nahi, "missing data" mein nahi
+const p5FeeFree = s => p5IsStaff(s) && num0(s.monthly_fee) <= 0;
+const p5NeedsData = s => !!s && s.status !== "left" && !isBillable(s) && !(p5FeeFree(s) && !!s.joining_date);
+const p5StaffTag = (data, sid) => {
+  const s = sid && data && (data.students || []).find(x => x.id === sid);
+  return p5IsStaff(s) ? " \xB7 Staff" : "";
+};
+const p5StaffOnBeds = (data, beds) => beds.filter(b => b.student_id && p5IsStaff((data.students || []).find(s => s.id === b.student_id))).length;
+// Login box (R1): "rahul01" -> rahul01@ddd-hostel.app; "@" wala input = email jaisa hai
+const p5LoginEmail = x => {
+  const t = String(x || "").trim();
+  return t && t.indexOf("@") < 0 ? t.toLowerCase() + "@ddd-hostel.app" : t;
+};
+NAV_LABEL.cexp = "Common Expense Report"; // REVIEW FIX L5: owner ka naam
+NAV_LABEL.users = "Managers";
+// login ke baad: kaun si SQL live par hai. Koi bhi error = woh feature band (p2b jaisa).
+const p5Detect = async () => {
+  const P = { r027: false, f028: false, f029: false, f030: false, f031: false, myRole: "", roles: {} };
+  const ok = async q => {
+    try {
+      const r = await q;
+      return r && !r.error ? r : null;
+    } catch (e) {
+      return null;
+    }
+  };
+  const res = await Promise.all([
+    ok(SB.rpc("ddd_my_role")),
+    ok(SB.from("monthly_dues").select("auto_fee").limit(1)),
+    ok(SB.from("students").select("occupant_type").limit(1)),
+    ok(SB.from("expenses").select("common_expense_id").limit(1)),
+    ok(SB.from("duplicate_deletion_log").select("id").limit(1))
+  ]);
+  P.r027 = !!res[0];
+  P.myRole = res[0] && typeof res[0].data === "string" ? res[0].data : "";
+  P.f028 = !!res[1];
+  P.f029 = !!res[2];
+  P.f030 = !!res[3];
+  P.f031 = !!res[4] && P.r027;
+  if (P.r027) {
+    const rr = await ok(SB.from("roles").select("id,name"));
+    (rr && rr.data || []).forEach(x => {
+      P.roles[x.id] = x.name;
+    });
+  }
+  P5 = P;
+  NAV_LABEL.audit = P.r027 ? "Activity Log" : "Audit Log";
+  return P;
+};
+// sidebar pages: Common Expense report (Director / Manager / Warden), Managers (sirf asli Director)
+const p5Allowed = (base, role, realRole) => {
+  const a = base.slice();
+  if (P5.f030 && (role === "director" || role === "manager")) {
+    const i = a.indexOf("expenses");
+    a.splice(i < 0 ? a.length : i + 1, 0, "cexp");
+  }
+  if (P5.r027 && realRole === "director") {
+    const i = a.indexOf("approvals");
+    a.splice(i < 0 ? a.length : i + 1, 0, "users");
+  }
+  return a;
+};
+// Warden Approvals: Director / Manager ki rows yahan nahi (Manager unhe kabhi nahi chhoo sakta, R2)
+const p5WardenRow = (u, realRole) => {
+  if (!P5.r027) return true;
+  const rn = P5.roles[u.role_id] || "";
+  if (rn === "director" || rn === "head_manager") return false;
+  return realRole === "director" || rn === "manager";
+};
+// Edit Student: bill bane student ki Monthly Fee badli (Director / Manager) = "kis mahine se?" prompt (028)
+const p5HasBill = (data, sid) => !!sid && (data && data.monthly_dues || []).some(d => d.student_id === sid);
+const p5FeeAskNeeded = (v, item, role, data) => P5.f028 && role === "director" && !!item && !!item.id && !item.merged_into && v.monthly_fee !== "" && v.monthly_fee != null && num0(v.monthly_fee) !== num0(item.monthly_fee) && p5HasBill(data, item.id);
+const P5_HOSTEL_DEL_MSG = "⚠ HOSTEL DELETE\n\nHostel tabhi hatega jab isme koi student, bill, payment, expense, staff ya salary record NA ho (warna database mana kar dega aur kuch nahi hatega).\nIske rooms aur beds bhi hamesha ke liye hat jayenge.\n\nHostel band hua hai to delete ki jagah use waise hi rehne dein.\n\nPhir bhi delete karna hai?";
+const P5_STU_DEL_MSG = "⚠ PERMANENT DELETE (sirf Director / Manager)\n\nStudent ka record aur uske bills hamesha ke liye mit jayenge. Payment wale student delete nahi hote.\n\nStudent chala gaya ho to delete ki jagah Edit → Status = Left karein.\nDuplicate record ho to Profile → \"Delete Duplicate\" use karein.\n\nPhir bhi delete karna hai?";
+// Edge Function admin-users (Manager logins, sirf Director). Har jawab { ok, error?, ... }
+const p5Admin = async (action, body) => {
+  let res;
+  try {
+    res = await SB.functions.invoke("admin-users", {
+      body: Object.assign({ action: action }, body || {})
+    });
+  } catch (e) {
+    return { ok: false, error: "Server se jawab nahi aaya: " + (e && e.message || e) };
+  }
+  const data = res && res.data;
+  const error = res && res.error;
+  if (!error) return data && typeof data === "object" ? data : { ok: false, error: "Server ka jawab samajh nahi aaya." };
+  let j = null;
+  let st = 0;
+  try {
+    const c = error.context;
+    st = c && c.status || 0;
+    j = c && typeof c.json === "function" ? await c.json() : null;
+  } catch (e) {
+    j = null;
+  }
+  if (j && j.error) return { ok: false, error: j.error, code: j.code || "" };
+  if (st === 404 || /FunctionsFetchError|FunctionsRelayError/.test(String(error.name || ""))) return {
+    ok: false,
+    code: "not_deployed",
+    error: "Manager screen abhi chalu nahi: Edge Function \"admin-users\" deploy nahi hua (DEPLOY_HINGLISH.md ke steps karein)."
+  };
+  return { ok: false, error: error.message || String(error) };
+};
 
 /* Fee status of one student from paid_till */
 const feeState = (s, today, grace) => {
@@ -1345,6 +1473,12 @@ const feeState = (s, today, grace) => {
     c: col('mut'),
     bg: "#eceef1"
   };
+  if (p5FeeFree(s) && s.joining_date) return {
+    kind: "staff",
+    label: "STAFF · NO FEE",
+    c: col('steel'),
+    bg: "#e8eef5"
+  }; // P5 (029): fee 0 wala staff kabhi due nahi
   if (!isBillable(s)) return {
     kind: "na",
     label: !s.joining_date ? "JOINING DATE MISSING" : "FEE NOT SET",
@@ -3348,9 +3482,10 @@ function StudentsPage({
       if (!isMergedOld(s)) return false; // P2 (026): sirf merged purane duplicate
     } else if (isMergedOld(s)) return false; // P2 (026): merged purana duplicate default chhupa
     else if (stuF.st === "missing") {
-      if (s.status === "left" || isBillable(s)) return false;
+      if (!p5NeedsData(s)) return false; // P5: fee 0 wala staff missing nahi
     } else if (stuF.st && (s.status || "active") !== stuF.st) return false;
     if (stuF.q && !studentMatches(s, stuF.q)) return false;
+    if (P5.f029 && stuF.ty && (s.occupant_type || "student") !== stuF.ty) return false; // P5: Students / Staff
     return true;
   });
   const addNew = () => setModal({
@@ -3440,7 +3575,12 @@ function StudentsPage({
     value: "missing"
   }, "Missing data (joining date / fee)"), anyMerged ? /*#__PURE__*/React.createElement("option", {
     value: "merged"
-  }, "Merged (purane duplicate)") : null), /*#__PURE__*/React.createElement("input", {
+  }, "Merged (purane duplicate)") : null), P5.f029 ? /*#__PURE__*/React.createElement(P5TypeChips, {
+    stuF: stuF,
+    upd: upd,
+    chip: chip,
+    data: data
+  }) : null, /*#__PURE__*/React.createElement("input", {
     className: "inp",
     style: {
       width: 190
@@ -3466,7 +3606,7 @@ function StudentsPage({
       color: col('mut'),
       marginLeft: "auto"
     }
-  }, list.length, " students")), /*#__PURE__*/React.createElement("div", {
+  }, P5.f029 ? p5CountText(list) : list.length, P5.f029 ? null : " students")), /*#__PURE__*/React.createElement("div", {
     className: "card",
     style: {
       overflowX: "auto"
@@ -3487,12 +3627,15 @@ function StudentsPage({
       mobile: s.mobile,
       sub: s.course,
       sid: s.id
-    })), /*#__PURE__*/React.createElement("td", null, s.father_name), /*#__PURE__*/React.createElement("td", null, s.mobile), /*#__PURE__*/React.createElement("td", null, s.course), /*#__PURE__*/React.createElement("td", null, hName(s.hostel_id)), /*#__PURE__*/React.createElement("td", null, bed ? (room ? room.room_number : "?") + "/" + bed.bed_number : "—"), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("div", {
+    })), /*#__PURE__*/React.createElement("td", null, s.father_name), /*#__PURE__*/React.createElement("td", null, s.mobile), /*#__PURE__*/React.createElement("td", null, p5IsStaff(s) ? /*#__PURE__*/React.createElement(Badge, {
+      c: col('steel'),
+      bg: "#e8eef5"
+    }, "Staff") : s.course), /*#__PURE__*/React.createElement("td", null, hName(s.hostel_id)), /*#__PURE__*/React.createElement("td", null, bed ? (room ? room.room_number : "?") + "/" + bed.bed_number : "—"), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("div", {
       style: {
         fontWeight: 700,
         whiteSpace: "nowrap"
       }
-    }, planLabel(s)), s.status !== "left" ? /*#__PURE__*/React.createElement("button", {
+    }, p5FeeFree(s) ? "No fee" : planLabel(s)), s.status !== "left" ? /*#__PURE__*/React.createElement("button", {
       onClick: () => setHist(s.id),
       title: "Fee history",
       style: {
@@ -3519,7 +3662,10 @@ function StudentsPage({
     }, rem.months, " months remaining (", inr(rem.value), ")") : null), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement(Badge, {
       c: col(tn[0]),
       bg: tn[1]
-    }, (s.status || "").replace("_", " "))), /*#__PURE__*/React.createElement("td", null, s.merged_into ? null : /*#__PURE__*/React.createElement(EditDel, {
+    }, (s.status || "").replace("_", " "))), /*#__PURE__*/React.createElement("td", null, s.merged_into ? null : P5.r027 && role !== "director" ? /*#__PURE__*/React.createElement(P5WardenStuActions, {
+      ctx: ctx,
+      s: s
+    }) : /*#__PURE__*/React.createElement(EditDel, {
       entity: "students",
       item: s
     })));
@@ -3567,7 +3713,7 @@ function FeesPage({
   const inHostel = x => !hf || x.hostel_id === hf;
   const allActive = data.students.filter(s => s.status !== "left" && inHostel(s));
   const students = allActive.filter(isBillable);
-  const missingCount = allActive.length - students.length;
+  const missingCount = allActive.filter(p5NeedsData).length;
   const withState = students.map(s => ({
     s,
     st: feeState(s, today)
@@ -3611,6 +3757,7 @@ function FeesPage({
   if (!showVoid) dues = dues.filter(d => !isVoidDue(d));
   dues = dues.slice().sort((a, b) => String(b.month).localeCompare(String(a.month)) || String(sName(a.student_id)).localeCompare(String(sName(b.student_id))));
   const genDues = async () => {
+    if (P5.f028) return p5GenDues(ctx, today); // P5 (028): kitne naye bill, kitne nayi fee par
     const {
       error
     } = await SB.rpc("generate_monthly_dues", {
@@ -3915,7 +4062,7 @@ function FeesPage({
     style: isVoidDue(d) ? {
       color: col('mut')
     } : undefined
-  }, /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("b", null, sName(d.student_id))), /*#__PURE__*/React.createElement("td", null, hName(d.hostel_id)), /*#__PURE__*/React.createElement("td", null, String(d.month).slice(0, 7)), /*#__PURE__*/React.createElement("td", {
+  }, /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("b", null, sName(d.student_id) + p5StaffTag(data, d.student_id))), /*#__PURE__*/React.createElement("td", null, hName(d.hostel_id)), /*#__PURE__*/React.createElement("td", null, String(d.month).slice(0, 7)), /*#__PURE__*/React.createElement("td", {
     style: {
       fontSize: 11.5
     }
@@ -4117,7 +4264,7 @@ function StudentSearch({
       fontSize: 11.5,
       color: col('mut')
     }
-  }, s.father_name ? "S/o " + s.father_name + " · " : "", hName(s.hostel_id), " · ", roomBed(s))), /*#__PURE__*/React.createElement(Badge, {
+  }, s.father_name ? "S/o " + s.father_name + " · " : "", hName(s.hostel_id), " · ", roomBed(s), p5IsStaff(s) ? " \xB7 Staff" : null)), /*#__PURE__*/React.createElement(Badge, {
     c: col(tone[s.status] || 'green'),
     bg: col(tone[s.status] || 'green') + "1c"
   }, String(s.status || "active").replace("_", " ") + (isMergedOld(s) ? " · merged" : ""))))) : null);
@@ -4304,7 +4451,7 @@ function StudentProfile({
       fontSize: 12.5,
       color: col('mut')
     }
-  }, hName(s.hostel_id), " · ", bed ? "Room " + (room ? room.room_number : "?") + "/" + bed.bed_number : "No bed", " · ", String(s.status || "active").replace("_", " "))), /*#__PURE__*/React.createElement("button", {
+  }, hName(s.hostel_id), " · ", bed ? "Room " + (room ? room.room_number : "?") + "/" + bed.bed_number : "No bed", " · ", String(s.status || "active").replace("_", " "), p5IsStaff(s) ? " \xB7 STAFF" : null)), /*#__PURE__*/React.createElement("button", {
     onClick: onClose,
     style: {
       border: "none",
@@ -4329,7 +4476,7 @@ function StudentProfile({
       item: s
     }),
     "data-profile-edit": "1"
-  }, "✎ Edit student"), s.status !== "left" && !s.merged_into ? /*#__PURE__*/React.createElement("button", {
+  }, "✎ Edit student"), s.status !== "left" && !s.merged_into && !p5FeeFree(s) ? /*#__PURE__*/React.createElement("button", {
     className: "mini",
     style: act(col('green')),
     onClick: () => setPayOpen(true),
@@ -4356,7 +4503,12 @@ function StudentProfile({
     className: "mini",
     style: act(col('red')),
     onClick: () => del("students", s.id)
-  }, "🗑 Delete") : null), s.merged_into ? /*#__PURE__*/React.createElement("div", {
+  }, "🗑 Delete") : null, /*#__PURE__*/React.createElement(P5ProfileExtra, {
+    ctx: ctx,
+    s: s,
+    isDir: isDir,
+    act: act
+  })), s.merged_into ? /*#__PURE__*/React.createElement("div", {
     className: "card",
     "data-merged-note": s.merged_into,
     style: {
@@ -4376,7 +4528,7 @@ function StudentProfile({
     "data-merged-open": mergedTo.id
   }, "Naya record kholen") : null) : null, sec("Fee summary", /*#__PURE__*/React.createElement("div", {
     style: grid
-  }, I("Monthly fee", inr(s.monthly_fee)), has014 ? I("Fee plan", planName(s)) : null, has014 ? I("Plan amount", planLabel(s)) : null, has014 ? I("Paid till", s.paid_till ? dmy(s.paid_till) : "—") : null, has014 ? /*#__PURE__*/React.createElement("div", null, I("Status", ""), /*#__PURE__*/React.createElement(Badge, {
+  }, I("Monthly fee", p5FeeFree(s) ? "\u20B90 \u2014 Staff, no fee" : inr(s.monthly_fee)), P5.f029 ? I("Type", p5IsStaff(s) ? "Staff" : "Student") : null, has014 ? I("Fee plan", planName(s)) : null, has014 ? I("Plan amount", planLabel(s)) : null, has014 ? I("Paid till", s.paid_till ? dmy(s.paid_till) : "—") : null, has014 ? /*#__PURE__*/React.createElement("div", null, I("Status", ""), /*#__PURE__*/React.createElement(Badge, {
     c: st.c,
     bg: st.bg
   }, st.label)) : null, I("Total paid", loading ? "…" : inr(totalPaid)), I("Pending (due now)", loading ? "…" : inr(totalPending)))), loading ? /*#__PURE__*/React.createElement("div", {
@@ -4533,7 +4685,7 @@ function BellAlerts({
   const today = istToday();
   const fs = (data.students || []).map(s => feeState(s, today));
   const n = k => fs.filter(x => x.kind === k).length;
-  const missing = (data.students || []).filter(s => s.status !== "left" && !isBillable(s)).length;
+  const missing = (data.students || []).filter(p5NeedsData).length;
   const vacant = (data.beds || []).filter(b => b.bed_status === "vacant").length;
   const openC = (data.complaints || []).filter(c => c.status !== "resolved").length;
   const alerts = [{
@@ -7183,7 +7335,10 @@ function DashboardPage({
       delta: d(c.admissions, p.admissions),
       tone: col('green'),
       onClick: nav("students", {
-        pj: "join"
+        pj: "join",
+        ...(P5.f029 ? {
+          ty: "student"
+        } : {})
       })
     }, {
       id: "left",
@@ -7191,7 +7346,10 @@ function DashboardPage({
       value: c.left,
       tone: col('red'),
       onClick: nav("students", {
-        pj: "left"
+        pj: "left",
+        ...(P5.f029 ? {
+          ty: "student"
+        } : {})
       })
     }, {
       id: "comp",
@@ -7213,8 +7371,10 @@ function DashboardPage({
       value: s.students,
       sub: s.missing ? s.missing + " joining date/fee missing" : null,
       tone: col('steel'),
-      onClick: nav("students")
-    }, {
+      onClick: nav("students", P5.f029 ? {
+        ty: "student"
+      } : undefined)
+    }].concat(P5.f029 && s.staff !== undefined ? [p5StaffCard(s, nav)] : [], [{
       id: "occ",
       label: "Occupied Beds",
       value: s.occupied + "/" + s.beds,
@@ -7238,7 +7398,7 @@ function DashboardPage({
       onClick: nav("fees", {
         sf: "overdue"
       })
-    }]).concat(dir ? [{
+    }])).concat(dir ? [{
       id: "salpay",
       label: "Salary Payable",
       value: inr(s.salary_payable),
@@ -7465,7 +7625,7 @@ function DashboardPage({
       style: {
         marginTop: 10
       }
-    }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Hostel", "Students", "Billed", "Collected", "Pending (" + tagS + ")", "Occupancy"].map(h => /*#__PURE__*/React.createElement("th", {
+    }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Hostel", "Students"].concat((sum.hostels || []).some(h => h.staff !== undefined) ? ["Staff"] : [], ["Billed", "Collected", "Pending (" + tagS + ")", "Occupancy"]).map(h => /*#__PURE__*/React.createElement("th", {
       key: h
     }, h)))), /*#__PURE__*/React.createElement("tbody", null, (sum.hostels || []).map(h => /*#__PURE__*/React.createElement("tr", {
       key: h.id,
@@ -7475,7 +7635,7 @@ function DashboardPage({
         fontSize: 11,
         color: col('mut')
       }
-    }, h.code)), /*#__PURE__*/React.createElement("td", null, h.students), /*#__PURE__*/React.createElement("td", null, inr(h.billed)), /*#__PURE__*/React.createElement("td", {
+    }, h.code)), /*#__PURE__*/React.createElement("td", null, h.students), h.staff !== undefined ? /*#__PURE__*/React.createElement("td", null, h.staff) : null, /*#__PURE__*/React.createElement("td", null, inr(h.billed)), /*#__PURE__*/React.createElement("td", {
       style: {
         color: col('green')
       }
@@ -7595,7 +7755,10 @@ function ExpensesPage({
   const appr = rows.filter(e => e.status === "approved").reduce((a, e) => a + num0(e.amount), 0);
   const pend = rows.filter(e => e.status === "pending").length;
   return /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(Header, {
-    entity: "expenses"
+    entity: "expenses",
+    extra: dir && P5.f030 ? /*#__PURE__*/React.createElement(P5CexpAddBtn, {
+      ctx: ctx
+    }) : undefined
   }), /*#__PURE__*/React.createElement(PeriodBar, {
     ctx: ctx,
     extra: dir ? /*#__PURE__*/React.createElement("button", {
@@ -7645,7 +7808,11 @@ function ExpensesPage({
     return /*#__PURE__*/React.createElement("tr", {
       key: e.id,
       "data-exp-row": e.id
-    }, /*#__PURE__*/React.createElement("td", null, hName(e.hostel_id)), /*#__PURE__*/React.createElement("td", null, dmy(e.expense_date)), /*#__PURE__*/React.createElement("td", null, e.category), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("b", null, inr(e.amount))), /*#__PURE__*/React.createElement("td", null, e.paid_to), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement(Badge, {
+    }, /*#__PURE__*/React.createElement("td", null, hName(e.hostel_id)), /*#__PURE__*/React.createElement("td", null, dmy(e.expense_date)), /*#__PURE__*/React.createElement("td", null, e.common_expense_id ? /*#__PURE__*/React.createElement(P5ShareCat, {
+      e: e
+    }) : e.category), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("b", null, inr(e.amount)), e.common_expense_id ? /*#__PURE__*/React.createElement(P5ShareAmt, {
+      e: e
+    }) : null), /*#__PURE__*/React.createElement("td", null, e.paid_to), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement(Badge, {
       c: col(tone),
       bg: col(tone) + "1c"
     }, e.status)), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("span", {
@@ -7672,7 +7839,13 @@ function ExpensesPage({
         id: e.id,
         status: "rejected"
       })
-    }, "Reject")) : null, /*#__PURE__*/React.createElement(EditDel, {
+    }, "Reject")) : null, e.common_expense_id ? /*#__PURE__*/React.createElement(P5ShareAct, {
+      ctx: ctx,
+      e: e
+    }) : P5.r027 && !dir && (e.status === "approved" || e.needs_reapproval) ? /*#__PURE__*/React.createElement(P5EditOnly, {
+      ctx: ctx,
+      item: e
+    }) : /*#__PURE__*/React.createElement(EditDel, {
       entity: "expenses",
       item: e
     }))));
@@ -7707,6 +7880,7 @@ function ReportsPage({
       code: h.code,
       beds: beds.length,
       occ,
+      staff: P5.f029 ? p5StaffOnBeds(data, beds) : 0,
       vacant: beds.length - occ,
       occPct: beds.length ? Math.round(occ / beds.length * 100) : 0,
       income,
@@ -7719,6 +7893,7 @@ function ReportsPage({
   const tot = rows.reduce((a, x) => ({
     beds: a.beds + x.beds,
     occ: a.occ + x.occ,
+    staff: (a.staff || 0) + (x.staff || 0),
     income: a.income + x.income,
     expense: a.expense + x.expense,
     profit: a.profit + x.profit,
@@ -7733,10 +7908,10 @@ function ReportsPage({
     pending: 0,
     staffCost: 0
   });
-  const cols = [["Hostel"], ["Beds"], ["Occ"], ["Vacant"], ["Occ%"], ["Income"]].concat(dir ? [["Expense"], ["Profit/Loss"]] : []).concat([["Pending"]]).concat(dir ? [["Staff Cost"]] : []);
+  const cols = [["Hostel"], ["Beds"], ["Occ"]].concat(P5.f029 ? [["Staff"]] : [], [["Vacant"], ["Occ%"], ["Income"]]).concat(dir ? [["Expense"], ["Profit/Loss"]] : []).concat([["Pending"]]).concat(dir ? [["Staff Cost"]] : []);
   const exportCSV = () => {
-    const head = ["Hostel", "Code", "Beds", "Occupied", "Vacant", "Occupancy%", "Income"].concat(dir ? ["Expense", "ProfitLoss"] : []).concat(["PendingFees"]).concat(dir ? ["StaffCost"] : []);
-    downloadCSV("DDD-report-" + r.from + "-to-" + r.to + ".csv", head, rows.map(x => [x.name, x.code, x.beds, x.occ, x.vacant, x.occPct, x.income].concat(dir ? [x.expense, x.profit] : []).concat([x.pending]).concat(dir ? [x.staffCost] : [])));
+    const head = ["Hostel", "Code", "Beds", "Occupied"].concat(P5.f029 ? ["StaffOnBeds"] : [], ["Vacant", "Occupancy%", "Income"]).concat(dir ? ["Expense", "ProfitLoss"] : []).concat(["PendingFees"]).concat(dir ? ["StaffCost"] : []);
+    downloadCSV("DDD-report-" + r.from + "-to-" + r.to + ".csv", head, rows.map(x => [x.name, x.code, x.beds, x.occ].concat(P5.f029 ? [x.staff] : [], [x.vacant, x.occPct, x.income]).concat(dir ? [x.expense, x.profit] : []).concat([x.pending]).concat(dir ? [x.staffCost] : [])));
   };
   const cells = x => [/*#__PURE__*/React.createElement("td", {
     key: "n"
@@ -7749,7 +7924,9 @@ function ReportsPage({
     key: "b"
   }, x.beds), /*#__PURE__*/React.createElement("td", {
     key: "o"
-  }, x.occ), /*#__PURE__*/React.createElement("td", {
+  }, x.occ)].concat(P5.f029 ? [/*#__PURE__*/React.createElement("td", {
+    key: "st"
+  }, x.staff || 0)] : [], [/*#__PURE__*/React.createElement("td", {
     key: "v"
   }, x.beds - x.occ), /*#__PURE__*/React.createElement("td", {
     key: "p"
@@ -7758,7 +7935,7 @@ function ReportsPage({
     style: {
       color: col('green')
     }
-  }, inr(x.income))].concat(dir ? [/*#__PURE__*/React.createElement("td", {
+  }, inr(x.income))]).concat(dir ? [/*#__PURE__*/React.createElement("td", {
     key: "e",
     style: {
       color: col('red')
@@ -8081,6 +8258,2463 @@ function DupPanel({
   }, "Nahi, yeh alag ", staff ? "staff" : "student", " hai — phir bhi naya add karein"));
 }
 
+/* =====================================================================
+   P5 (Phase 5) screens + modals. Sab sirf tab dikhte hain jab unki SQL (027-031) live par hai (P5 flags).
+   Mobile pehle: cards, wrap hone wale buttons, tables overflowX auto ke andar.
+   ===================================================================== */
+const p5ErrBox = msg => msg ? /*#__PURE__*/React.createElement("div", {
+  "data-p5-err": "1",
+  style: {
+    fontSize: 12.5,
+    color: col('red'),
+    fontWeight: 700,
+    margin: "8px 0",
+    whiteSpace: "pre-wrap",
+    wordBreak: "break-word"
+  }
+}, msg) : null;
+const p5NoteBox = (msg, tone) => msg ? /*#__PURE__*/React.createElement("div", {
+  style: {
+    fontSize: 12.5,
+    padding: "8px 10px",
+    borderRadius: 8,
+    margin: "8px 0",
+    background: tone === "ok" ? "#e6f4ec" : tone === "warn" ? "#fdf4e0" : "#f1ede4",
+    color: tone === "ok" ? col('green') : tone === "warn" ? "#8a6100" : col('ink'),
+    whiteSpace: "pre-wrap",
+    wordBreak: "break-word"
+  }
+}, msg) : null;
+const p5IstTime = t => t ? new Date(t).toLocaleString("en-IN", {
+  timeZone: "Asia/Kolkata",
+  day: "2-digit",
+  month: "2-digit",
+  year: "numeric",
+  hour: "2-digit",
+  minute: "2-digit",
+  hour12: true
+}) : "—";
+const p5Lbl = {
+  fontSize: 11.5,
+  color: col('mut'),
+  fontWeight: 700
+};
+const p5Ghost = {
+  padding: "9px 14px",
+  background: col('paper'),
+  border: "1px solid " + col('line'),
+  borderRadius: 9,
+  fontWeight: 700,
+  cursor: "pointer"
+};
+function P5Modal({
+  title,
+  onClose,
+  busy,
+  wide,
+  children,
+  footer,
+  tag
+}) {
+  const close = () => {
+    if (!busy) onClose();
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    className: "ovl",
+    onClick: close,
+    "data-p5-modal": tag || "1"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "card",
+    style: {
+      maxWidth: wide ? 820 : 480,
+      width: "100%",
+      minWidth: 0,
+      maxHeight: "92vh",
+      display: "flex",
+      flexDirection: "column"
+    },
+    onClick: e => e.stopPropagation()
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: "14px 18px",
+      borderBottom: "1px solid " + col('line'),
+      display: "flex",
+      justifyContent: "space-between",
+      gap: 10,
+      alignItems: "center"
+    }
+  }, /*#__PURE__*/React.createElement("b", {
+    className: "serif",
+    style: {
+      fontSize: 16.5
+    }
+  }, title), /*#__PURE__*/React.createElement("button", {
+    onClick: close,
+    style: {
+      border: "none",
+      background: "none",
+      cursor: "pointer",
+      fontSize: 18,
+      color: col('mut')
+    }
+  }, "✕")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: 16,
+      overflowY: "auto"
+    }
+  }, children), footer ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: "12px 16px",
+      borderTop: "1px solid " + col('line'),
+      display: "flex",
+      gap: 8,
+      flexWrap: "wrap"
+    }
+  }, footer) : null));
+}
+function P5Modals({
+  ctx,
+  m,
+  close
+}) {
+  if (m.kind === "fee") return /*#__PURE__*/React.createElement(P5FeeAsk, {
+    ctx: ctx,
+    m: m,
+    close: close
+  });
+  if (m.kind === "dup") return /*#__PURE__*/React.createElement(P5DupDel, {
+    ctx: ctx,
+    m: m,
+    close: close
+  });
+  if (m.kind === "cexp") return /*#__PURE__*/React.createElement(P5CexpModal, {
+    ctx: ctx,
+    m: m,
+    close: close
+  });
+  return null;
+}
+
+/* ---------- D-fee (028): "Nayi fee kis mahine se lagani hai?" ---------- */
+const P5_FEE_ACT = {
+  reprice: "Nayi fee par",
+  same: "Wahi rahega",
+  credit_review: "Zyada jama — Director dekhein",
+  rule: "Exit / wapsi rule se",
+  pin: "Purani fee par hi",
+  skip: "Nahi badla — khud dekhein"
+};
+function P5FeeAsk({
+  ctx,
+  m,
+  close
+}) {
+  const {
+    data
+  } = ctx;
+  const s = m.student;
+  const cur = monthStartOf(istToday());
+  const jm = s.joining_date ? monthStartOf(s.joining_date) : "";
+  const earlier = Array.from(new Set((data.monthly_dues || []).filter(d => d.student_id === s.id).map(d => monthStartOf(d.month)))).filter(x => x < cur && (!jm || x >= jm)).sort().reverse();
+  const opts = [cur].concat(earlier);
+  const [from, setFrom] = useState(cur);
+  const [pv, setPv] = useState(null);
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const doneRef = useRef(false);
+  useEffect(() => {
+    let alive = true;
+    setPv(null);
+    setErr("");
+    Promise.resolve(SB.rpc("ddd_fee_change", {
+      p_student: s.id,
+      p_new_fee: m.newFee,
+      p_from_month: from,
+      p_apply: false
+    })).then(r => {
+      if (!alive) return;
+      if (r.error) setErr(r.error.message);else setPv(r.data);
+    }, e => {
+      if (alive) setErr(String(e && e.message || e));
+    });
+    return () => {
+      alive = false;
+    };
+  }, [from]);
+  const cancel = () => {
+    if (busy) return;
+    if (!doneRef.current) {
+      doneRef.current = true;
+      m.reject(new Error("Monthly Fee nahi badli, kuch save nahi hua. Fee wapas purani karein ya Save dabakar mahina chunein."));
+    }
+    close();
+  };
+  const apply = async () => {
+    if (busy || !pv) return;
+    setBusy(true);
+    setErr("");
+    let r;
+    try {
+      r = await SB.rpc("ddd_fee_change", {
+        p_student: s.id,
+        p_new_fee: m.newFee,
+        p_from_month: from,
+        p_apply: true
+      });
+    } catch (e) {
+      r = {
+        error: {
+          message: String(e && e.message || e)
+        }
+      };
+    }
+    if (r.error) {
+      setBusy(false);
+      setErr(r.error.message);
+      return;
+    }
+    doneRef.current = true;
+    close();
+    m.resolve(r.data);
+  };
+  const bills = pv && pv.bills || [];
+  return /*#__PURE__*/React.createElement(P5Modal, {
+    title: "Nayi fee kis mahine se lagani hai?",
+    onClose: cancel,
+    busy: busy,
+    tag: "fee",
+    footer: /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("button", {
+      onClick: cancel,
+      disabled: busy,
+      style: {
+        ...p5Ghost,
+        flex: 1
+      }
+    }, "Cancel"), /*#__PURE__*/React.createElement("button", {
+      className: "pbtn",
+      onClick: apply,
+      disabled: busy || !pv,
+      style: {
+        flex: 2,
+        justifyContent: "center"
+      },
+      "data-fee-apply": "1"
+    }, busy ? "Badal rahe…" : "Haan, fee badlein"))
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 13.5,
+      marginBottom: 10
+    }
+  }, /*#__PURE__*/React.createElement("b", null, s.full_name), ": Monthly Fee ", /*#__PURE__*/React.createElement("b", null, inr(s.monthly_fee)), " ", "→", " ", /*#__PURE__*/React.createElement("b", null, inr(m.newFee))), /*#__PURE__*/React.createElement("label", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      gap: 5,
+      marginBottom: 10
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: p5Lbl
+  }, "Kis mahine se? (default: is mahine se)"), /*#__PURE__*/React.createElement("select", {
+    className: "inp",
+    value: from,
+    onChange: e => setFrom(e.target.value),
+    disabled: busy,
+    "data-fee-from": "1"
+  }, opts.map(x => /*#__PURE__*/React.createElement("option", {
+    key: x,
+    value: x
+  }, monthName(x), x === cur ? " (is mahine se)" : " se (pichhla bill bhi badlega)")))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11.5,
+      color: col('mut'),
+      marginBottom: 8
+    }
+  }, "Jama paise aur payments kabhi nahi badalte. Is mahine se pehle ke bill purani fee par rehte hain (jab tak pichhla mahina na chunein)."), p5ErrBox(err), !pv && !err ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12.5,
+      color: col('mut')
+    }
+  }, "Preview ban raha hai", "…") : null, pv ? /*#__PURE__*/React.createElement(React.Fragment, null, p5NoteBox(pv.message, "info"), bills.length ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      overflowX: "auto"
+    }
+  }, /*#__PURE__*/React.createElement("table", {
+    "data-fee-preview": "1",
+    style: {
+      minWidth: 420
+    }
+  }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Mahina", "Pehle", "Ab", "Jama", "Baaki (ab)", "Kya hoga"].map(h => /*#__PURE__*/React.createElement("th", {
+    key: h
+  }, h)))), /*#__PURE__*/React.createElement("tbody", null, bills.map(b => /*#__PURE__*/React.createElement("tr", {
+    key: b.due_id
+  }, /*#__PURE__*/React.createElement("td", null, monthName(b.month)), /*#__PURE__*/React.createElement("td", null, inr(b.old_fee_amount)), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("b", null, inr(b.new_fee_amount))), /*#__PURE__*/React.createElement("td", null, inr(b.paid_amount)), /*#__PURE__*/React.createElement("td", {
+    style: {
+      color: num0(b.new_pending) > 0 ? col('red') : col('green'),
+      fontWeight: 700
+    }
+  }, num0(b.new_pending) > 0 ? inr(b.new_pending) : "—"), /*#__PURE__*/React.createElement("td", {
+    style: {
+      fontSize: 11.5
+    }
+  }, /*#__PURE__*/React.createElement("b", null, P5_FEE_ACT[b.action] || b.action), b.note ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: col('mut')
+    }
+  }, b.note) : null)))))) : /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12.5,
+      color: col('mut')
+    }
+  }, "Is mahine se koi bill nahi badlega (sirf aage ke naye bill nayi fee se banenge).")) : null);
+}
+
+/* ---------- D-dup (031): Delete Duplicate ---------- */
+const P5_NOT_DUP = "This record is not a duplicate, deletion not allowed.";
+const P5_DUP_ACT = {
+  MOVE_DUE: "Bill original par jayega",
+  MOVE_PAY: "Payment original ke bill par",
+  VOID_OLD: "Duplicate ka bill void",
+  LEAVE_VOID: "Pehle se void",
+  CONFLICT: "Rukega"
+};
+function P5DupDel({
+  ctx,
+  m,
+  close
+}) {
+  const {
+    flash,
+    refresh
+  } = ctx;
+  const [rows, setRows] = useState(null);
+  const [err, setErr] = useState("");
+  const [pick, setPick] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [ask, setAsk] = useState(null);
+  const [done, setDone] = useState(null);
+  const [feeOk, setFeeOk] = useState(false); // REVIEW FIX R1-3: fee kam ho rahi hai = alag se haan
+  useEffect(() => {
+    let alive = true;
+    Promise.resolve(SB.rpc("ddd_duplicate_candidates", {
+      p_student: m.student.id
+    })).then(r => {
+      if (!alive) return;
+      if (r.error) {
+        setErr(r.error.message);
+        setRows([]);
+        return;
+      }
+      const rr = r.data || [];
+      setRows(rr);
+      const og = rr.filter(x => x.side === "original");
+      const ok1 = og.find(x => x.can_delete);
+      setPick(ok1 ? ok1.id : og[0] ? og[0].id : "");
+    }, e => {
+      if (alive) {
+        setErr(String(e && e.message || e));
+        setRows([]);
+      }
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
+  const dup = rows ? rows.find(x => x.side === "duplicate") : null;
+  const origs = rows ? rows.filter(x => x.side === "original") : [];
+  const o = origs.find(x => x.id === pick) || null;
+  const run = async move => {
+    if (busy || !dup || !o) return;
+    setBusy(true);
+    setErr("");
+    setAsk(null);
+    let r;
+    try {
+      const args = {
+        p_dup: dup.id,
+        p_original: o.id,
+        p_move_payments: !!move
+      };
+      if (o.plan && o.plan.fee_drop) args.p_confirm_fee = !!feeOk;
+      r = await SB.rpc("ddd_delete_duplicate", args);
+    } catch (e) {
+      r = {
+        error: {
+          message: String(e && e.message || e)
+        }
+      };
+    }
+    setBusy(false);
+    if (r.error) {
+      const c = r.error.code || "";
+      if (c === "DDP01") setAsk(r.error.message);else if (c === "DDF01") setErr(r.error.message + "\nUpar fee wali warning par tick karke dobara dabayein.");else if (c === "DDN01") setErr(P5_NOT_DUP);else if (c === "DDB01") setErr(r.error.message + "\nPehle Bed Allocation mein yeh bed khali karein.");else if (c === "P0002") setErr(r.error.message + "\nPage refresh karein.");else setErr(r.error.message + (c === "DDC01" && r.error.details ? "\n" + r.error.details : ""));
+      return;
+    }
+    setDone(r.data || {});
+    flash(r.data && r.data.message || "Duplicate hata diya ✓");
+    refresh();
+  };
+  const card = (x, label) => {
+    const F = (k, v) => /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        justifyContent: "space-between",
+        gap: 8,
+        fontSize: 12.5,
+        padding: "3px 0",
+        borderTop: "1px dashed " + col('line')
+      }
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: col('mut')
+      }
+    }, k), /*#__PURE__*/React.createElement("b", {
+      style: {
+        textAlign: "right",
+        wordBreak: "break-word"
+      }
+    }, v == null || v === "" ? "—" : v));
+    return /*#__PURE__*/React.createElement("div", {
+      className: "card",
+      key: x.id,
+      style: {
+        padding: 12,
+        borderLeft: "4px solid " + (x.side === "duplicate" ? col('red') : col('green'))
+      },
+      "data-dup-side": x.side
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 11,
+        fontWeight: 800,
+        color: x.side === "duplicate" ? col('red') : col('green'),
+        marginBottom: 4
+      }
+    }, label), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontWeight: 800,
+        fontSize: 14.5,
+        marginBottom: 4
+      }
+    }, x.full_name), F("Pita", x.father_name), F("Mobile", x.mobile), F("Hostel", (x.hostel_code || "") + (x.hostel_name ? " \xB7 " + x.hostel_name : "")), F("Room / Bed", x.bed), F("Joining", x.joining_date ? dmy(x.joining_date) : ""), F("Exit", x.exit_date ? dmy(x.exit_date) : ""), F("Monthly Fee", inr(x.monthly_fee)), F("Status", String(x.status || "").replace("_", " ") + (x.occupant_type === "staff" ? " \xB7 Staff" : "")), F("Bills", x.dues_count + " \xB7 bill " + inr(x.dues_billed) + " \xB7 jama " + inr(x.dues_paid) + " \xB7 baaki " + inr(x.dues_pending)), F("Payments", x.payments_count + " \xB7 " + inr(x.payments_amount) + (x.last_payment_date ? " \xB7 aakhri " + dmy(x.last_payment_date) : "")), F("Banaya", (p5RoleText(x.created_by_name) || "—") + (x.created_at ? " \xB7 " + dmy(x.created_at) : "")));
+  };
+  let body;
+  if (done) {
+    body = /*#__PURE__*/React.createElement("div", {
+      "data-dup-done": "1"
+    }, p5NoteBox((done.message || "Duplicate hata diya.") + (done.already_deleted ? "" : "\n\nBill shift: " + num0(done.moved_dues) + " \xB7 Payment shift: " + num0(done.moved_payments) + " (" + inr(done.moved_amount) + ")\nDuplicate ke bill hate / void: " + num0(done.dropped_dues) + (num0(done.cexp_recalculated) ? "\nCommon Expense split dobara gine: " + num0(done.cexp_recalculated) : "")), "ok"), /*#__PURE__*/React.createElement("button", {
+      className: "pbtn",
+      onClick: () => {
+        close();
+        if (ctx.openProfile && done.original_student_id) ctx.openProfile(done.original_student_id);
+      },
+      "data-dup-open-original": "1"
+    }, "Original record kholen"));
+  } else if (!rows) {
+    body = /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 13,
+        color: col('mut')
+      }
+    }, "Check ho raha hai", "…");
+  } else if (!dup) {
+    body = /*#__PURE__*/React.createElement("div", {
+      "data-dup-none": "1"
+    }, p5ErrBox(err || P5_NOT_DUP));
+  } else {
+    const months = o && o.plan && Array.isArray(o.plan.months) ? o.plan.months : [];
+    // REVIEW FIX R2-F3: original ki joining ke pehle ke bill shift = pichhle Common Expense mein woh mahine nahi ginenge
+    const early = o && o.joining_date ? months.filter(x => x.act === "MOVE_DUE" && x.month && monthStartOf(x.month) < monthStartOf(o.joining_date)) : [];
+    body = /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 12.5,
+        color: col('mut'),
+        marginBottom: 10
+      }
+    }, "Dono record dhyan se milayein. Laal = jo hatega (duplicate), hara = jo rahega (original). Duplicate kahin se mitta nahi: \"merged\" ban kar chhup jaata hai, log mein rehta hai."), origs.length > 1 ? /*#__PURE__*/React.createElement("label", {
+      style: {
+        display: "flex",
+        flexDirection: "column",
+        gap: 5,
+        marginBottom: 10
+      }
+    }, /*#__PURE__*/React.createElement("span", {
+      style: p5Lbl
+    }, "Original record chunein"), /*#__PURE__*/React.createElement("select", {
+      className: "inp",
+      value: pick,
+      onChange: e => setPick(e.target.value),
+      "data-dup-pick": "1"
+    }, origs.map(x => /*#__PURE__*/React.createElement("option", {
+      key: x.id,
+      value: x.id
+    }, x.full_name, " \xB7 ", x.hostel_code, " \xB7 joining ", x.joining_date ? dmy(x.joining_date) : "—", x.can_delete ? "" : " (ruka hua)")))) : null, /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "grid",
+        gap: 10,
+        gridTemplateColumns: "repeat(auto-fit,minmax(240px,1fr))"
+      }
+    }, card(dup, "DUPLICATE — hatega"), o ? card(o, "ORIGINAL — rahega") : null), o && o.plan && o.plan.father_differs ? p5NoteBox("Dhyan dein: dono ke pita ka naam alag hai. Pakka same student hai?", "warn") : null, o && o.plan && o.plan.fee_drop ? /*#__PURE__*/React.createElement("div", {
+      "data-dup-feedrop": "1",
+      style: {
+        border: "2px solid " + col('red'),
+        borderRadius: 8,
+        padding: "8px 10px",
+        margin: "8px 0"
+      }
+    }, p5ErrBox("Fee kam ho rahi hai: " + (o.plan.fee_drop_note || "") + "."), /*#__PURE__*/React.createElement("label", {
+      style: {
+        display: "flex",
+        gap: 8,
+        alignItems: "flex-start",
+        fontSize: 12.5,
+        fontWeight: 700
+      }
+    }, /*#__PURE__*/React.createElement("input", {
+      type: "checkbox",
+      checked: feeOk,
+      onChange: e => setFeeOk(e.target.checked),
+      "data-dup-feeok": "1"
+    }), "Haan, maine fee ka farq dekh liya hai. Original wali (kam) fee hi rahegi.")) : null, early.length ? /*#__PURE__*/React.createElement("div", {
+      "data-dup-early": "1"
+    }, p5NoteBox("Original ki Joining Date (" + dmy(o.joining_date) + ") duplicate (" + (dup.joining_date ? dmy(dup.joining_date) : "—") + ") se baad ki hai, par " + early.length + " pehle ke mahine ka bill original par jayega. Common Expense ki ginti Joining Date se hoti hai: agar yeh student pehle se hostel mein tha to pehle Original record ki Joining Date theek karein (Edit), phir Delete Duplicate karein. Warna pichhle Common Expense split mein yeh student un dino nahi ginega.", "warn")) : null, o && !o.can_delete ? p5ErrBox(o.block_reason || "Yeh duplicate apne aap delete nahi ho sakta.") : null, months.length ? /*#__PURE__*/React.createElement("div", {
+      style: {
+        marginTop: 10
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: p5Lbl
+    }, "Mahine ke hisaab se kya hoga"), months.map((x, i) => /*#__PURE__*/React.createElement("div", {
+      key: i,
+      style: {
+        fontSize: 12,
+        padding: "5px 0",
+        borderTop: "1px dashed " + col('line')
+      }
+    }, /*#__PURE__*/React.createElement("b", null, x.label || monthName(x.month)), " \xB7 ", /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: x.act === "CONFLICT" ? col('red') : col('steel'),
+        fontWeight: 700
+      }
+    }, P5_DUP_ACT[x.act] || x.act), x.note ? /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: col('mut')
+      }
+    }, " \xB7 ", x.note) : null))) : null, o && o.needs_move ? p5NoteBox("Duplicate record par paise jama hain. Delete se pehle yeh payments original record par shift honge (upar ke mahine dekhein).", "warn") : null, ask ? /*#__PURE__*/React.createElement("div", null, p5NoteBox(ask + "\n\nPayments original par shift karke delete karein?", "warn"), /*#__PURE__*/React.createElement("button", {
+      className: "pbtn",
+      disabled: busy,
+      onClick: () => run(true),
+      style: {
+        background: col('red')
+      },
+      "data-dup-move": "1"
+    }, busy ? "…" : "Haan, payments shift karke delete karein")) : null, p5ErrBox(err));
+  }
+  const canRun = !done && dup && o && o.can_delete && !ask && !(o.plan && o.plan.fee_drop && !feeOk);
+  return /*#__PURE__*/React.createElement(P5Modal, {
+    title: "Delete Duplicate — " + m.student.full_name,
+    onClose: close,
+    busy: busy,
+    wide: true,
+    tag: "dup",
+    footer: done ? null : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("button", {
+      onClick: close,
+      disabled: busy,
+      style: {
+        ...p5Ghost,
+        flex: 1
+      }
+    }, dup ? "Cancel" : "Band karein"), canRun ? /*#__PURE__*/React.createElement("button", {
+      className: "pbtn",
+      disabled: busy,
+      onClick: () => run(!!o.needs_move),
+      style: {
+        flex: 2,
+        justifyContent: "center",
+        background: col('red')
+      },
+      "data-dup-confirm": "1"
+    }, busy ? "Ho raha hai…" : o.needs_move ? "Payments shift karke Delete karein" : "Haan, duplicate delete karein") : null)
+  }, body);
+}
+
+/* ---------- D-cexp (030): Common Expense form ---------- */
+function P5CexpModal({
+  ctx,
+  m,
+  close
+}) {
+  const {
+    data,
+    flash,
+    refresh
+  } = ctx;
+  const editId = m.id || null;
+  const idRef = useRef(null);
+  if (idRef.current === null) idRef.current = editId || (typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : null);
+  const t0 = istToday();
+  const pf = m.prefill || {};
+  const [f, setF] = useState({
+    date: pf.date && pf.date <= t0 ? pf.date : t0,
+    category: pf.category || EXP_CATS[0],
+    description: "",
+    total: pf.total || "",
+    mode: pf.mode || PAY_MODES[0],
+    paid_to: pf.paid_to || "",
+    remarks: pf.remarks || "",
+    hostels: []
+  });
+  const set = (k, x) => setF(p => ({
+    ...p,
+    [k]: x
+  }));
+  const [loading, setLoading] = useState(!!editId);
+  const [removed, setRemoved] = useState(false);
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [rc, setRc] = useState(null);
+  const [pv, setPv] = useState({
+    key: "",
+    rows: null,
+    err: "",
+    loading: false
+  });
+  useEffect(() => {
+    if (!editId) return;
+    let alive = true;
+    (async () => {
+      const [a, b] = await Promise.all([SB.from("common_expenses").select("id,expense_date,category,description,total_amount,mode,paid_to,remarks,removed_at").eq("id", editId).maybeSingle(), SB.from("common_expense_hostels").select("hostel_id").eq("common_expense_id", editId)]);
+      if (!alive) return;
+      if (a.error || b.error || !a.data) {
+        setErr((a.error || b.error || {}).message || "Common expense nahi mila. Page refresh karein.");
+        setLoading(false);
+        return;
+      }
+      const c = a.data;
+      setRemoved(!!c.removed_at);
+      setF({
+        date: String(c.expense_date).slice(0, 10),
+        category: c.category || EXP_CATS[0],
+        description: c.description || "",
+        total: num0(c.total_amount),
+        mode: c.mode || "",
+        paid_to: c.paid_to || "",
+        remarks: c.remarks || "",
+        hostels: (b.data || []).map(x => x.hostel_id)
+      });
+      setLoading(false);
+    })().catch(e => {
+      if (alive) {
+        setErr(String(e && e.message || e));
+        setLoading(false);
+      }
+    });
+    return () => {
+      alive = false;
+    };
+  }, [editId]);
+  const hs = f.hostels;
+  const pkey = f.date + "|" + num0(f.total) + "|" + hs.slice().sort().join(",");
+  const canPv = !loading && !removed && !!f.date && num0(f.total) > 0 && hs.length > 0;
+  useEffect(() => {
+    if (!canPv) {
+      setPv({
+        key: "",
+        rows: null,
+        err: "",
+        loading: false
+      });
+      return;
+    }
+    let alive = true;
+    setPv(p => ({
+      ...p,
+      loading: true,
+      err: ""
+    }));
+    const t = setTimeout(() => {
+      Promise.resolve(SB.rpc("ddd_common_expense_preview", {
+        p_date: f.date,
+        p_total: num0(f.total),
+        p_hostels: hs,
+        p_id: editId
+      })).then(r => {
+        if (!alive) return;
+        if (r.error) setPv({
+          key: pkey,
+          rows: null,
+          err: r.error.message,
+          loading: false
+        });else setPv({
+          key: pkey,
+          rows: r.data || [],
+          err: "",
+          loading: false
+        });
+      }, e => {
+        if (alive) setPv({
+          key: pkey,
+          rows: null,
+          err: String(e && e.message || e),
+          loading: false
+        });
+      });
+    }, 350);
+    return () => {
+      alive = false;
+      clearTimeout(t);
+    };
+  }, [pkey, canPv]);
+  const pvOk = pv.key === pkey && !pv.loading && !pv.err && Array.isArray(pv.rows) && pv.rows.length > 0;
+  const allIds = data.hostels.map(h => h.id);
+  const allOn = allIds.length > 0 && allIds.every(id => hs.includes(id));
+  const toggle = id => set("hostels", hs.includes(id) ? hs.filter(x => x !== id) : hs.concat([id]));
+  const save = async () => {
+    if (busy) return;
+    if (!f.date) return setErr("Expense ki date daalein.");
+    if (f.date > t0) return setErr("Aage ki date ka common expense nahi ban sakta. Aaj ya pehle ki date daalein.");
+    if (!(num0(f.total) > 0)) return setErr("Total amount 0 se zyada hona chahiye.");
+    if (!hs.length) return setErr("Kam se kam ek hostel chunein.");
+    if (!pvOk) return setErr(pv.err || "Pehle neeche split ka preview aane dein.");
+    setBusy(true);
+    setErr("");
+    let r;
+    try {
+      r = await SB.rpc("ddd_common_expense_save", {
+        p_id: idRef.current,
+        p_date: f.date,
+        p_category: f.category,
+        p_description: f.description || null,
+        p_total: num0(f.total),
+        p_mode: f.mode || null,
+        p_paid_to: f.paid_to || null,
+        p_remarks: f.remarks || null,
+        p_hostels: hs
+      });
+    } catch (e) {
+      r = {
+        error: {
+          message: String(e && e.message || e)
+        }
+      };
+    }
+    setBusy(false);
+    if (r.error) return setErr(r.error.message);
+    flash(editId ? "Common Expense badla ✓ — saare hisse dobara bane" : "Common Expense save ✓ — " + hs.length + " hostels mein baanta");
+    refresh();
+    close();
+  };
+  const delAll = async () => {
+    if (busy || !editId) return;
+    if (!confirm("Poora Common Expense hatana hai?\n\nSaare " + hs.length + " hostels ke hisse bhi expense list se hat jayenge.")) return;
+    setBusy(true);
+    setErr("");
+    const r = await SB.rpc("ddd_common_expense_delete", {
+      p_id: editId
+    });
+    setBusy(false);
+    if (r.error) return setErr(r.error.message);
+    flash("Common Expense hata diya ✓ (" + num0(r.data) + " hisse hate)");
+    refresh();
+    close();
+  };
+  const recalc = async () => {
+    if (busy || !editId) return;
+    setBusy(true);
+    setErr("");
+    const r = await SB.rpc("ddd_common_expense_recalc", {
+      p_id: editId
+    });
+    setBusy(false);
+    if (r.error) return setErr(r.error.message);
+    setRc(r.data || {});
+    flash(r.data && r.data.split_changed ? "Split dobara gina ✓" : "Kuch nahi badla — occupants wahi hain");
+    refresh();
+  };
+  const tot = pvOk ? pv.rows.reduce((a, x) => a + num0(x.share), 0) : 0;
+  const occ = pvOk ? pv.rows.reduce((a, x) => a + num0(x.occupants), 0) : 0;
+  const inp = (k, label, extra) => /*#__PURE__*/React.createElement("label", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      gap: 5,
+      gridColumn: extra && extra.full ? "1/-1" : "auto"
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: p5Lbl
+  }, label), extra && extra.opts ? /*#__PURE__*/React.createElement("select", {
+    className: "inp",
+    value: f[k],
+    onChange: e => set(k, e.target.value),
+    disabled: busy || removed
+  }, extra.opts.map(o => /*#__PURE__*/React.createElement("option", {
+    key: o,
+    value: o
+  }, o))) : /*#__PURE__*/React.createElement("input", {
+    className: "inp",
+    type: extra && extra.type || "text",
+    value: f[k] ?? "",
+    max: extra && extra.max,
+    min: extra && extra.type === "number" ? 0 : undefined,
+    disabled: busy || removed,
+    onChange: e => set(k, extra && extra.type === "number" ? e.target.value === "" ? "" : Number(e.target.value) : e.target.value),
+    "data-cexp-field": k
+  }));
+  return /*#__PURE__*/React.createElement(P5Modal, {
+    title: editId ? "Common Expense — badlein" : "Common Expense (kai hostels mein baantein)",
+    onClose: close,
+    busy: busy,
+    tag: "cexp",
+    footer: /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("button", {
+      onClick: close,
+      disabled: busy,
+      style: {
+        ...p5Ghost,
+        flex: 1
+      }
+    }, "Cancel"), editId && !removed ? /*#__PURE__*/React.createElement("button", {
+      className: "mini",
+      disabled: busy,
+      onClick: delAll,
+      style: {
+        background: col('red'),
+        padding: "9px 12px"
+      },
+      "data-cexp-delete": "1"
+    }, "Poora hatayein") : null, editId && !removed ? /*#__PURE__*/React.createElement("button", {
+      className: "mini",
+      disabled: busy,
+      onClick: recalc,
+      style: {
+        background: col('steel'),
+        padding: "9px 12px"
+      },
+      "data-cexp-recalc": "1"
+    }, "Recalculate") : null, !removed ? /*#__PURE__*/React.createElement("button", {
+      className: "pbtn",
+      disabled: busy || loading,
+      onClick: save,
+      style: {
+        flex: 2,
+        justifyContent: "center"
+      },
+      "data-cexp-save": "1"
+    }, busy ? "Saving…" : "Save") : null)
+  }, loading ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: col('mut'),
+      fontSize: 13
+    }
+  }, "Load ho raha hai", "…") : null, removed ? p5ErrBox("Ye common expense hata diya gaya hai, ab badla nahi ja sakta.") : null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gap: 10,
+      gridTemplateColumns: "1fr 1fr"
+    }
+  }, inp("date", "Date", {
+    type: "date",
+    max: t0
+  }), inp("total", "Total Amount (₹)", {
+    type: "number"
+  }), inp("category", "Category", {
+    opts: EXP_CATS
+  }), inp("mode", "Mode", {
+    opts: PAY_MODES
+  }), inp("description", "Description (kya kharcha)", {
+    full: true
+  }), inp("paid_to", "Paid To"), inp("remarks", "Remarks")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 12
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "center",
+      gap: 8,
+      flexWrap: "wrap"
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: p5Lbl
+  }, "Hostels (jinme baantna hai)"), /*#__PURE__*/React.createElement("button", {
+    className: "mini",
+    style: {
+      background: allOn ? col('slate') : col('steel')
+    },
+    disabled: busy || removed,
+    onClick: () => set("hostels", allOn ? [] : allIds.slice()),
+    "data-cexp-all": "1"
+  }, allOn ? "Sab hatayein" : "Select All")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      flexWrap: "wrap",
+      gap: 6,
+      marginTop: 6
+    }
+  }, data.hostels.map(h => /*#__PURE__*/React.createElement("label", {
+    key: h.id,
+    style: {
+      display: "inline-flex",
+      alignItems: "center",
+      gap: 6,
+      padding: "6px 10px",
+      border: "1px solid " + col('line'),
+      borderRadius: 8,
+      fontSize: 12.5,
+      fontWeight: 700,
+      background: hs.includes(h.id) ? "#e8eef5" : "#fff",
+      cursor: "pointer"
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "checkbox",
+    checked: hs.includes(h.id),
+    disabled: busy || removed,
+    onChange: () => toggle(h.id),
+    "data-cexp-hostel": h.code
+  }), h.code)))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 12
+    },
+    "data-cexp-preview": "1"
+  }, /*#__PURE__*/React.createElement("div", {
+    style: p5Lbl
+  }, "Split ka preview (save se pehle)"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: col('mut'),
+      margin: "2px 0 6px"
+    }
+  }, "Us din hostel mein rehne wale students + bed par staff gine jaate hain (jo us din chhod raha hai woh nahi). Paise paise tak baante jaate hain, jod bilkul total ke barabar."), !canPv && !removed && !loading ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12.5,
+      color: col('mut')
+    }
+  }, "Date, total aur hostel chunein ", "—", " preview yahan aayega.") : null, canPv && (pv.loading || pv.key !== pkey) ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12.5,
+      color: col('mut')
+    }
+  }, "Preview ban raha hai", "…") : null, pv.key === pkey && pv.err ? p5ErrBox(pv.err) : null, pvOk ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      overflowX: "auto"
+    }
+  }, /*#__PURE__*/React.createElement("table", {
+    style: {
+      minWidth: 300
+    }
+  }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Hostel", "Occupants", "Hissa"].map(h => /*#__PURE__*/React.createElement("th", {
+    key: h
+  }, h)))), /*#__PURE__*/React.createElement("tbody", null, pv.rows.map(x => /*#__PURE__*/React.createElement("tr", {
+    key: x.hostel_id,
+    "data-cexp-row": x.hostel_code
+  }, /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("b", null, x.hostel_code), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10.5,
+      color: col('mut')
+    }
+  }, x.hostel_name)), /*#__PURE__*/React.createElement("td", null, x.occupants, num0(x.staff_occupants) ? /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 10.5,
+      color: col('mut')
+    }
+  }, " (staff ", x.staff_occupants, ")") : null), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("b", null, inr(x.share))))), /*#__PURE__*/React.createElement("tr", {
+    style: {
+      fontWeight: 800
+    }
+  }, /*#__PURE__*/React.createElement("td", null, "TOTAL"), /*#__PURE__*/React.createElement("td", null, occ), /*#__PURE__*/React.createElement("td", null, inr(Math.round(tot * 100) / 100))))), pv.rows.some(x => x.counted_now === false) ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: col('mut')
+    }
+  }, "Purane gine hue occupants (naye ke liye Recalculate dabayein).") : null) : null), rc ? p5NoteBox("Recalculate: " + (rc.split_changed ? "split badla" : "split wahi") + "\n" + Object.keys(rc.after || {}).map(k => k + ": " + ((rc.before || {})[k] ? rc.before[k].occupants + " occ / " + inr(rc.before[k].share) : "—") + " → " + rc.after[k].occupants + " occ / " + inr(rc.after[k].share)).join("\n"), "ok") : null, p5ErrBox(err));
+}
+
+/* ---------- Expenses list: Common Expense (Split) rows ---------- */
+function P5CexpAddBtn({
+  ctx
+}) {
+  return /*#__PURE__*/React.createElement("button", {
+    className: "pbtn",
+    style: {
+      background: col('steel')
+    },
+    onClick: () => ctx.openP5({
+      kind: "cexp"
+    }),
+    "data-cexp-add": "1"
+  }, "+ Common Expense");
+}
+function P5ShareCat({
+  e
+}) {
+  const desc = String(e.remarks || "").split(" | ")[0].replace(/^Common Expense \(Split\):?\s*/, "");
+  return /*#__PURE__*/React.createElement("span", null, /*#__PURE__*/React.createElement(Badge, {
+    c: col('steel'),
+    bg: "#e8eef5"
+  }, "Common Expense (Split)"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      marginTop: 3
+    }
+  }, e.category), desc ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: col('mut')
+    }
+  }, desc) : null);
+}
+function P5ShareAmt({
+  e
+}) {
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10.5,
+      color: col('mut'),
+      whiteSpace: "nowrap"
+    },
+    "data-share-of": e.common_expense_id
+  }, "Total ", inr(e.common_total), " \xB7 ", num0(e.common_hostels), " hostels", e.common_occupants_total != null ? " \xB7 " + num0(e.common_occupants) + "/" + num0(e.common_occupants_total) + " log" : "");
+}
+function P5ShareAct({
+  ctx,
+  e
+}) {
+  if (ctx.role !== "director") return /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11,
+      color: col('mut')
+    }
+  }, "Hissa (read-only)");
+  return /*#__PURE__*/React.createElement("button", {
+    className: "mini",
+    style: {
+      background: col('steel')
+    },
+    onClick: () => ctx.openP5({
+      kind: "cexp",
+      id: e.common_expense_id
+    }),
+    "data-share-open": e.common_expense_id
+  }, "Common Expense kholen");
+}
+function P5EditOnly({
+  ctx,
+  item
+}) {
+  return /*#__PURE__*/React.createElement("button", {
+    onClick: () => ctx.setModal({
+      entity: "expenses",
+      item: item
+    }),
+    title: "Edit (approved: dobara approval mein jayega)",
+    style: {
+      border: "none",
+      background: "none",
+      cursor: "pointer",
+      color: col('slate')
+    }
+  }, "✎");
+}
+
+/* ---------- Common Expense Report ---------- */
+function P5CexpReport({
+  ctx
+}) {
+  const {
+    role,
+    per,
+    refresh,
+    flash
+  } = ctx;
+  const dir = role === "director";
+  const today = istToday();
+  const r = periodRange(per, today);
+  const [tick, setTick] = useState(0);
+  const [st, setSt] = useState({
+    key: "",
+    rows: null,
+    err: ""
+  });
+  const [busy, setBusy] = useState("");
+  const key = r.from + "|" + r.to + "|" + tick;
+  useEffect(() => {
+    let alive = true;
+    Promise.resolve(SB.rpc("ddd_common_expense_report", {
+      p_from: r.from === ALL_FROM ? null : r.from,
+      p_to: r.to
+    })).then(res => {
+      if (!alive) return;
+      if (res.error) setSt({
+        key,
+        rows: null,
+        err: res.error.message
+      });else setSt({
+        key,
+        rows: res.data || [],
+        err: ""
+      });
+    }, e => {
+      if (alive) setSt({
+        key,
+        rows: null,
+        err: String(e && e.message || e)
+      });
+    });
+    return () => {
+      alive = false;
+    };
+  }, [key, ctx.data]);
+  const rows = st.rows || [];
+  const groups = [];
+  const byId = {};
+  rows.forEach(x => {
+    let g = byId[x.common_expense_id];
+    if (!g) {
+      g = byId[x.common_expense_id] = {
+        id: x.common_expense_id,
+        head: x,
+        lines: []
+      };
+      groups.push(g);
+    }
+    g.lines.push(x);
+  });
+  groups.reverse();
+  const recalc = async id => {
+    if (busy) return;
+    setBusy(id);
+    const res = await SB.rpc("ddd_common_expense_recalc", {
+      p_id: id
+    });
+    setBusy("");
+    if (res.error) {
+      flash("⚠ " + res.error.message);
+      return;
+    }
+    flash(res.data && res.data.split_changed ? "Split dobara gina ✓" : "Kuch nahi badla — occupants wahi hain");
+    setTick(t => t + 1);
+    refresh();
+  };
+  const csv = () => downloadCSV("DDD-common-expense-" + r.from + "-to-" + r.to + ".csv", ["Date", "Category", "Description", "Total", "Hostels", "Hostel", "Occupants", "StaffOccupants", "Share", "CreatedBy"], rows.map(x => [x.expense_date, x.category, x.description || "", x.total_amount, x.hostels_count, x.hostel_code, x.occupants, x.staff_occupants, x.share, p5RoleText(x.created_by_name || "")]));
+  // REVIEW FIX F5: warden ko sirf apne hostel ka hissa (poora total nahi)
+  const total = dir ? groups.reduce((a, g) => a + num0(g.head.total_amount), 0) : rows.reduce((a, x) => a + num0(x.share), 0);
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      gap: 12
+    },
+    "data-cexp-report": "1"
+  }, /*#__PURE__*/React.createElement(PeriodBar, {
+    ctx: ctx,
+    noHostel: true,
+    extra: /*#__PURE__*/React.createElement("span", {
+      style: {
+        display: "inline-flex",
+        gap: 6,
+        flexWrap: "wrap"
+      }
+    }, dir ? /*#__PURE__*/React.createElement(P5CexpAddBtn, {
+      ctx: ctx
+    }) : null, /*#__PURE__*/React.createElement("button", {
+      className: "mini",
+      style: {
+        background: col('green')
+      },
+      onClick: csv,
+      disabled: !rows.length
+    }, "⬇", " CSV"))
+  }), !dir ? p5NoteBox("Sirf aapke hostel ka hissa dikh raha hai. Common Expense Director / Manager banate aur badalte hain.", "info") : null, st.err && st.key === key ? p5ErrBox(st.err) : null, st.key !== key && !st.rows ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: col('mut'),
+      fontSize: 13
+    }
+  }, "Load ho raha hai", "…") : null, st.rows ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12.5,
+      color: col('mut')
+    }
+  }, /*#__PURE__*/React.createElement("b", {
+    style: {
+      color: col('ink')
+    }
+  }, groups.length), " common expense \xB7 ", dir ? "total" : "aapke hostel ka hissa", " ", /*#__PURE__*/React.createElement("b", {
+    style: {
+      color: col('ink')
+    },
+    "data-cexp-total": "1"
+  }, inr(total)), " \xB7 ", r.label) : null, st.rows && !groups.length ? /*#__PURE__*/React.createElement("div", {
+    className: "card",
+    style: {
+      padding: 18,
+      color: col('mut'),
+      textAlign: "center"
+    }
+  }, "Is period mein koi common expense nahi.") : null, groups.map(g => {
+    const h = g.head;
+    const stale = g.lines.some(x => x.is_stale);
+    return /*#__PURE__*/React.createElement("div", {
+      key: g.id,
+      className: "card",
+      style: {
+        padding: 14
+      },
+      "data-cexp-group": g.id
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        justifyContent: "space-between",
+        gap: 10,
+        flexWrap: "wrap",
+        alignItems: "flex-start"
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        minWidth: 0
+      }
+    }, /*#__PURE__*/React.createElement("b", {
+      className: "serif",
+      style: {
+        fontSize: 15
+      }
+    }, h.category, h.description ? " — " + h.description : ""), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 12,
+        color: col('mut'),
+        marginTop: 2
+      }
+    }, dmy(h.expense_date), " \xB7 Total ", /*#__PURE__*/React.createElement("b", {
+      style: {
+        color: col('ink')
+      }
+    }, inr(h.total_amount)), " \xB7 ", h.hostels_count, " hostels", h.paid_to ? " \xB7 " + h.paid_to : ""), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 11,
+        color: col('mut'),
+        marginTop: 2
+      }
+    }, "Banaya: ", p5RoleText(h.created_by_name) || "—", " \xB7 ", p5IstTime(h.created_at), h.recalc_at ? " \xB7 Recalculate: " + (p5RoleText(h.recalc_by_name) || "—") + " " + p5IstTime(h.recalc_at) : "")), dir ? /*#__PURE__*/React.createElement("span", {
+      style: {
+        display: "inline-flex",
+        gap: 6,
+        flexWrap: "wrap"
+      }
+    }, stale ? /*#__PURE__*/React.createElement("button", {
+      className: "mini",
+      style: {
+        background: col('amber')
+      },
+      disabled: !!busy,
+      onClick: () => recalc(g.id),
+      "data-cexp-recalc-row": g.id
+    }, busy === g.id ? "…" : "Recalculate") : null, /*#__PURE__*/React.createElement("button", {
+      className: "mini",
+      style: {
+        background: col('slate')
+      },
+      onClick: () => ctx.openP5({
+        kind: "cexp",
+        id: g.id
+      }),
+      "data-cexp-edit": g.id
+    }, "✎", " Edit")) : null), stale ? p5NoteBox("Is din ke occupants ab alag hain (late joiner / exit / duplicate). " + (dir ? "Recalculate dabayein." : "Director / Manager Recalculate karenge."), "warn") : null, /*#__PURE__*/React.createElement("div", {
+      style: {
+        overflowX: "auto",
+        marginTop: 8
+      }
+    }, /*#__PURE__*/React.createElement("table", {
+      style: {
+        minWidth: 320
+      }
+    }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Hostel", "Occupants", "Hissa"].concat(stale ? ["Ab ke occupants"] : []).map(c => /*#__PURE__*/React.createElement("th", {
+      key: c
+    }, c)))), /*#__PURE__*/React.createElement("tbody", null, g.lines.map(x => /*#__PURE__*/React.createElement("tr", {
+      key: x.hostel_id
+    }, /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("b", null, x.hostel_code)), /*#__PURE__*/React.createElement("td", null, x.occupants, num0(x.staff_occupants) ? /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontSize: 10.5,
+        color: col('mut')
+      }
+    }, " (staff ", x.staff_occupants, ")") : null), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("b", null, inr(x.share))), stale ? /*#__PURE__*/React.createElement("td", {
+      style: {
+        color: x.occupants_now !== x.occupants ? col('red') : col('mut')
+      }
+    }, x.occupants_now) : null))))));
+  }));
+}
+
+/* ---------- D-log: Activity Log (Director / Manager) ---------- */
+const P5_AREAS = [["", "Sab"], ["fees", "Fees"], ["payments", "Payments"], ["expenses", "Expenses"], ["students", "Students"], ["beds", "Beds / Rooms"], ["users", "Users"], ["salary", "Salary / Staff"], ["deletions", "Hataya (deletions)"], ["other", "Hostel / baaki"]];
+const P5_AREA_TYPES = {
+  fees: ["monthly_dues", "ddd_fee_change_log"],
+  payments: ["fee_payments"],
+  expenses: ["expenses", "common_expenses", "common_expense_hostels"],
+  students: ["students"],
+  beds: ["beds", "rooms"],
+  users: ["users", "user_hostel_assignments", "role_permissions", "user_admin_log"],
+  salary: ["salary_runs", "salary_payments", "salary_advances", "employees"],
+  other: ["hostels", "complaints", "inventory"]
+};
+const P5_ENT = {
+  monthly_dues: "Fee bill",
+  ddd_fee_change_log: "Fee badlav",
+  fee_payments: "Payment",
+  expenses: "Expense",
+  common_expenses: "Common Expense",
+  common_expense_hostels: "Common Expense hissa",
+  students: "Student",
+  beds: "Bed",
+  rooms: "Room",
+  users: "User",
+  user_hostel_assignments: "Warden ka hostel",
+  role_permissions: "Permission",
+  user_admin_log: "Manager account",
+  salary_runs: "Salary",
+  salary_payments: "Salary payment",
+  salary_advances: "Advance",
+  employees: "Staff",
+  hostels: "Hostel",
+  complaints: "Complaint",
+  inventory: "Inventory",
+  duplicate_deletion_log: "Duplicate delete",
+  staff_attendance: "Staff attendance"
+};
+const P5_ACT = {
+  insert: "Naya",
+  update: "Badla",
+  delete: "Hataya"
+};
+// REVIEW FIX L1: Activity Log detail - Hinglish naam (baaki field apne naam se)
+const P5_LOG_KEY = {
+  full_name: "Naam",
+  father_name: "Pita",
+  mother_name: "Maa",
+  mobile: "Mobile",
+  parent_mobile: "Parent mobile",
+  whatsapp: "WhatsApp",
+  email: "Email / Login",
+  phone: "Mobile",
+  course: "Course",
+  batch: "Batch",
+  status: "Status",
+  hostel_id: "Hostel",
+  student_id: "Student",
+  current_bed_id: "Bed",
+  room_id: "Room",
+  bed_id: "Bed",
+  bed_number: "Bed no.",
+  room_number: "Room no.",
+  joining_date: "Joining",
+  exit_date: "Exit",
+  rejoined_on: "Wapsi",
+  merged_into: "Merge (original)",
+  occupant_type: "Type",
+  monthly_fee: "Monthly Fee",
+  security_deposit: "Security",
+  fee_plan: "Fee plan",
+  plan_months: "Plan mahine",
+  plan_amount: "Plan amount",
+  paid_till: "Paid till",
+  month: "Mahina",
+  fee_amount: "Bill",
+  payable: "Bill (discount ke baad)",
+  discount: "Discount",
+  paid_amount: "Jama",
+  pending: "Baaki",
+  period_from: "Kab se",
+  period_to: "Kab tak",
+  paid_to: "Kahan tak jama",
+  auto_fee: "Auto fee",
+  auto_amount: "Auto bill",
+  amount: "Amount",
+  payment_date: "Payment date",
+  mode: "Mode",
+  receipt_number: "Receipt",
+  due_id: "Bill",
+  collected_by: "Jama kiya",
+  category: "Category",
+  expense_date: "Expense date",
+  remarks: "Remarks",
+  approved_by: "Approve kiya",
+  added_by: "Add kiya",
+  needs_reapproval: "Dobara approval",
+  created_at: "Kab bana",
+  common_expense_id: "Common Expense",
+  common_total: "Common total",
+  common_hostels: "Hostels",
+  common_occupants: "Occupants",
+  common_occupants_total: "Kul occupants",
+  kind: "Kya",
+  note: "Note",
+  old_amount: "Pehle",
+  new_amount: "Ab",
+  from_month: "Kis mahine se",
+  old_status: "Pehle status",
+  new_status: "Ab status",
+  role_id: "Role",
+  is_active: "Login chalu",
+  requested_hostel_id: "Maanga hostel",
+  user_id: "User",
+  actor_name: "Kisne",
+  actor_role: "Kisne (role)",
+  action: "Kaam",
+  target_name: "Kiska account",
+  target_login: "Login ID",
+  ok: "Ho gaya",
+  error: "Error",
+  deleted_name: "Hataya record",
+  original_name: "Original",
+  moved_dues: "Bill shift",
+  moved_payments: "Payment shift",
+  moved_amount: "Shift amount",
+  dropped_dues: "Bill void",
+  cexp_recalculated: "Common Expense dobara"
+};
+const P5_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const p5LogVal = (k, v, data, uName) => {
+  if (v === null || v === undefined || v === "") return "—";
+  if (typeof v === "boolean") return v ? "Haan" : "Nahi";
+  if (typeof v === "string" && P5_UUID.test(v)) {
+    const h = (data.hostels || []).find(x => x.id === v);
+    if (h) return h.code || h.name;
+    const s = (data.students || []).find(x => x.id === v);
+    if (s) return s.full_name;
+    const u = (data.users || []).find(x => x.id === v);
+    if (u) return u.full_name || u.email;
+    if (k === "role_id" && P5.roles[v]) return p5RoleLabel(P5.roles[v]);
+    const bd = (data.beds || []).find(x => x.id === v);
+    if (bd) return "Bed " + (bd.bed_number || "?");
+    return "#" + v.slice(0, 8);
+  }
+  if (typeof v === "string" && /_at$/.test(k) && /^\d{4}-\d{2}-\d{2}T/.test(v)) return p5IstTime(v);
+  if (typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v)) return dmy(v);
+  return p5Val(v);
+};
+const p5Val = v => {
+  if (v === null || v === undefined || v === "") return "—";
+  const t = typeof v === "object" ? JSON.stringify(v) : String(v);
+  return p5RoleText(t.length > 140 ? t.slice(0, 140) + "…" : t);
+};
+function P5LogDetail({
+  id,
+  a,
+  data,
+  uName
+}) {
+  const [d, setD] = useState(null);
+  const [err, setErr] = useState("");
+  useEffect(() => {
+    let alive = true;
+    Promise.resolve(SB.from("audit_logs").select("before,after").eq("id", id).maybeSingle()).then(r => {
+      if (!alive) return;
+      if (r.error) setErr(r.error.message);else setD(r.data || {
+        before: null,
+        after: null
+      });
+    }, e => {
+      if (alive) setErr(String(e && e.message || e));
+    });
+    return () => {
+      alive = false;
+    };
+  }, [id]);
+  if (err) return p5ErrBox(err);
+  if (!d) return /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: col('mut')
+    }
+  }, "Load ho raha hai", "…");
+  const b = d.before || {};
+  const af = d.after || {};
+  // REVIEW FIX L1: id / created_by / updated_at nahi dikhate; naam, IST time, Hinglish label
+  const skip = {
+    updated_at: 1,
+    id: 1,
+    created_by: 1
+  };
+  let keys;
+  if (a.action === "update") keys = Object.keys(af).filter(k => !skip[k] && JSON.stringify(af[k]) !== JSON.stringify(b[k]));else keys = Object.keys(a.action === "delete" ? b : af).filter(k => !skip[k]);
+  const src = a.action === "delete" ? b : af;
+  const sid = src.student_id || (a.entity_type === "students" ? src.id : null);
+  const stu = sid ? (data.students || []).find(s => s.id === sid) : null;
+  const V = (k, v) => p5LogVal(k, v, data, uName);
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      padding: "6px 0"
+    },
+    "data-log-detail": id
+  }, stu ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: 4
+    }
+  }, "Student: ", /*#__PURE__*/React.createElement("b", null, stu.full_name)) : null, !keys.length ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: col('mut')
+    }
+  }, "Koi field nahi badla.") : keys.slice(0, 40).map(k => /*#__PURE__*/React.createElement("div", {
+    key: k,
+    style: {
+      display: "flex",
+      gap: 6,
+      flexWrap: "wrap",
+      padding: "2px 0",
+      borderTop: "1px dashed " + col('line')
+    },
+    "data-log-key": k
+  }, /*#__PURE__*/React.createElement("b", {
+    style: {
+      minWidth: 110
+    }
+  }, a.entity_type === "expenses" && k === "paid_to" ? "Kisko diya" : P5_LOG_KEY[k] || k), a.action === "update" ? /*#__PURE__*/React.createElement("span", null, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: col('mut'),
+      textDecoration: "line-through"
+    }
+  }, V(k, b[k])), " ", "→", " ", /*#__PURE__*/React.createElement("b", null, V(k, af[k]))) : /*#__PURE__*/React.createElement("span", null, V(k, src[k])))));
+}
+function P5ActivityLog({
+  ctx
+}) {
+  const {
+    data,
+    uName
+  } = ctx;
+  const t0 = istToday();
+  const [f, setF] = useState({
+    from: addDaysYmd(t0, -6),
+    to: t0,
+    who: "",
+    area: ""
+  });
+  const [page, setPage] = useState(0);
+  const [st, setSt] = useState({
+    key: "",
+    rows: null,
+    more: false,
+    err: ""
+  });
+  const [open, setOpen] = useState("");
+  const set = (k, v) => {
+    setPage(0);
+    setOpen("");
+    setF(p => ({
+      ...p,
+      [k]: v
+    }));
+  };
+  const key = JSON.stringify(f) + "|" + page;
+  useEffect(() => {
+    let alive = true;
+    const from = f.from && isYmd(f.from) ? f.from : addDaysYmd(t0, -6);
+    const to = f.to && isYmd(f.to) ? f.to : t0;
+    let q = SB.from("audit_logs").select("id,user_id,action,entity_type,entity_id,created_at").gte("created_at", from + "T00:00:00+05:30").lt("created_at", addDaysYmd(to, 1) + "T00:00:00+05:30");
+    if (f.area === "deletions") q = q.or("action.eq.delete,entity_type.eq.duplicate_deletion_log");else if (f.area && P5_AREA_TYPES[f.area]) q = q.in("entity_type", P5_AREA_TYPES[f.area]);
+    if (f.who) q = q.eq("user_id", f.who);
+    q = q.order("created_at", {
+      ascending: false
+    }).range(page * 50, page * 50 + 50);
+    Promise.resolve(q).then(r => {
+      if (!alive) return;
+      if (r.error) setSt({
+        key,
+        rows: null,
+        more: false,
+        err: r.error.message
+      });else setSt({
+        key,
+        rows: (r.data || []).slice(0, 50),
+        more: (r.data || []).length > 50,
+        err: ""
+      });
+    }, e => {
+      if (alive) setSt({
+        key,
+        rows: null,
+        more: false,
+        err: String(e && e.message || e)
+      });
+    });
+    return () => {
+      alive = false;
+    };
+  }, [key]);
+  const users = (data.users || []).slice().sort((a, b) => String(a.full_name || a.email || "").localeCompare(String(b.full_name || b.email || "")));
+  const roleOf = id => {
+    const u = (data.users || []).find(x => x.id === id);
+    const rn = u ? P5.roles[u.role_id] : "";
+    return rn ? p5RoleLabel(rn) : "";
+  };
+  const ent = a => {
+    if (a.entity_type === "students") {
+      const s = (data.students || []).find(x => x.id === a.entity_id);
+      if (s) return s.full_name;
+    }
+    if (a.entity_type === "hostels" || a.entity_type === "user_hostel_assignments") {
+      const h = (data.hostels || []).find(x => x.id === a.entity_id);
+      if (h) return h.code;
+    }
+    if (a.entity_type === "users") {
+      const u = (data.users || []).find(x => x.id === a.entity_id);
+      if (u) return u.full_name || u.email;
+    }
+    return a.entity_id ? "#" + String(a.entity_id).slice(0, 8) : "";
+  };
+  const rows = st.key === key && st.rows ? st.rows : null;
+  // REVIEW FIX L2: "Manager account" rows (Edge Function, service key) = asli kisne (user_admin_log.actor_name)
+  const [actors, setActors] = useState({});
+  useEffect(() => {
+    const ids = (rows || []).filter(x => x.entity_type === "user_admin_log" && !x.user_id && x.entity_id && !actors[x.entity_id]).map(x => x.entity_id);
+    if (!ids.length) return;
+    let alive = true;
+    Promise.resolve(SB.from("user_admin_log").select("id,actor_name,actor_role").in("id", ids)).then(r => {
+      if (!alive || !r || r.error) return;
+      const m = {};
+      (r.data || []).forEach(x => {
+        m[x.id] = x;
+      });
+      setActors(p => ({
+        ...p,
+        ...m
+      }));
+    }, () => {});
+    return () => {
+      alive = false;
+    };
+  }, [rows]);
+  const who = a => {
+    if (a.user_id) return uName(a.user_id);
+    const x = a.entity_type === "user_admin_log" ? actors[a.entity_id] : null;
+    return x && x.actor_name ? x.actor_name : "System / SQL";
+  };
+  const whoRole = a => a.user_id ? roleOf(a.user_id) : a.entity_type === "user_admin_log" && actors[a.entity_id] && actors[a.entity_id].actor_role ? p5RoleLabel(actors[a.entity_id].actor_role) + " (Manager screen)" : "";
+  const lab = {
+    display: "flex",
+    flexDirection: "column",
+    gap: 4,
+    flex: "1 1 140px",
+    minWidth: 130
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      gap: 12
+    },
+    "data-activity-log": "1"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "card",
+    style: {
+      padding: 12,
+      display: "flex",
+      flexWrap: "wrap",
+      gap: 10
+    }
+  }, /*#__PURE__*/React.createElement("label", {
+    style: lab
+  }, /*#__PURE__*/React.createElement("span", {
+    style: p5Lbl
+  }, "Kab se"), /*#__PURE__*/React.createElement("input", {
+    className: "inp",
+    type: "date",
+    value: f.from,
+    max: t0,
+    onChange: e => set("from", e.target.value),
+    "data-log-from": "1"
+  })), /*#__PURE__*/React.createElement("label", {
+    style: lab
+  }, /*#__PURE__*/React.createElement("span", {
+    style: p5Lbl
+  }, "Kab tak"), /*#__PURE__*/React.createElement("input", {
+    className: "inp",
+    type: "date",
+    value: f.to,
+    max: t0,
+    onChange: e => set("to", e.target.value),
+    "data-log-to": "1"
+  })), /*#__PURE__*/React.createElement("label", {
+    style: lab
+  }, /*#__PURE__*/React.createElement("span", {
+    style: p5Lbl
+  }, "Kisne"), /*#__PURE__*/React.createElement("select", {
+    className: "inp",
+    value: f.who,
+    onChange: e => set("who", e.target.value),
+    "data-log-who": "1"
+  }, /*#__PURE__*/React.createElement("option", {
+    value: ""
+  }, "Sab log"), users.map(u => /*#__PURE__*/React.createElement("option", {
+    key: u.id,
+    value: u.id
+  }, (u.full_name || u.email) + (roleOf(u.id) ? " (" + roleOf(u.id) + ")" : ""))))), /*#__PURE__*/React.createElement("label", {
+    style: lab
+  }, /*#__PURE__*/React.createElement("span", {
+    style: p5Lbl
+  }, "Kya (area)"), /*#__PURE__*/React.createElement("select", {
+    className: "inp",
+    value: f.area,
+    onChange: e => set("area", e.target.value),
+    "data-log-area": "1"
+  }, P5_AREAS.map(([k, l]) => /*#__PURE__*/React.createElement("option", {
+    key: k || "all",
+    value: k
+  }, l))))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11.5,
+      color: col('mut')
+    }
+  }, "Har badlav (fees, payments, expenses, students, beds, users, deletions) yahan likha jaata hai: kisne, kab (IST), kya. Kisi line par tap karein = kya badla."), st.err && st.key === key ? p5ErrBox(st.err) : null, !rows && !(st.err && st.key === key) ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: col('mut'),
+      fontSize: 13
+    }
+  }, "Load ho raha hai", "…") : null, rows ? /*#__PURE__*/React.createElement("div", {
+    className: "card",
+    style: {
+      overflowX: "auto"
+    }
+  }, /*#__PURE__*/React.createElement("table", {
+    "data-log-table": "1"
+  }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Kab (IST)", "Kisne", "Kya", "Kahan", ""].map(c => /*#__PURE__*/React.createElement("th", {
+    key: c
+  }, c)))), /*#__PURE__*/React.createElement("tbody", null, rows.map(a => /*#__PURE__*/React.createElement(React.Fragment, {
+    key: a.id
+  }, /*#__PURE__*/React.createElement("tr", {
+    "data-log-row": a.id,
+    onClick: () => setOpen(open === a.id ? "" : a.id),
+    style: {
+      cursor: "pointer"
+    }
+  }, /*#__PURE__*/React.createElement("td", {
+    style: {
+      whiteSpace: "nowrap",
+      fontSize: 12
+    }
+  }, p5IstTime(a.created_at)), /*#__PURE__*/React.createElement("td", {
+    style: {
+      fontSize: 12.5
+    },
+    "data-log-who": a.id
+  }, who(a), whoRole(a) ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10.5,
+      color: col('mut')
+    }
+  }, whoRole(a)) : null), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement(Badge, {
+    c: a.action === "delete" ? col('red') : a.action === "insert" ? col('green') : col('steel'),
+    bg: (a.action === "delete" ? col('red') : a.action === "insert" ? col('green') : col('steel')) + "1c"
+  }, P5_ACT[a.action] || a.action)), /*#__PURE__*/React.createElement("td", {
+    style: {
+      fontSize: 12.5
+    }
+  }, /*#__PURE__*/React.createElement("b", null, P5_ENT[a.entity_type] || a.entity_type), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: col('mut')
+    }
+  }, ent(a))), /*#__PURE__*/React.createElement("td", {
+    style: {
+      fontSize: 16,
+      color: col('mut')
+    }
+  }, open === a.id ? "▴" : "▾")), open === a.id ? /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
+    colSpan: "5",
+    style: {
+      background: col('paper')
+    }
+  }, /*#__PURE__*/React.createElement(P5LogDetail, {
+    id: a.id,
+    a: a,
+    data: data,
+    uName: uName
+  }))) : null)), !rows.length ? /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
+    colSpan: "5"
+  }, "Is filter mein koi activity nahi.")) : null))) : null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 8,
+      justifyContent: "space-between",
+      alignItems: "center"
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "mini",
+    style: {
+      background: col('slate'),
+      padding: "8px 12px",
+      opacity: page > 0 ? 1 : 0.4
+    },
+    disabled: page === 0,
+    onClick: () => setPage(p => Math.max(0, p - 1)),
+    "data-log-newer": "1"
+  }, "←", " Naye"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 12,
+      color: col('mut')
+    }
+  }, "Page ", page + 1, " \xB7 50 per page"), /*#__PURE__*/React.createElement("button", {
+    className: "mini",
+    style: {
+      background: col('slate'),
+      padding: "8px 12px",
+      opacity: st.more && st.key === key ? 1 : 0.4
+    },
+    disabled: !(st.more && st.key === key),
+    onClick: () => setPage(p => p + 1),
+    "data-log-older": "1"
+  }, "Purane ", "→")));
+}
+
+/* ---------- R1: Managers screen (sirf asli Director, Edge Function admin-users) ---------- */
+const p5MobileOk = x => {
+  const all = String(x || "").replace(/\D/g, "");
+  const d = all.length >= 10 && /^0*(91)?0*$/.test(all.slice(0, all.length - 10)) ? all.slice(-10) : "";
+  return /^[6-9][0-9]{9}$/.test(d) ? d : "";
+};
+const p5LoginOk = x => {
+  const s = String(x || "").trim().toLowerCase();
+  return s.indexOf("@") >= 0 ? /^[a-z0-9._%+-]+@[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,}$/.test(s) : /^[a-z0-9][a-z0-9._-]{2,29}$/.test(s);
+};
+function P5Managers({
+  ctx
+}) {
+  const {
+    flash
+  } = ctx;
+  // TEST FIX T1: Manager badla = app ka users data bhi naya (Activity Log "Kisne", naam, approvals turant sahi)
+  const reloadApp = () => {
+    try {
+      if (ctx.refresh) ctx.refresh();
+    } catch (e) {}
+  };
+  const [list, setList] = useState(null);
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState("");
+  const [form, setForm] = useState(null);
+  const [ferr, setFerr] = useState("");
+  const [show, setShow] = useState(false);
+  const load = async () => {
+    const r = await p5Admin("list_managers", {
+      include_removed: true
+    });
+    if (!r.ok) {
+      setErr(r.error || "Manager list nahi aayi.");
+      setList(list || []);
+      return;
+    }
+    setErr("");
+    setList(r.managers || []);
+  };
+  useEffect(() => {
+    load();
+  }, []);
+  const call = async (key, action, body, okMsg) => {
+    setBusy(key);
+    const r = await p5Admin(action, body);
+    setBusy("");
+    if (!r.ok) {
+      setErr(r.error || "Kaam nahi hua.");
+      return false;
+    }
+    setErr("");
+    flash(r.message || okMsg || "Ho gaya ✓");
+    await load();
+    reloadApp();
+    return true;
+  };
+  const submit = async () => {
+    const v = form;
+    setFerr("");
+    if (v.mode === "pw") {
+      if (String(v.password || "").length < 8) return setFerr("Password kam se kam 8 akshar ka rakhein.");
+      if (v.password.trim() !== v.password) return setFerr("Password ke shuru ya end mein space mat rakhein.");
+      setBusy("form");
+      const r = await p5Admin("reset_password", {
+        user_id: v.m.user_id,
+        new_password: v.password
+      });
+      setBusy("");
+      if (!r.ok) return setFerr(r.error);
+      flash(r.message || "Password badal diya ✓");
+      setForm(null);
+      return;
+    }
+    const name = String(v.full_name || "").replace(/\s+/g, " ").trim();
+    if (name.length < 2) return setFerr("Naam likhein (kam se kam 2 akshar).");
+    const mob = p5MobileOk(v.mobile);
+    if (!mob) return setFerr("Mobile number 10 ank ka hona chahiye (jaise 9876543210).");
+    if (!p5LoginOk(v.login_id)) return setFerr("Login ID 3 se 30 akshar: sirf chhote English akshar, ank, . _ - (space nahi). Ya poora email.");
+    if (v.mode === "add" && String(v.password || "").length < 8) return setFerr("Password kam se kam 8 akshar ka rakhein.");
+    setBusy("form");
+    let r;
+    if (v.mode === "add") r = await p5Admin("create_manager", {
+      full_name: name,
+      mobile: mob,
+      login_id: String(v.login_id).trim().toLowerCase(),
+      password: v.password
+    });else {
+      const body = {
+        user_id: v.m.user_id
+      };
+      if (name !== (v.m.full_name || "")) body.full_name = name;
+      if (mob !== (v.m.mobile || "")) body.mobile = mob;
+      if (String(v.login_id).trim().toLowerCase() !== String(v.m.login_id || "").toLowerCase()) body.login_id = String(v.login_id).trim().toLowerCase();
+      if (Object.keys(body).length === 1) {
+        setBusy("");
+        setForm(null);
+        flash("Koi badlav nahi");
+        return;
+      }
+      r = await p5Admin("update_manager", body);
+    }
+    setBusy("");
+    if (!r.ok) return setFerr(r.error);
+    flash(r.message || "Ho gaya ✓");
+    setForm(null);
+    load();
+    reloadApp();
+  };
+  const fset = (k, x) => setForm(p => ({
+    ...p,
+    [k]: x
+  }));
+  const stTone = m => m.status === "removed" ? ["Removed", col('red')] : m.status === "inactive" || m.is_active === false ? ["Login band", col('amber')] : ["Active", col('green')];
+  const fld = (k, label, type, ph) => /*#__PURE__*/React.createElement("label", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      gap: 5
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: p5Lbl
+  }, label), /*#__PURE__*/React.createElement("input", {
+    className: "inp",
+    type: type === "password" && !show ? "password" : "text",
+    value: form[k] || "",
+    placeholder: ph || "",
+    autoCapitalize: "none",
+    onChange: e => fset(k, e.target.value),
+    "data-mgr-field": k
+  }));
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      gap: 12
+    },
+    "data-managers": "1"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "card",
+    style: {
+      padding: 16
+    }
+  }, /*#__PURE__*/React.createElement("b", {
+    className: "serif",
+    style: {
+      fontSize: 16
+    }
+  }, "Managers"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12.5,
+      color: col('mut'),
+      marginTop: 4
+    }
+  }, "Manager ke paas Director wali saari powers hoti hain (sabhi hostels, fees, salary, Activity Log, warden approval) ", "—", " sirf Manager / Director accounts nahi badal sakta. Yeh screen sirf Director dekhte hain."), /*#__PURE__*/React.createElement("button", {
+    className: "pbtn",
+    style: {
+      marginTop: 10
+    },
+    onClick: () => {
+      setFerr("");
+      setShow(false);
+      setForm({
+        mode: "add",
+        full_name: "",
+        mobile: "",
+        login_id: "",
+        password: ""
+      });
+    },
+    "data-mgr-add": "1"
+  }, "+ Naya Manager")), p5ErrBox(err), !list ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: col('mut'),
+      fontSize: 13
+    }
+  }, "Load ho raha hai", "…") : null, list && !list.length && !err ? /*#__PURE__*/React.createElement("div", {
+    className: "card",
+    style: {
+      padding: 18,
+      color: col('mut'),
+      textAlign: "center"
+    }
+  }, "Abhi koi Manager nahi.") : null, (list || []).map(m => {
+    const [stl, stc] = stTone(m);
+    const removed = m.status === "removed";
+    const off = m.status === "inactive" || m.is_active === false;
+    return /*#__PURE__*/React.createElement("div", {
+      key: m.user_id,
+      className: "card",
+      style: {
+        padding: 14,
+        opacity: removed ? 0.7 : 1
+      },
+      "data-mgr": m.login_id
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        justifyContent: "space-between",
+        gap: 10,
+        flexWrap: "wrap"
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        minWidth: 0
+      }
+    }, /*#__PURE__*/React.createElement("b", {
+      style: {
+        fontSize: 14.5
+      }
+    }, m.full_name || "—"), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 12.5,
+        color: col('mut')
+      }
+    }, "Login ID: ", /*#__PURE__*/React.createElement("b", {
+      style: {
+        color: col('ink')
+      }
+    }, m.login_id), " \xB7 Mobile: ", m.mobile || "—"), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 11,
+        color: col('mut')
+      }
+    }, "Aakhri login: ", m.last_sign_in_at ? p5IstTime(m.last_sign_in_at) : "—")), /*#__PURE__*/React.createElement(Badge, {
+      c: stc,
+      bg: stc + "1c"
+    }, stl)), !removed ? /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        gap: 6,
+        flexWrap: "wrap",
+        marginTop: 10
+      }
+    }, /*#__PURE__*/React.createElement("button", {
+      className: "mini",
+      style: {
+        background: col('slate'),
+        padding: "7px 11px"
+      },
+      disabled: !!busy,
+      onClick: () => {
+        setFerr("");
+        setForm({
+          mode: "edit",
+          m: m,
+          full_name: m.full_name || "",
+          mobile: m.mobile || "",
+          login_id: m.login_id || ""
+        });
+      },
+      "data-mgr-edit": m.login_id
+    }, "✎", " Edit"), /*#__PURE__*/React.createElement("button", {
+      className: "mini",
+      style: {
+        background: col('steel'),
+        padding: "7px 11px"
+      },
+      disabled: !!busy,
+      onClick: () => {
+        setFerr("");
+        setShow(false);
+        setForm({
+          mode: "pw",
+          m: m,
+          password: ""
+        });
+      },
+      "data-mgr-pw": m.login_id
+    }, "Password reset"), /*#__PURE__*/React.createElement("button", {
+      className: "mini",
+      style: {
+        background: off ? col('green') : col('amber'),
+        padding: "7px 11px"
+      },
+      disabled: !!busy,
+      onClick: () => {
+        if (!off && !confirm(m.full_name + " ka login band karein?\n\nWoh login nahi kar payega. Data safe rahega. Baad mein \"Login chalu\" se wapas.")) return;
+        call(m.user_id, "set_active", {
+          user_id: m.user_id,
+          active: off
+        }, off ? "Login chalu ✓" : "Login band ✓");
+      },
+      "data-mgr-active": m.login_id
+    }, busy === m.user_id ? "…" : off ? "Login chalu karein" : "Login band karein"), /*#__PURE__*/React.createElement("button", {
+      className: "mini",
+      style: {
+        background: col('red'),
+        padding: "7px 11px"
+      },
+      disabled: !!busy,
+      onClick: () => {
+        if (!confirm("⚠ " + m.full_name + " ko Manager se hatana hai?\n\nLogin hamesha ke liye band. Iska kiya hua kaam (history) safe rahega.")) return;
+        call(m.user_id, "remove_manager", {
+          user_id: m.user_id
+        }, "Manager hata diya ✓");
+      },
+      "data-mgr-remove": m.login_id
+    }, "Remove")) : null);
+  }), form ? /*#__PURE__*/React.createElement(P5Modal, {
+    title: form.mode === "add" ? "Naya Manager" : form.mode === "pw" ? "Password reset — " + form.m.full_name : "Manager badlein — " + form.m.full_name,
+    onClose: () => setForm(null),
+    busy: busy === "form",
+    tag: "mgr",
+    footer: /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("button", {
+      onClick: () => setForm(null),
+      disabled: busy === "form",
+      style: {
+        ...p5Ghost,
+        flex: 1
+      }
+    }, "Cancel"), /*#__PURE__*/React.createElement("button", {
+      className: "pbtn",
+      disabled: busy === "form",
+      onClick: submit,
+      style: {
+        flex: 2,
+        justifyContent: "center"
+      },
+      "data-mgr-save": "1"
+    }, busy === "form" ? "Saving…" : "Save"))
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gap: 10
+    }
+  }, form.mode !== "pw" ? /*#__PURE__*/React.createElement(React.Fragment, null, fld("full_name", "Poora Naam", "text", "jaise Rahul Sharma"), fld("mobile", "Mobile (10 ank)", "text", "9876543210"), fld("login_id", "Login ID", "text", "jaise rahul01")) : null, form.mode !== "edit" ? fld("password", form.mode === "pw" ? "Naya Password (kam se kam 8 akshar)" : "Password (kam se kam 8 akshar)", "password", "") : null, form.mode !== "edit" ? /*#__PURE__*/React.createElement("label", {
+    style: {
+      display: "inline-flex",
+      gap: 6,
+      alignItems: "center",
+      fontSize: 12.5
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "checkbox",
+    checked: show,
+    onChange: e => setShow(e.target.checked)
+  }), "Password dikhayein") : null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11.5,
+      color: col('mut')
+    }
+  }, "Manager login box mein Login ID (jaise rahul01) aur password daalega. Login ID / password Manager ko khud batayein (app kahin nahi bhejta)."), p5ErrBox(ferr))) : null);
+}
+
+/* ---------- Students: warden = Edit + Mark as Left (delete sirf Director / Manager, R10) ---------- */
+function P5WardenStuActions({
+  ctx,
+  s
+}) {
+  return /*#__PURE__*/React.createElement("span", {
+    style: {
+      display: "inline-flex",
+      gap: 8,
+      alignItems: "center"
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: () => ctx.setModal({
+      entity: "students",
+      item: s
+    }),
+    style: {
+      border: "none",
+      background: "none",
+      cursor: "pointer",
+      color: col('slate')
+    }
+  }, "✎"), s.status !== "left" ? /*#__PURE__*/React.createElement("button", {
+    className: "mini",
+    style: {
+      background: col('amber')
+    },
+    onClick: () => ctx.markLeft(s),
+    "data-mark-left": s.id
+  }, "Mark as Left") : null);
+}
+function P5ProfileExtra({
+  ctx,
+  s,
+  isDir,
+  act
+}) {
+  return /*#__PURE__*/React.createElement(React.Fragment, null, P5.f031 && isDir && !s.merged_into ? /*#__PURE__*/React.createElement("button", {
+    className: "mini",
+    style: act(col('red')),
+    onClick: () => ctx.openP5({
+      kind: "dup",
+      student: s
+    }),
+    "data-dup-delete": s.id
+  }, "Delete Duplicate") : null, P5.r027 && !isDir && s.status !== "left" && !s.merged_into ? /*#__PURE__*/React.createElement("button", {
+    className: "mini",
+    style: act(col('amber')),
+    onClick: () => ctx.markLeft(s),
+    "data-mark-left": s.id
+  }, "Mark as Left") : null);
+}
+function P5TypeChips({
+  stuF,
+  upd,
+  chip,
+  data
+}) {
+  const ty = stuF.ty || "";
+  const nStaff = data.students.filter(s => p5IsStaff(s) && s.status !== "left").length;
+  return /*#__PURE__*/React.createElement("span", {
+    style: {
+      display: "inline-flex",
+      gap: 6,
+      flexWrap: "wrap"
+    }
+  }, [["", "All"], ["student", "Students"], ["staff", "Staff (" + nStaff + ")"]].map(([k, l]) => /*#__PURE__*/React.createElement("button", {
+    key: k || "all",
+    onClick: () => upd({
+      ty: k
+    }),
+    style: chip(ty === k),
+    "data-type-chip": k || "all"
+  }, l)));
+}
+const p5CountText = list => {
+  const n = list.filter(p5IsStaff).length;
+  return list.length - n + " students" + (n ? " \xB7 " + n + " staff" : "");
+};
+
+/* ---------- 029: bed allocation Student / Staff ---------- */
+function P5AllocType({
+  ty,
+  setTy,
+  onNew
+}) {
+  const b = on => ({
+    padding: "6px 12px",
+    borderRadius: 8,
+    border: "1px solid " + col('line'),
+    cursor: "pointer",
+    fontSize: 12.5,
+    fontWeight: 700,
+    background: on ? col('slate') : "#fff",
+    color: on ? "#fff" : col('slate')
+  });
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 6,
+      flexWrap: "wrap",
+      alignItems: "center",
+      marginBottom: 8
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    style: b(ty === "student"),
+    onClick: () => setTy("student"),
+    "data-alloc-type": "student"
+  }, "Student"), /*#__PURE__*/React.createElement("button", {
+    style: b(ty === "staff"),
+    onClick: () => setTy("staff"),
+    "data-alloc-type": "staff"
+  }, "Staff"), ty === "staff" ? /*#__PURE__*/React.createElement("button", {
+    className: "mini",
+    style: {
+      background: col('green'),
+      padding: "6px 10px"
+    },
+    onClick: onNew,
+    "data-alloc-new-staff": "1"
+  }, "+ Naya Staff is bed par") : null);
+}
+const p5StaffCard = (s, nav) => ({
+  id: "staff",
+  label: "Staff (bed par)",
+  value: s.staff,
+  sub: num0(s.staff_nofee) ? s.staff_nofee + " bina fee" : null,
+  tone: col('slate'),
+  onClick: nav("students", {
+    ty: "staff"
+  })
+});
+
+/* ---------- 028: Generate ka nateeja (kitne naye bill, kitne nayi fee par) ---------- */
+const p5GenDues = async (ctx, today) => {
+  const {
+    flash,
+    refresh,
+    role,
+    session
+  } = ctx;
+  const pm = monthStartOf(today);
+  const cnt = async () => {
+    try {
+      const r = await SB.from("monthly_dues").select("id", {
+        count: "exact",
+        head: true
+      }).eq("month", pm);
+      return r.error ? null : r.count;
+    } catch (e) {
+      return null;
+    }
+  };
+  const since = new Date(Date.now() - 120000).toISOString();
+  const before = await cnt();
+  const {
+    error
+  } = await SB.rpc("generate_monthly_dues", {
+    p_month: pm
+  });
+  if (error) {
+    flash("⚠ " + error.message);
+    return;
+  }
+  const after = await cnt();
+  const parts = [monthName(pm) + ":"];
+  if (before != null && after != null) parts.push(after > before ? after - before + (after - before === 1 ? " naya bill bana" : " naye bill bane") : "koi naya bill nahi bana (sab ke bill pehle se hain)");else parts.push("dues generate ho gayi");
+  if (role === "director" && session && session.user) {
+    try {
+      const lg = await SB.from("ddd_fee_change_log").select("kind,note").in("kind", ["regen", "regen_error"]).eq("month", pm).eq("created_by", session.user.id).gte("created_at", since).limit(200);
+      const L = lg && !lg.error ? lg.data || [] : [];
+      const n = L.filter(x => x.kind === "regen").length;
+      const bad = L.find(x => x.kind === "regen_error");
+      if (n) parts.push("\xB7 " + n + " bill nayi Monthly Fee par update hue");
+      if (bad) parts.push("\xB7 ⚠ " + bad.note);
+    } catch (e) {/* sirf jaankari */}
+  }
+  flash(parts.join(" "));
+  refresh();
+};
+
+/* ---------- FIELDS (Add / Edit forms) mein P5 badlav ---------- */
+const p5PatchFields = (F, o) => {
+  const {
+    role,
+    data,
+    modal,
+    setModal,
+    openP5
+  } = o;
+  const dirLvl = role === "director";
+  if (F.students) {
+    const hasBill = v => p5HasBill(data, v && v.id);
+    const roFee = v => P5.f028 && !dirLvl && !!v.id && hasBill(v);
+    F.students = F.students.map(f => f.k !== "monthly_fee" ? f : {
+      ...f,
+      // staff (Director / Manager): 0 chalega, khali nahi
+      req: v => !(P5.f029 && dirLvl && v.occupant_type === "staff" && v.monthly_fee !== "" && v.monthly_fee != null),
+      ro: roFee,
+      hint: v => roFee(v) ? "Bill ban chuka hai — Fee Director / Manager badlenge" : P5.f029 && v.occupant_type === "staff" ? dirLvl ? "Staff: 0 bhi chalega (0 = kabhi bill nahi)" : "Staff ki fee likhein. Fee 0 sirf Director / Manager rakh sakte hain." : P5.f028 && dirLvl && v.id && hasBill(v) ? "Fee badalne par poochha jayega: kis mahine se lagani hai" : ""
+    });
+    if (P5.f029) {
+      const occ = {
+        k: "occupant_type",
+        label: "Type (bed par)",
+        type: "custom",
+        render: (v, set) => {
+          const billed = !!v.id && ((data.monthly_dues || []).some(d => d.student_id === v.id && num0(d.fee_amount) > 0 && !isVoidDue(d)) || (data.fee_payments || []).some(p => p.student_id === v.id));
+          const s0 = modal && modal.item || {};
+          const lockStaff = !dirLvl && billed && (s0.occupant_type || "student") !== "staff";
+          const cur = v.occupant_type || "student";
+          return /*#__PURE__*/React.createElement("label", {
+            key: "occupant_type",
+            style: {
+              display: "flex",
+              flexDirection: "column",
+              gap: 5,
+              gridColumn: "1/-1"
+            }
+          }, /*#__PURE__*/React.createElement("span", {
+            style: p5Lbl
+          }, "Type (bed par)"), /*#__PURE__*/React.createElement("select", {
+            className: "inp",
+            value: cur,
+            onChange: e => {
+              const x = e.target.value;
+              set("occupant_type", x);
+              if (x === "staff" && dirLvl && (v.monthly_fee === "" || v.monthly_fee == null)) set("monthly_fee", 0);
+            },
+            "data-occupant-type": "1"
+          }, /*#__PURE__*/React.createElement("option", {
+            value: "student"
+          }, "Student"), /*#__PURE__*/React.createElement("option", {
+            value: "staff",
+            disabled: lockStaff
+          }, "Staff (hostel ka staff, bed par)", lockStaff ? " — sirf Director / Manager" : "")), lockStaff ? /*#__PURE__*/React.createElement("span", {
+            style: {
+              fontSize: 10.5,
+              color: col('mut')
+            }
+          }, "Bill ban chuka hai ", "—", " Student ko Staff sirf Director / Manager bana sakte hain.") : null);
+        }
+      };
+      F.students = F.students.slice(0, 1).concat([occ], F.students.slice(1));
+    }
+  }
+  if (F.expenses && P5.r027 && !dirLvl) {
+    F.expenses = [{
+      k: "_apprnote",
+      label: "",
+      type: "custom",
+      hide: v => !(v.id && modal && modal.item && modal.item.status === "approved"),
+      render: () => /*#__PURE__*/React.createElement("div", {
+        key: "_apprnote",
+        style: {
+          gridColumn: "1/-1"
+        }
+      }, p5NoteBox("Dhyan dein: yeh expense approved hai. Badalne par yeh dobara approval (pending) mein jayega.", "warn"))
+    }].concat(F.expenses);
+  }
+  if (F.expenses && P5.f030 && dirLvl) {
+    F.expenses = [{
+      k: "_ctype",
+      label: "",
+      type: "custom",
+      hide: v => !!v.id,
+      render: v => /*#__PURE__*/React.createElement("div", {
+        key: "_ctype",
+        style: {
+          gridColumn: "1/-1",
+          display: "flex",
+          gap: 6,
+          flexWrap: "wrap"
+        }
+      }, /*#__PURE__*/React.createElement("span", {
+        className: "badge",
+        style: {
+          background: col('slate'),
+          color: "#fff",
+          padding: "6px 10px"
+        }
+      }, "Sirf is hostel ka"), /*#__PURE__*/React.createElement("button", {
+        type: "button",
+        className: "mini",
+        style: {
+          background: col('steel'),
+          padding: "6px 10px"
+        },
+        onClick: () => {
+          setModal(null);
+          openP5({
+            kind: "cexp",
+            prefill: {
+              date: v.expense_date,
+              category: v.category,
+              total: v.amount,
+              mode: v.mode,
+              paid_to: v.paid_to,
+              remarks: v.remarks
+            }
+          });
+        },
+        "data-exp-common": "1"
+      }, "Common Expense (kai hostels mein baantein) ", "→"))
+    }].concat(F.expenses);
+  }
+  return F;
+};
 function App() {
   const [session, setSession] = useState(null);
   const [profile, setProfile] = useState(null);
@@ -8116,6 +10750,7 @@ function App() {
   const setPer = p => setPerSt(s => { const n = { ...s, p: p }; savePeriod(n); return n; });
   const setPerH = h => setPerSt(s => { const n = { ...s, h: h || "" }; savePeriod(n); return n; });
   const [feeTab, setFeeTab] = useState("students");
+  const [p5m, setP5m] = useState(null); // P5: Common Expense / Delete Duplicate / fee prompt modal
   FEE_GRACE = feeGrace;
   // open a page with a filter (Bell alerts + Dashboard cards)
   const go = (pg, f) => {
@@ -8127,7 +10762,7 @@ function App() {
     if (pg === "staff") setStaffF(f.staff || "");
     if (pg === "salary") { setSalSf(f.sf || "all"); if (f.month) setSalMonth(f.month); }
     if (pg === "fees") { setFeeTab(f.tab || "students"); if (f.hostel !== undefined) setHf(f.hostel || ""); if (f.month !== undefined) setMf(f.month || ""); }
-    if (pg === "students") setStuF(p => ({ ...p, pj: f.pj || "", ...(f.pj ? { st: "", q: "", r: "" } : {}), ...(f.hostel ? { h: [f.hostel], r: "" } : {}) }));
+    if (pg === "students") setStuF(p => ({ ...p, pj: f.pj || "", ...(f.pj ? { st: "", q: "", r: "" } : {}), ...(f.hostel ? { h: [f.hostel], r: "" } : {}), ...(f.ty !== undefined ? { ty: f.ty } : {}) }));
     if ((pg === "expenses" || pg === "reports") && f.hostel !== undefined) setPerH(f.hostel || "");
     setPage(pg);
     setOpen(false);
@@ -8189,6 +10824,7 @@ function App() {
           setLoadErr("Aapka profile/role nahi mila. SQL Editor mein 'insert into public.users...' waala role-SQL chalaya? (Step 3)");
           return;
         }
+        await p5Detect(); // P5: kaun si SQL (027-031) live par hai = kaun se naye features dikhenge
         setProfile(u);
         const {
           data: a
@@ -8199,7 +10835,8 @@ function App() {
       }
     })();
   }, [session]);
-  const role = profile?.roles?.name || "manager";
+  const realRole = profile?.roles?.name || "manager"; // P5: asli DB role (head_manager = Manager, manager = Warden)
+  const role = realRole === "head_manager" ? "director" : realRole; // P5 (R3): Manager ko Director wali saari screens
   // P2b review: sirf SABSE NAYA refresh data likhe. Load ke baad wala auto-generate refresh (D-c) der se khatam ho to woh
   // Add ke turant baad wali local row (duplicate rokne wali) mita deta tha. Purana refresh ab chup-chaap chhod diya jaata hai.
   const refreshSeq = useRef(0);
@@ -8212,7 +10849,7 @@ function App() {
         const {
           data: d,
           error
-        } = x === "audit_logs" ? await SB.from(x).select("*") : await fetchAll(x);
+        } = x === "audit_logs" ? P5.r027 ? { data: [], error: null } : await SB.from(x).select("*") : await fetchAll(x); // P5: Activity Log khud 50-50 karke laata hai
         if (error) throw new Error(x + ": " + error.message);
         out[x] = d || [];
       }
@@ -8308,7 +10945,7 @@ function App() {
     const overdue = _fs.filter(x => x.kind === "overdue").length;
     const dueSoon = _fs.filter(x => x.kind === "soon").length;
     const dueCount = _fs.filter(x => x.kind === "due").length;
-    const missing = data.students.filter(s => s.status !== "left" && !isBillable(s)).length;
+    const missing = data.students.filter(p5NeedsData).length;
     const _sc = salaryCycle(data, _t);
     const salaryPay = _sc.pendingNet;
     const salarySub = _sc.sub;
@@ -8387,13 +11024,14 @@ function App() {
     }
   }, "Loading\u2026");
   if (profile.status === "rejected") return /*#__PURE__*/React.createElement(Pending, { status: "rejected" });
+  if (profile.status === "inactive" || P5.r027 && profile.is_active === false) return /*#__PURE__*/React.createElement(Pending, { status: "removed" }); // P5: Director ne login band kiya
   if (profile.status === "removed") return /*#__PURE__*/React.createElement(Pending, { status: "removed" });
   if (profile.status === "pending" || !profile.role_id) return /*#__PURE__*/React.createElement(Pending, { status: "pending" });
   const flash = m => {
     setToast(m);
     setTimeout(() => setToast(""), 5000);
   };
-  const allowed = NAV[role] || ["dashboard"];
+  const allowed = p5Allowed(NAV[role] || ["dashboard"], role, realRole); // P5: + Common Expense, + Managers (sirf Director)
   const cur = allowed.includes(page) ? page : allowed[0];
 
   // lookups
@@ -8469,13 +11107,13 @@ function App() {
       const exists = (data.employees || []).some(emp => emp.hostel_id === hid && (/warden/i.test(emp.role || "") && String(emp.full_name || "").trim().toLowerCase() === nm || String(emp.full_name || "").trim().toLowerCase() === nm));
       if (hid && changed && !exists) await SB.from("employees").insert({ id: crypto.randomUUID(), full_name: row.manager_name, role: "Warden", hostel_id: hid, mobile: row.contact_number || null, created_by: session.user.id });
     }
-    flash(editId ? "Updated \u2713" : "Added \u2713");
+    flash(editId ? P5.r027 && table === "expenses" && saved && saved.status === "pending" && opts.initial && opts.initial.status === "approved" ? "Updated \u2713 \xB7 Dobara approval ke liye bheja gaya" : "Updated \u2713" : "Added \u2713"); // P5 (R5)
     refresh();
     return true;
   };
   const del = async (table, id) => {
     const _heavy = (table === "hostels" || table === "students");
-    const _msg = _heavy ? "\u26A0 PERMANENT DELETE\n\nIske saath iska saara juda data (fees, expenses, beds, etc.) hamesha ke liye mit jayega aur wapas nahi aayega.\n\nAgar band hua hai to delete ki jagah Status = Inactive / Left karein.\n\nPhir bhi delete karna hai?" : "Delete this record?";
+    const _msg = P5.r027 && table === "hostels" ? P5_HOSTEL_DEL_MSG : P5.r027 && table === "students" ? P5_STU_DEL_MSG : _heavy ? "\u26A0 PERMANENT DELETE\n\nIske saath iska saara juda data (fees, expenses, beds, etc.) hamesha ke liye mit jayega aur wapas nahi aayega.\n\nAgar band hua hai to delete ki jagah Status = Inactive / Left karein.\n\nPhir bhi delete karna hai?" : "Delete this record?";
     if (!confirm(_msg)) return;
     const {
       error
@@ -8543,7 +11181,7 @@ function App() {
       }]
     }, {
       k: "manager_name",
-      label: "Manager/Warden"
+      label: P5.r027 ? "Warden" : "Manager/Warden"
     }, {
       k: "contact_number",
       label: "Contact"
@@ -8991,6 +11629,68 @@ function App() {
     }]
   };
 
+  // P5: Add / Edit forms mein naye fields (Type Student / Staff, Monthly Fee rules, Common Expense option, approved expense note)
+  p5PatchFields(FIELDS, {
+    role,
+    data,
+    modal,
+    setModal,
+    openP5: setP5m
+  });
+  // P5 (R10): warden ke liye "Mark as Left" (student delete sirf Director / Manager). Exit Date wahi P2b rules.
+  const p5MarkLeft = s => setModal({
+    entity: "students",
+    title: "Mark as Left — " + s.full_name,
+    item: {
+      ...s,
+      status: "left",
+      exit_date: ""
+    },
+    fields: FIELDS.students.filter(f => f.k === "exit_date"),
+    validate: v => !v.exit_date ? "Exit Date (chhodne ki tareekh) chunein." : p2bExitErr({
+      ...v,
+      status: "left"
+    }, s, role),
+    onSave: v => save("students", {
+      status: "left",
+      exit_date: v.exit_date
+    }, {
+      editId: s.id,
+      throwErr: true,
+      initial: s
+    })
+  });
+  // P5 (028, D-fee): bill bane student ki Monthly Fee badli (Director / Manager) = pehle "kis mahine se?" + preview +
+  // ddd_fee_change, phir baaki badle fields normal update se (monthly_fee ke bina). Cancel = kuch save nahi, form khula.
+  const p5FeeFlow = (v, item) => new Promise((resolve, reject) => {
+    // REVIEW FIX F2: fee 0 wala Staff kabhi due nahi dikhta - pichhle mahino ka baaki ho to pehle woh clear (database bhi rokta hai)
+    const oldDue = P5.f029 && v.occupant_type === "staff" && num0(v.monthly_fee) <= 0 ? (data.monthly_dues || []).filter(d => d.student_id === item.id && !isVoidDue(d) && monthStartOf(d.month) < monthStartOf(istToday())).reduce((a, d) => a + Math.max(num0(d.fee_amount) - num0(d.discount) - num0(d.paid_amount), 0), 0) : 0;
+    if (oldDue > 0) return reject(new Error("Is record par pichhle mahino ka " + inr(oldDue) + " baaki hai. Fee 0 wala Staff kabhi due nahi dikhta, isliye pehle purana baaki clear karein (fee lein ya bill theek karein), phir Staff fee 0 karein."));
+    setP5m({
+      kind: "fee",
+      student: item,
+      newFee: num0(v.monthly_fee),
+      reject: reject,
+      resolve: async res => {
+        try {
+          const ok = await save("students", {
+            ...v,
+            monthly_fee: item.monthly_fee
+          }, {
+            editId: item.id,
+            throwErr: true,
+            initial: item
+          });
+          flash(res && res.message ? res.message : "Monthly Fee badal di ✓");
+          refresh();
+          if (ok && v._rejoin === "back") p2bRejoinGen(v, refresh);
+          resolve(ok);
+        } catch (e) {
+          reject(e);
+        }
+      }
+    });
+  });
   /* ---------- dashboard ---------- */
   // (D is computed above the early returns to keep hook order stable)
 
@@ -9109,8 +11809,9 @@ function App() {
       const hsel = roomsH && data.hostels.some(h => h.id === roomsH) ? roomsH : data.hostels[0]?.id || "";
       const setHsel = setRoomsH;
       const [alloc, setAlloc] = useState(null);
+      const [allocTy, setAllocTy] = useState("student"); // P5 (029): bed par Student ya Staff
       const roomsOf = data.rooms.filter(r => r.hostel_id === hsel && (!roomsVac || data.beds.some(b => b.room_id === r.id && b.bed_status === "vacant")));
-      const free = data.students.filter(s => s.status === "active" && !s.current_bed_id);
+      const free = data.students.filter(s => s.status === "active" && !s.current_bed_id && (!P5.f029 || (s.occupant_type || "student") === allocTy)); // P5 (029)
       const addRoom = async v => {
         try {
           const hid = hsel || (myHostels && myHostels[0]) || (data.hostels[0] && data.hostels[0].id) || "";
@@ -9337,7 +12038,7 @@ function App() {
             textOverflow: "ellipsis",
             whiteSpace: "nowrap"
           }
-        }, b.student_id ? sName(b.student_id) : s.label));
+        }, b.student_id ? sName(b.student_id) + p5StaffTag(data, b.student_id) : s.label));
       })))), !roomsOf.length && /*#__PURE__*/React.createElement("span", {
         style: {
           color: col('mut'),
@@ -9389,7 +12090,32 @@ function App() {
           fontWeight: 700,
           marginBottom: 6
         }
-      }, "Allocate student"), /*#__PURE__*/React.createElement("select", {
+      }, P5.f029 ? "Allocate " + (allocTy === "staff" ? "staff" : "student") : "Allocate student"), P5.f029 ? /*#__PURE__*/React.createElement(P5AllocType, {
+        ty: allocTy,
+        setTy: setAllocTy,
+        onNew: () => {
+          const b0 = alloc;
+          setModal({
+            entity: "students",
+            title: "Add Staff \u2014 Bed " + b0.bed_number,
+            item: {
+              occupant_type: "staff",
+              hostel_id: b0.hostel_id,
+              joining_date: istToday(),
+              monthly_fee: role === "director" ? 0 : ""
+            },
+            onSave: async (v, meta) => {
+              const nid = meta && meta.newId || crypto.randomUUID();
+              const ok = await save("students", v, {
+                throwErr: true,
+                newId: nid
+              });
+              if (ok) await doAlloc(b0, nid);
+              return ok;
+            }
+          });
+        }
+      }) : null, /*#__PURE__*/React.createElement("select", {
         className: "inp",
         defaultValue: "",
         onChange: e => e.target.value && doAlloc(alloc, e.target.value)
@@ -9398,7 +12124,7 @@ function App() {
       }, "\u2014 select \u2014"), free.map(s => /*#__PURE__*/React.createElement("option", {
         key: s.id,
         value: s.id
-      }, s.full_name, " (", s.course, ")"))), /*#__PURE__*/React.createElement("button", {
+      }, s.full_name, p5IsStaff(s) ? " \xB7 Staff" : " (", p5IsStaff(s) ? null : s.course, p5IsStaff(s) ? null : ")"))), /*#__PURE__*/React.createElement("button", {
         onClick: () => setAlloc(null),
         style: {
           marginTop: 14,
@@ -9473,7 +12199,7 @@ function App() {
           color: col('mut'),
           marginTop: 3
         }
-      }, h?.code, " \xB7 ", hb.length, " beds \xB7 ", occ, " occupied \xB7 ", hb.length - occ, " vacant \xB7 Manager: ", h?.manager_name || "—")), /*#__PURE__*/React.createElement("div", {
+      }, h?.code, " \xB7 ", hb.length, " beds \xB7 ", occ, " occupied \xB7 ", hb.length - occ, " vacant \xB7 " + (P5.r027 ? "Warden" : "Manager") + ": ", h?.manager_name || "—")), /*#__PURE__*/React.createElement("div", {
         className: "card",
         style: {
           overflowX: "auto"
@@ -9486,7 +12212,7 @@ function App() {
         return /*#__PURE__*/React.createElement("tr", {
           key: i
         }, /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("b", null, r.room)), /*#__PURE__*/React.createElement("td", null, r.bed), /*#__PURE__*/React.createElement("td", null, r.stu ? /*#__PURE__*/React.createElement(NameBtn, {
-          name: r.stu.full_name,
+          name: r.stu.full_name + p5StaffTag(data, r.stu.id),
           sid: r.stu.id,
           mobile: r.stu.mobile,
           sub: r.stu.course
@@ -9494,7 +12220,7 @@ function App() {
           style: {
             color: b.fg
           }
-        }, b.label)), /*#__PURE__*/React.createElement("td", null, r.stu?.course || "—"), /*#__PURE__*/React.createElement("td", null, r.stu?.mobile || "—"), /*#__PURE__*/React.createElement("td", null, inr(r.fee)), /*#__PURE__*/React.createElement("td", null, r.stu ? /*#__PURE__*/React.createElement("span", {
+        }, b.label)), /*#__PURE__*/React.createElement("td", null, p5IsStaff(r.stu) ? "Staff" : r.stu?.course || "—"), /*#__PURE__*/React.createElement("td", null, r.stu?.mobile || "—"), /*#__PURE__*/React.createElement("td", null, p5IsStaff(r.stu) ? p5FeeFree(r.stu) ? "Staff \xB7 no fee" : inr(r.stu.monthly_fee) : inr(r.fee)), /*#__PURE__*/React.createElement("td", null, r.stu ? /*#__PURE__*/React.createElement("span", {
           style: {
             color: due > 0 ? col('red') : col('green'),
             fontWeight: 700
@@ -9789,8 +12515,8 @@ function App() {
       flash("Access hata diya \u2713 \u2014 data safe hai");
       refresh();
     };
-    const actives = (data.users || []).filter(u => u.status === "active" && u.id !== (session && session.user && session.user.id));
-    const removedList = (data.users || []).filter(u => u.status === "removed");
+    const actives = (data.users || []).filter(u => u.status === "active" && u.id !== (session && session.user && session.user.id) && p5WardenRow(u, realRole)); // P5 (R2)
+    const removedList = (data.users || []).filter(u => u.status === "removed" && !(P5.r027 && /@ddd-hostel\.app$/i.test(String(u.email || "")))); // P5: hataye gaye Manager (Login ID wale) Managers screen par
     return /*#__PURE__*/React.createElement("div", {
       style: {
         display: "flex",
@@ -9891,7 +12617,7 @@ function App() {
   }
   };
   const Current = Pages[cur] || Pages.dashboard;
-  const pageCtx = { data, role, session, hName, sName, uName, NameBtn, Header, EditDel, setModal, setContact, del, flash, refresh, hf, setHf, mf, setMf, billingMode, saveBillingMode, stuF, setStuF, openProfile: setProfId, feeSf, setFeeSf, go, feeGrace, saveFeeGrace, salMonth, setSalMonth, salH, setSalH, salSf, setSalSf, openSal: setSalModal, per: perSt.p, setPer, perH: perSt.h, setPerH, feeTab, setFeeTab, save, allowed };
+  const pageCtx = { data, role, session, hName, sName, uName, NameBtn, Header, EditDel, setModal, setContact, del, flash, refresh, hf, setHf, mf, setMf, billingMode, saveBillingMode, stuF, setStuF, openProfile: setProfId, feeSf, setFeeSf, go, feeGrace, saveFeeGrace, salMonth, setSalMonth, salH, setSalH, salSf, setSalSf, openSal: setSalModal, per: perSt.p, setPer, perH: perSt.h, setPerH, feeTab, setFeeTab, save, allowed, realRole, openP5: setP5m, markLeft: p5MarkLeft };
   return /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
@@ -9974,7 +12700,7 @@ function App() {
       textTransform: "capitalize",
       marginBottom: 8
     }
-  }, role), /*#__PURE__*/React.createElement("button", {
+  }, p5RoleLabel(realRole)), /*#__PURE__*/React.createElement("button", {
     onClick: () => SB.auth.signOut(),
     style: {
       width: "100%",
@@ -10046,7 +12772,13 @@ function App() {
     ctx: pageCtx
   }), /*#__PURE__*/React.createElement(DashboardPage, {
     ctx: pageCtx
-  })) : cur === "students" ? /*#__PURE__*/React.createElement(StudentsPage, {
+  })) : cur === "audit" && P5.r027 ? /*#__PURE__*/React.createElement(P5ActivityLog, {
+    ctx: pageCtx
+  }) : cur === "users" && P5.r027 && realRole === "director" ? /*#__PURE__*/React.createElement(P5Managers, {
+    ctx: pageCtx
+  }) : cur === "cexp" && P5.f030 ? /*#__PURE__*/React.createElement(P5CexpReport, {
+    ctx: pageCtx
+  }) : cur === "students" ? /*#__PURE__*/React.createElement(StudentsPage, {
     ctx: pageCtx
   }) : cur === "expenses" ? /*#__PURE__*/React.createElement(ExpensesPage, {
     ctx: pageCtx
@@ -10075,8 +12807,12 @@ function App() {
     dupCheck: !(modal.item && modal.item.id) && (modal.entity === "students" || modal.entity === "employees") ? async v => { const loc = findDuplicates(modal.entity, v, data, hName); if (modal.entity !== "students" || role === "director" || role === "accountant") return loc; return loc.concat(await findRemoteDups(v)); } : null, // P1: Manager ko doosre hostel ka same student bhi dikhe (025)
     onOpenDup: d => d.entity === "students" ? (setModal(null), setProfId(d.id)) : setModal({ entity: "employees", item: d.row }),
     onClose: () => setModal(null),
-    onSave: (v, meta) => modal.onSave ? modal.onSave(v) : modal.entity === "employees" && role === "director" ? saveStaff(v, modal.item && modal.item.id) : save(modal.entity, v, { editId: modal.item && modal.item.id, throwErr: true, initial: modal.item, newId: meta && meta.newId }).then(ok => { if (ok && modal.entity === "students" && v._rejoin === "back") p2bRejoinGen(v, refresh); return ok; }) // P2b review: wapas aaya = is mahine ka bill turant
-  }), contact && /*#__PURE__*/React.createElement(Contact, {
+    onSave: (v, meta) => modal.onSave ? modal.onSave(v, meta) : modal.entity === "students" && p5FeeAskNeeded(v, modal.item, role, data) ? p5FeeFlow(v, modal.item) : modal.entity === "employees" && role === "director" ? saveStaff(v, modal.item && modal.item.id) : save(modal.entity, v, { editId: modal.item && modal.item.id, throwErr: true, initial: modal.item, newId: meta && meta.newId }).then(ok => { if (ok && modal.entity === "students" && v._rejoin === "back") p2bRejoinGen(v, refresh); return ok; }) // P2b review: wapas aaya = is mahine ka bill turant
+  }), p5m ? /*#__PURE__*/React.createElement(P5Modals, {
+    ctx: pageCtx,
+    m: p5m,
+    close: () => setP5m(null)
+  }) : null, contact && /*#__PURE__*/React.createElement(Contact, {
     c: contact,
     onClose: () => setContact(null)
   }), toast && /*#__PURE__*/React.createElement("div", {
